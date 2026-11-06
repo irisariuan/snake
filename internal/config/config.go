@@ -108,6 +108,7 @@ type Settings struct {
 	DomainSetTimeout int      `json:"domain_set_timeout"` // seconds, 0 = never expire
 	SessionTimeout   int      `json:"session_timeout"`    // WebRTC session window, seconds
 	PeerTimeout      int      `json:"peer_timeout"`       // learned WebRTC peer lifetime, seconds
+	STUNServerTTL    int      `json:"stun_server_ttl"`    // learned STUN/TURN server lifetime once idle, seconds
 	HealthInterval   int      `json:"health_interval"`
 	HandshakeMaxAge  int      `json:"handshake_max_age"`
 	ProbeTargets     []string `json:"probe_targets"` // host:port, TCP
@@ -204,6 +205,7 @@ func DefaultSettings() Settings {
 		DomainSetTimeout: 0,
 		SessionTimeout:   120,
 		PeerTimeout:      600,
+		STUNServerTTL:    86400,
 		HealthInterval:   15,
 		HandshakeMaxAge:  180,
 		ProbeTargets:     []string{"1.1.1.1:443", "8.8.8.8:443", "9.9.9.9:443"},
@@ -260,6 +262,7 @@ func (c *Config) ApplyDefaults() {
 	setInt(&s.QueueBase, d.QueueBase)
 	setInt(&s.SessionTimeout, d.SessionTimeout)
 	setInt(&s.PeerTimeout, d.PeerTimeout)
+	setInt(&s.STUNServerTTL, d.STUNServerTTL)
 	setInt(&s.HealthInterval, d.HealthInterval)
 	setInt(&s.HandshakeMaxAge, d.HandshakeMaxAge)
 	setInt(&s.ProbeFailures, d.ProbeFailures)
@@ -471,6 +474,15 @@ func (c *Config) Validate() error {
 		add("mark_mask must contain at least 6 contiguous bits")
 	} else if (s.MarkMask>>s.MarkShift())&(s.MarkMask>>s.MarkShift()+1) != 0 {
 		add("mark_mask bits must be contiguous")
+	}
+	// ipset's maximum timeout.
+	for _, t := range []struct {
+		name string
+		v    int
+	}{{"session_timeout", s.SessionTimeout}, {"peer_timeout", s.PeerTimeout}, {"stun_server_ttl", s.STUNServerTTL}, {"domain_set_timeout", s.DomainSetTimeout}} {
+		if t.v > 2147483 {
+			add("%s must be at most 2147483 seconds", t.name)
+		}
 	}
 	if s.APIPort < 1 || s.APIPort > 65534 {
 		add("api_port out of range")

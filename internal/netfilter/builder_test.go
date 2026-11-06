@@ -53,6 +53,9 @@ func TestBuild(t *testing.T) {
 		"-m conntrack --ctstate NEW -m set --match-set SNK_1_d4 dst -j SET --add-set SNK_1_s4 src --exist",
 		"-A SNAKE_P1 -p udp -m set --match-set SNK_1_s4 src -m set --match-set SNK_1_r4 dst -g SNAKE_M1",
 		"-A SNAKE_RTC -p udp -m conntrack --ctstate NEW -m set --match-set SNK_1_s4 src -j NFQUEUE --queue-num 4201 --queue-bypass",
+		// learned STUN servers: routed outside sessions and open the window
+		"-A SNAKE_P1 -p udp -m set --match-set SNK_1_t4 dst -g SNAKE_M1",
+		"-A SNAKE -p udp -m conntrack --ctstate NEW -m set --match-set SNK_1_t4 dst -j SET --add-set SNK_1_s4 src --exist",
 		// device + destination
 		"-A SNAKE_P2 -m mac --mac-source aa:bb:cc:00:00:01 -m set --match-set SNK_2_d4 dst -g SNAKE_M2",
 		"-A SNAKE_P2 -p udp -m multiport --dports 3478,3479,5349,19302:19309 -m set --match-set SNK_2_s4 src -g SNAKE_M2",
@@ -62,6 +65,9 @@ func TestBuild(t *testing.T) {
 		// stale chains deleted
 		"-X SNAKE_M9", "-X SNAKE_P9",
 	)
+	if strings.Contains(m4, "SNK_2_t4") {
+		t.Error("server set used in ports fallback mode")
+	}
 	if strings.Contains(m4, "-X SNAKE\n") {
 		t.Error("live chain deleted")
 	}
@@ -134,5 +140,18 @@ func TestBuildDNSInspector(t *testing.T) {
 	}
 	if !found {
 		t.Error("OUTPUT hook missing")
+	}
+}
+
+func TestBuildServerSetPerDevice(t *testing.T) {
+	c, st := states(t)
+	st[1].WebRTCMode = RTCQueue // device + destination policy
+	m4 := Build(c.Settings, st, Options{}).Restore["4/mangle"]
+	mustContain(t, m4,
+		"-A SNAKE_P2 -m mac --mac-source aa:bb:cc:00:00:01 -p udp -m set --match-set SNK_2_t4 dst -g SNAKE_M2",
+		"-A SNAKE -m mac --mac-source aa:bb:cc:00:00:01 -p udp -m conntrack --ctstate NEW -m set --match-set SNK_2_t4 dst -j SET --add-set SNK_2_s4 src --exist",
+	)
+	if strings.Contains(m4, "-A SNAKE_P2 -p udp -m set --match-set SNK_2_t4") {
+		t.Error("device policy's server set applied LAN-wide")
 	}
 }

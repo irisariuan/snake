@@ -131,8 +131,16 @@ func (e *Engine) saveSets() {
 	ips := netfilter.IPSet{R: e.R}
 	var names []string
 	for _, n := range ips.Names() {
-		// Only DNS-learned sets are worth persisting; static sets are rebuilt.
-		if strings.HasSuffix(n, "_"+netfilter.KindDomain+"4") || strings.HasSuffix(n, "_"+netfilter.KindDomain+"6") {
+		// Only learned sets are worth persisting; static sets are rebuilt.
+		// Learned STUN servers are kept so they cover ICE gathering that
+		// starts before a session after a reboot too.
+		learned := false
+		for _, k := range []string{netfilter.KindDomain, netfilter.KindServer} {
+			if strings.HasSuffix(n, "_"+k+"4") || strings.HasSuffix(n, "_"+k+"6") {
+				learned = true
+			}
+		}
+		if learned {
 			names = append(names, n)
 		}
 	}
@@ -234,7 +242,7 @@ func (e *Engine) Status() Status {
 			ps.Candidates = cands[p.ID]
 			s := stByID[p.ID]
 			ps.IPv6Mode, ps.WebRTCMode = s.IPv6Mode, s.WebRTCMode
-			for _, kind := range []string{netfilter.KindDomain, netfilter.KindNet, netfilter.KindSession, netfilter.KindPeer} {
+			for _, kind := range []string{netfilter.KindDomain, netfilter.KindNet, netfilter.KindSession, netfilter.KindPeer, netfilter.KindServer} {
 				for _, v6 := range []bool{false, true} {
 					if v6 && !caps.IPv6 {
 						continue
@@ -403,7 +411,7 @@ func (e *Engine) SetMembers(name string, limit int) ([]string, error) {
 // FlushLearned empties DNS-learned and WebRTC sets of a policy.
 func (e *Engine) FlushLearned(id int) {
 	ips := netfilter.IPSet{R: e.R}
-	for _, k := range []string{netfilter.KindDomain, netfilter.KindPeer, netfilter.KindSession} {
+	for _, k := range []string{netfilter.KindDomain, netfilter.KindPeer, netfilter.KindServer, netfilter.KindSession} {
 		for _, v6 := range []bool{false, true} {
 			_ = ips.Flush(netfilter.SetName(id, k, v6))
 		}
@@ -544,7 +552,7 @@ func (e *Engine) LeakChecks() []LeakCheck {
 		}
 		switch ps.WebRTCMode {
 		case netfilter.RTCQueue:
-			ok("WebRTC tracked (STUN learning via NFQUEUE)")
+			ok("WebRTC tracked (STUN learning via NFQUEUE; learned STUN/TURN servers also covered before a session starts)")
 		case netfilter.RTCPorts:
 			warn("WebRTC tracked in fallback mode (NFQUEUE unavailable: only STUN/TURN ports during sessions)")
 		default:

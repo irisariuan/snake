@@ -131,3 +131,15 @@ func TestRuleListsExpand(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestSTUNServerTTL(t *testing.T) {
+	c := Default()
+	c.ApplyDefaults()
+	if c.Settings.STUNServerTTL != 86400 {
+		t.Fatalf("default ttl %d", c.Settings.STUNServerTTL)
+	}
+	c.Settings.STUNServerTTL = 3000000
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "stun_server_ttl") {
+		t.Fatalf("over ipset max accepted: %v", err)
+	}
+}

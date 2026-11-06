@@ -355,6 +355,11 @@ func setSpecs(cfg *config.Config, states []netfilter.PolicyState, v6 bool) []net
 					netfilter.SetSpec{Name: netfilter.SetName(p.ID, netfilter.KindPeer, f), Type: "hash:ip", V6: f, Timeout: s.PeerTimeout, MaxElem: 65536},
 				)
 			}
+			if st.WebRTCMode == netfilter.RTCQueue {
+				// The tracker refreshes entries while connections to them are
+				// alive, so the TTL only counts down once a server is idle.
+				specs = append(specs, netfilter.SetSpec{Name: netfilter.SetName(p.ID, netfilter.KindServer, f), Type: "hash:ip", V6: f, Timeout: s.STUNServerTTL, MaxElem: 4096})
+			}
 		}
 	}
 	// DoH sets always exist (cheap) so dnsmasq never logs missing-set errors.

@@ -217,15 +217,40 @@ break every other app's calls. snake tracks it per policy instead:
    working even when hardware acceleration offloads the flows.
 2. **STUN learning (NFQUEUE).** While the window is open, new UDP flows from
    that device go to the daemon over NFQUEUE (header only, fail-open).
-   * If the packet is a STUN message (ICE connectivity check, TURN Allocate,
-     binding request), its destination is added to `SNK_<id>_r` and the packet
-     is re-injected with the policy mark. The whole media flow, including its
-     NAT binding, then uses the tunnel from the first packet.
+   * If the packet is a STUN message, it is re-injected with the policy mark,
+     so the whole flow, including its NAT binding, uses the tunnel from the
+     first packet. Its destination is learned:
+     * **ICE connectivity checks** (binding requests carrying `USERNAME`,
+       `PRIORITY` or `ICE-CONTROLLING/CONTROLLED`) and anything ambiguous go
+       to the peer set `SNK_<id>_r` (`peer_timeout`, default 600 s). Peers are
+       routed only for devices inside a session window.
+     * **Server requests** (plain binding requests, i.e. server-reflexive
+       candidate gathering, and TURN Allocate/Refresh/CreatePermission/
+       ChannelBind/Send) go to the server set `SNK_<id>_t`.
    * Anything else passes through untouched.
-3. **Fallback.** If the kernel has no NFQUEUE, only STUN/TURN ports
+3. **Learned servers (pre-session coverage).** Browsers often start gathering
+   ICE candidates before the page's first connection to a policy destination.
+   That early binding request would reveal the WAN address. Learned
+   STUN/TURN servers are therefore routed through the tunnel for the policy's
+   devices (the whole LAN for destination-only policies) **even outside a
+   session**, and a new UDP flow to one opens the device's session window, so
+   the ICE checks that follow are learned too.
+   * Each server has a TTL (`stun_server_ttl`, default 86400 s). The session
+     refresher re-arms it every 20 s while any policy-marked connection to
+     the server is still in conntrack, so the countdown only starts once the
+     server is idle. A server shared with unrelated apps (a public STUN
+     server, for example) therefore drops out after a quiet period instead of
+     staying tunnelled forever.
+   * Server sets are saved with the DNS-learned sets (`save_interval`), so the
+     coverage survives a reboot.
+   * The first visit to a service still has no learned servers, so ICE
+     gathering that starts before its first session can use WAN once.
+4. **Fallback.** If the kernel has no NFQUEUE, only STUN/TURN ports
    (`3478,3479,5349,19302:19309`) from devices inside a window are routed.
+   There is no server learning in this mode.
 
-WebRTC from other apps, or from the same device outside a session, stays on WAN.
+WebRTC from other apps, or from the same device outside a session, stays on WAN,
+except UDP to a learned STUN/TURN server of the policy.
 
 ## Failover
 
@@ -255,7 +280,7 @@ entries of the policy are flushed when the `conntrack` tool exists.
 LAN client ──► mangle PREROUTING -i br+ ─► SNAKE
                  restore connmark │ private dst → RETURN
                  SNAKE_P<id> (in policy order):
-                   mac / ipset(dnsmasq-learned, ASN+CIDR, WebRTC peers)  ─► SNAKE_M<id>: MARK id<<16, save connmark
+                   mac / ipset(dnsmasq-learned, ASN+CIDR, WebRTC peers/servers)  ─► SNAKE_M<id>: MARK id<<16, save connmark
                  SNAKE_RTC: NFQUEUE for session clients' new UDP flows
             ─► ip rule  pref 5200+id  fwmark id<<16/0xff0000 → table 1000+id
                table 1000+id: default dev <active tunnel> | unreachable (kill switch) | empty (→ main/WAN)

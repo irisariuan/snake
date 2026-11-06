@@ -223,11 +223,20 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		macMatch := func(m string) string { return "-m mac --mac-source " + m }
 
 		// Session refresh for WebRTC tracking: a NEW connection from a client
-		// to a policy destination (re)opens that client's session window.
+		// to a policy destination (re)opens that client's session window. So
+		// does STUN to a server learned in an earlier session: ICE gathering
+		// often starts before the first connection to a policy destination,
+		// and the peers it then checks must be learned too.
 		if st.WebRTCMode != RTCOff && len(dsets) > 0 {
 			sess := SetName(id, KindSession, v6)
+			opens := []string{}
 			for _, ds := range dsets {
-				base := "-m conntrack --ctstate NEW -m set --match-set " + ds + " dst"
+				opens = append(opens, "-m conntrack --ctstate NEW -m set --match-set "+ds+" dst")
+			}
+			if st.WebRTCMode == RTCQueue {
+				opens = append(opens, "-p udp -m conntrack --ctstate NEW -m set --match-set "+SetName(id, KindServer, v6)+" dst")
+			}
+			for _, base := range opens {
 				if len(st.MACs) == 0 {
 					mangle.add(ChainMain, base, "-j SET --add-set", sess, "src --exist")
 				}
@@ -263,6 +272,16 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 			mangle.add(pc, "-p udp -m set --match-set", sess, "src -m set --match-set", peers, "dst -g", mc)
 			switch st.WebRTCMode {
 			case RTCQueue:
+				// Learned STUN/TURN servers are routed for the policy's
+				// clients even outside a session window, so binding requests
+				// sent before the session opens cannot reveal the WAN address.
+				srv := SetName(id, KindServer, v6)
+				if len(st.MACs) == 0 {
+					mangle.add(pc, "-p udp -m set --match-set", srv, "dst -g", mc)
+				}
+				for _, m := range st.MACs {
+					mangle.add(pc, macMatch(m), "-p udp -m set --match-set", srv, "dst -g", mc)
+				}
 				q := fmt.Sprint(s.QueueBase + id)
 				mangle.add(ChainRTC, "-p udp -m conntrack --ctstate NEW -m set --match-set", sess,
 					"src -j NFQUEUE --queue-num", q, "--queue-bypass")

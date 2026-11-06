@@ -179,7 +179,7 @@
           el('td', null, p.scope),
           el('td', null, route, cands),
           el('td', null, p.ipv6_mode || ''),
-          el('td', null, p.webrtc_mode || '', p.webrtc ? el('div', { class: 'small muted' }, 'stun ' + p.webrtc.stun + ' · peers ' + p.webrtc.learned) : null),
+          el('td', null, p.webrtc_mode || '', p.webrtc ? el('div', { class: 'small muted' }, 'stun ' + p.webrtc.stun + ' · peers ' + p.webrtc.learned + ' · servers ' + (p.webrtc.servers || 0)) : null),
           el('td', { class: 'mono' }, sets),
           el('td', null, fmtBytes(p.bytes), el('div', { class: 'small muted' }, p.packets + ' pkts')));
       }))));
@@ -783,6 +783,7 @@
       el('div', { class: 'card' }, el('b', null, 'WebRTC & sets'),
         num('session_timeout', 'WebRTC session window (s)', 'How long after the last policy connection a device\'s STUN is still attributed to the policy.'),
         num('peer_timeout', 'Learned peer lifetime (s)'),
+        num('stun_server_ttl', 'Learned STUN/TURN server TTL once idle (s)', 'Learned servers stay routed through the tunnel for the policy\'s devices, even before a session starts. The countdown starts when the last connection to the server ends.'),
         txt('stun_ports', 'STUN/TURN ports (fallback mode)'),
         num('domain_set_timeout', 'Domain set entry timeout (s, 0 = never)'),
         num('save_interval', 'Persist learned sets every (s)'),

@@ -7,6 +7,7 @@
 package engine
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"net"
 	"os"
@@ -128,7 +129,7 @@ func TestIntegrationApply(t *testing.T) {
 		t.Errorf("v6 table 1001 (tunnel has IPv6): %s", r)
 	}
 	sets := sh(t, "ipset list -n")
-	for _, s := range []string{"SNK_1_d4", "SNK_1_n4", "SNK_1_s4", "SNK_1_r4", "SNK_2_d4", "SNK_DOH4"} {
+	for _, s := range []string{"SNK_1_d4", "SNK_1_n4", "SNK_1_s4", "SNK_1_r4", "SNK_1_t4", "SNK_2_d4", "SNK_DOH4"} {
 		if !strings.Contains(sets, s) {
 			t.Errorf("missing set %s", s)
 		}
@@ -193,9 +194,52 @@ func TestIntegrationApply(t *testing.T) {
 		if err := e.rtc.Configure([]webrtc.PolicyTrack{{ID: 1, Queue: 4201, Mark: 0x10000}}, true); err != nil {
 			t.Errorf("nfqueue listener: %v", err)
 		}
+		// Real STUN through the queue: a plain binding request is learned as
+		// a server, an ICE connectivity check as a peer.
+		sh(t, "ip tuntap add mode tun dev stunout && ip link set stunout up && ip addr add 192.0.2.1/24 dev stunout && ip route add 203.0.113.0/24 dev stunout && ip route add 198.51.100.0/24 dev stunout")
+		sh(t, "iptables -t mangle -I OUTPUT -p udp --dport 3478 -m mark --mark 0/0xff0000 -j NFQUEUE --queue-num 4201 --queue-bypass")
+		sendSTUN(t, "203.0.113.7:3478", stunPacket(0x0001))
+		sendSTUN(t, "198.51.100.5:3478", stunPacket(0x0001, 0x0006, 0x0024, 0x802A))
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) && e.rtc.Stats()[1].Servers+e.rtc.Stats()[1].Learned < 2 {
+			time.Sleep(50 * time.Millisecond)
+		}
+		if srv := sh(t, "ipset list SNK_1_t4"); !strings.Contains(srv, "203.0.113.7") || strings.Contains(srv, "198.51.100.5") {
+			t.Errorf("server set:\n%s", srv)
+		}
+		if peers := sh(t, "ipset list SNK_1_r4"); !strings.Contains(peers, "198.51.100.5") || strings.Contains(peers, "203.0.113.7") {
+			t.Errorf("peer set:\n%s", peers)
+		}
+		t.Logf("webrtc stats: %+v", e.rtc.Stats()[1])
+		sh(t, "iptables -t mangle -D OUTPUT -p udp --dport 3478 -m mark --mark 0/0xff0000 -j NFQUEUE --queue-num 4201 --queue-bypass")
 		e.rtc.Stop()
 	}
 	t.Logf("plan:\n%s", e.Plan().Restore["4/mangle"])
+}
+
+func stunPacket(typ uint16, attrs ...uint16) []byte {
+	b := make([]byte, 20, 20+8*len(attrs))
+	binary.BigEndian.PutUint16(b[0:2], typ)
+	binary.BigEndian.PutUint16(b[2:4], uint16(8*len(attrs)))
+	binary.BigEndian.PutUint32(b[4:8], 0x2112A442)
+	for _, a := range attrs {
+		b = binary.BigEndian.AppendUint16(b, a)
+		b = binary.BigEndian.AppendUint16(b, 4)
+		b = append(b, 0, 0, 0, 0)
+	}
+	return b
+}
+
+func sendSTUN(t *testing.T, addr string, msg []byte) {
+	t.Helper()
+	c, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Write(msg); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // fakeDNS answers A queries on 127.0.0.1:53 from a fixed table.
