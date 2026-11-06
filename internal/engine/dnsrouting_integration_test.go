@@ -136,6 +136,17 @@ func TestIntegrationSharedDNSResolver(t *testing.T) {
 			for i, stats := range m.Stats() {
 				check(t, stats.Listen, "test.example", fmt.Sprintf("198.18.%d.1", i))
 			}
+			// A failover must discard the old encrypted connection pool,
+			// even though the resolver IP and certificate name did not change.
+			specs[0].Up.Mark, specs[0].Up.Iface = s.ProbeMark("wgc2"), "wgc2"
+			if err := m.Configure(specs); err != nil {
+				t.Fatal(err)
+			}
+			check(t, m.Stats()[1].Listen, "test.example", "198.18.2.1")
+			specs[0].Up.Mark, specs[0].Up.Iface = s.ProbeMark("wgc1"), "wgc1"
+			if err := m.Configure(specs); err != nil {
+				t.Fatal(err)
+			}
 			// A down tunnel must not fall through to another tunnel or WAN.
 			probes[0].Up = false
 			if err := rm.Sync(s, nil, probes, false); err != nil {
