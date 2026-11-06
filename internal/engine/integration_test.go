@@ -362,7 +362,7 @@ func TestIntegrationDNSInspector(t *testing.T) {
 	if n, err := e.ForgetLearned("nf", ForgetRequest{Kind: LearnedDNS, Addrs: []string{"203.0.113.51"}}); err != nil || n != 1 || strings.Contains(sh(t, "ipset list SNK_1_d4"), "203.0.113.51") {
 		t.Errorf("forget: %d %v", n, err)
 	}
-		// The domain tester sees the CNAME chain and the matching rule.
+	// The domain tester sees the CNAME chain and the matching rule.
 	dt := e.TestDomain("play.partner.tv")
 	if dt.Policy != "nf" || dt.Matched != "**.nflxvideo.net" || dt.Via != "x1.cdn.nflxvideo.net" || len(dt.Addrs) != 1 || dt.Addrs[0].InSet != "SNK_1_d4" {
 		t.Errorf("TestDomain = %+v", dt)
