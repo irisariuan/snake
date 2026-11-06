@@ -194,7 +194,11 @@
       btn('Re-check tunnels', function () { api('POST', '/api/recheck').then(function () { toast('Health check scheduled'); setTimeout(refreshStatus, 4000); }); }),
       btn('Re-apply rules', function () { api('POST', '/api/apply').then(function () { toast('Applied'); refreshStatus(); }).catch(function (e) { toast(e.message); }); }),
       el('span', { class: 'muted small' }, 'WAN ' + (s.wan_ip || '?') + ' · uptime ' + s.uptime + ' · applied ' + ago(s.last_apply) + ' · IPv6 ' + (s.caps.ipv6 ? 'yes' : 'no') + ' · NFQUEUE ' + (s.caps.nfqueue ? 'yes' : 'no') + ' · ipset netlink ' + (s.caps.ipset_netlink ? 'yes' : 'no') +
-        (s.dns_inspector ? ' · DNS inspector: ' + s.dns_inspector.answers + ' answers, ' + s.dns_inspector.matched + ' matched' + (s.dns_inspector.dropped ? ' (' + s.dns_inspector.dropped + ' blocked)' : '') + ', ' + s.dns_inspector.added + ' IPs added' : ''))));
+        (s.dns_inspector ? ' · DNS inspector: ' + s.dns_inspector.answers + ' answers, ' + s.dns_inspector.matched + ' matched' + (s.dns_inspector.dropped ? ' (' + s.dns_inspector.dropped + ' blocked)' : '') + ', ' + s.dns_inspector.added + ' IPs added' : '') +
+        (s.sni_proxy ? ' · SNI proxy ' + (s.sni_proxy.listen ? s.sni_proxy.listen : 'not running') + ': ' + s.sni_proxy.conns + ' conns, ' + s.sni_proxy.matched + ' matched, ' + s.sni_proxy.active + ' open' +
+          (s.sni_proxy.ech ? ', ' + s.sni_proxy.ech + ' ECH' : '') + (s.sni_proxy.dropped ? ', ' + s.sni_proxy.dropped + ' blocked' : '') + (s.sni_proxy.errors ? ', ' + s.sni_proxy.errors + ' failed' : '') : ''))));
+    if (s.sni_proxy && s.sni_proxy.last_error && (!s.sni_proxy.listen || (Date.now() - new Date(s.sni_proxy.last_error_at).getTime()) < 600000))
+      b.appendChild(el('div', { class: 'small', style: 'color:var(--warn);margin-bottom:8px' }, 'SNI proxy: ' + s.sni_proxy.last_error));
 
     var tn = Object.keys(s.tunnels || {}).sort();
     b.appendChild(el('h3', null, 'Tunnels'));
@@ -222,6 +226,7 @@
         return el('tr', null,
           el('td', null, el('b', null, p.name), p.domain_mode ? el('div', { class: 'small ' + (p.domain_mode.indexOf('degraded') === 0 ? '' : 'muted'), style: p.domain_mode.indexOf('degraded') === 0 ? 'color:var(--warn)' : '' }, 'domains: ' + p.domain_mode) : null,
             (p.asn_errors || []).map(function (e) { return el('div', { class: 'small', style: 'color:var(--warn)' }, e); }),
+            p.sni_matched !== undefined ? el('div', { class: 'small muted' }, 'SNI: ' + p.sni_matched + ' connections routed by server name') : null,
             p.dns_upstream ? el('div', { class: 'small muted' }, 'DNS: ' + p.dns_upstream.upstream + ' · ' + p.dns_upstream.queries + ' queries' +
               (p.dns_upstream.queries > p.dns_upstream.errors ? ', ' + p.dns_upstream.avg_ms.toFixed(0) + ' ms avg' : '') + (p.dns_upstream.errors ? ', ' + p.dns_upstream.errors + ' failed' : '')) : null,
             p.dns_upstream && p.dns_upstream.last_error && (Date.now() - new Date(p.dns_upstream.last_error_at).getTime()) < 600000 ?
@@ -537,7 +542,7 @@
   // ---------- policies ----------
   function defaultPolicy() {
     return { id: 0, name: '', enabled: true, tunnels: [], kill_switch: true, expected_country: '', domains: [], lists: [], ignore_cname: false, asns: [], cidrs: [], devices: [],
-      leak: { dns_via_tunnel: true, dns_server: '9.9.9.9', dns_protocol: 'udp', hijack_dns: true, block_dot: true, block_doh: true, block_quic: false, ipv6: 'tunnel', webrtc: 'track' } };
+      leak: { dns_via_tunnel: true, dns_server: '9.9.9.9', dns_protocol: 'udp', hijack_dns: true, block_dot: true, block_doh: true, block_quic: false, sniff_sni: false, ipv6: 'tunnel', webrtc: 'track' } };
   }
   function viewPolicies(b) {
     if (state.edit) return viewEditor(b);
@@ -564,6 +569,7 @@
         if (gs.block_doh === 'always' || (gs.block_doh !== 'never' && p.leak.block_doh)) prot.push('doh');
         if (gs.block_dot === 'always' || (gs.block_dot !== 'never' && p.leak.block_dot)) prot.push('dot');
         if (p.leak.block_quic) prot.push('quic');
+        if (p.leak.sniff_sni) prot.push('sni');
         prot.push('v6:' + p.leak.ipv6);
         prot.push('rtc:' + p.leak.webrtc);
         return el('tr', null,
@@ -647,6 +653,7 @@
         overridden('block_doh', chk(L, 'block_doh', 'Block DNS-over-HTTPS resolvers', 'Forces browsers/apps back to router DNS so domains are detected.')),
         overridden('block_dot', chk(L, 'block_dot', 'Block DNS-over-TLS / QUIC (port 853)', 'Android "Private DNS" falls back to normal DNS.')),
         chk(L, 'block_quic', 'Block QUIC (UDP 443)', 'Optional; forces HTTP/2 over TCP.'),
+        chk(L, 'sniff_sni', 'Route HTTPS by TLS server name (SNI proxy)', 'For devices using DoH/DoT, whose lookups the router cannot see. HTTPS connections no set matched pass through a proxy on the router that reads the server name (nothing is decrypted) and sends matches through the tunnel. Costs router CPU. Unclaimed QUIC is rejected so browsers fall back to TCP. Encrypted Client Hello hides the real name: those connections are routed by their public name (add e.g. cloudflare-ech.com to route them).'),
         el('label', { class: 'f' }, 'IPv6'),
         el('select', { onchange: function (e) { L.ipv6 = e.target.value; } },
           [['tunnel', 'Route via tunnel if it has IPv6, otherwise block'], ['block', 'Always block IPv6 for policy traffic'], ['off', 'Off (IPv6 may leak)']].map(function (o) { return el('option', { value: o[0], selected: L.ipv6 === o[0] }, o[1]); })),
@@ -910,7 +917,8 @@
       mode('block_dot', 'Block DNS over TLS (port 853)', 'DoT'),
       mode('block_doh', 'Block DNS over HTTPS (known resolvers)', 'DoH'),
       el('div', { class: 'small muted' }, '"Per policy" uses each policy\'s leak protection toggle. Blocking makes devices fall back to the router\'s DNS, which snake needs to see which domains they use. "Never" lets them keep encrypted DNS, but domain rules then miss those devices\' lookups.'),
-      num('dns_forward_port', 'Preferred local port base for DoT/DoH', 'Policy id is added. Occupied ports and mDNS port 5353 are skipped automatically; Status shows the actual port. Only reachable from the router itself.'));
+      num('dns_forward_port', 'Preferred local port base for DoT/DoH', 'Policy id is added. Occupied ports and mDNS port 5353 are skipped automatically; Status shows the actual port. Only reachable from the router itself.'),
+      num('sni_proxy_port', 'SNI proxy port', 'Used by policies with "Route HTTPS by TLS server name". Only connections redirected by snake are served.'));
   }
 
   // ---------- updates ----------
