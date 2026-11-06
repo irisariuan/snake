@@ -9,9 +9,9 @@ import (
 	"time"
 )
 
-func upstreamDialer(mark uint32, timeout time.Duration) *net.Dialer {
+func upstreamDialer(up Upstream, timeout time.Duration) *net.Dialer {
 	d := &net.Dialer{Timeout: timeout}
-	if mark != 0 {
+	if up.Mark != 0 || up.Iface != "" {
 		d.Control = func(_, _ string, _ syscall.RawConn) error {
 			return errors.New("marked DNS routing requires Linux")
 		}

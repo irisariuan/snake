@@ -128,7 +128,7 @@ func TestIntegrationSharedDNSResolver(t *testing.T) {
 			}
 			var specs []dnsfwd.Spec
 			for i := 1; i <= 2; i++ {
-				specs = append(specs, dnsfwd.Spec{ID: i, Listen: "127.0.0.1:0", Up: dnsfwd.Upstream{Proto: proto, IP: "203.0.113.53", Port: port, TLSName: "example.com", Path: "/dns-query", RootCAs: pool, Mark: s.ProbeMark(fmt.Sprintf("wgc%d", i))}})
+				specs = append(specs, dnsfwd.Spec{ID: i, Listen: "127.0.0.1:0", Up: dnsfwd.Upstream{Proto: proto, IP: "203.0.113.53", Port: port, TLSName: "example.com", Path: "/dns-query", RootCAs: pool, Mark: s.ProbeMark(fmt.Sprintf("wgc%d", i)), Iface: fmt.Sprintf("wgc%d", i)}})
 			}
 			if err := m.Configure(specs); err != nil {
 				t.Fatal(err)
@@ -149,6 +149,22 @@ func TestIntegrationSharedDNSResolver(t *testing.T) {
 				t.Fatal("down tunnel leaked DNS through another route")
 			}
 			probes[0].Up = true
+			if err := rm.Sync(s, nil, probes, false); err != nil {
+				t.Fatal(err)
+			}
+			// Even if another service removes the mark rules, a socket
+			// must not use a default route through the other VPN/WAN.
+			m.Stop()
+			rm.Teardown(false)
+			sh(t, "ip route replace default dev wgc2")
+			defer exec.Command("ip", "route", "del", "default", "dev", "wgc2").Run()
+			if err := m.Configure(specs); err != nil {
+				t.Fatal(err)
+			}
+			if answer, err := dnsinspect.Query(m.Stats()[1].Listen, "test.example", 2*time.Second); err == nil && len(answer.IPs) > 0 {
+				t.Fatal("missing rules leaked DNS through the default route")
+			}
+			sh(t, "ip route del default dev wgc2")
 			if err := rm.Sync(s, nil, probes, false); err != nil {
 				t.Fatal(err)
 			}

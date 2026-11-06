@@ -44,6 +44,7 @@ type Upstream struct {
 	TLSName  string // certificate name, also the DoH Host
 	Path     string // DoH path
 	Mark     uint32 // tunnel probe mark; independent of the resolver IP
+	Iface    string // bind to the tunnel too, so missing rules cannot leak to WAN
 	Disabled bool   // no healthy tunnel: SERVFAIL without dialing
 	// RootCAs overrides the system roots (tests).
 	RootCAs *x509.CertPool
@@ -111,7 +112,7 @@ type dot struct {
 func newDoT(u Upstream) *dot { return &dot{up: u, pool: make(chan *tls.Conn, 4)} }
 
 func (d *dot) dial(ctx context.Context) (*tls.Conn, error) {
-	nd := upstreamDialer(d.up.Mark, queryTimeout)
+	nd := upstreamDialer(d.up, queryTimeout)
 	raw, err := nd.DialContext(ctx, "tcp", d.up.addr())
 	if err != nil {
 		return nil, err
@@ -218,7 +219,7 @@ func newDoH(u Upstream) *doh {
 	tr := &http.Transport{
 		Proxy: nil, // never through an HTTP proxy: the tunnel is the path
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			nd := upstreamDialer(u.Mark, queryTimeout)
+			nd := upstreamDialer(u, queryTimeout)
 			return nd.DialContext(ctx, "tcp", u.addr()) // always the configured IP
 		},
 		TLSClientConfig:     tlsConfig(u),
@@ -506,7 +507,7 @@ func (m *Manager) Configure(specs []Spec) error {
 
 func sameSpec(a, b Spec) bool {
 	return a.Listen == b.Listen && a.Up.Proto == b.Up.Proto && a.Up.IP == b.Up.IP && a.Up.Port == b.Up.Port &&
-		a.Up.TLSName == b.Up.TLSName && a.Up.Path == b.Up.Path && a.Up.RootCAs == b.Up.RootCAs && a.Up.Mark == b.Up.Mark && a.Up.Disabled == b.Up.Disabled
+		a.Up.TLSName == b.Up.TLSName && a.Up.Path == b.Up.Path && a.Up.RootCAs == b.Up.RootCAs && a.Up.Mark == b.Up.Mark && a.Up.Iface == b.Up.Iface && a.Up.Disabled == b.Up.Disabled
 }
 
 func joinErrs(errs []string) string {

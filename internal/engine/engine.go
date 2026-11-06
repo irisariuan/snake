@@ -701,14 +701,16 @@ func forwarders(cfg *config.Config, states []netfilter.PolicyState) []dnsfwd.Spe
 			continue
 		}
 		var mark uint32
+		var iface string
 		if st.ActiveTunnel != "" {
 			mark = cfg.Settings.ProbeMark(st.ActiveTunnel)
+			iface = config.TunnelInterface(st.ActiveTunnel)
 		}
 		out = append(out, dnsfwd.Spec{
 			ID:     p.ID,
 			Listen: net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.Settings.DNSForwardPort+p.ID)),
 			Up: dnsfwd.Upstream{Proto: p.Leak.DNSProtocol, IP: p.Leak.DNSServer, TLSName: p.Leak.DNSTLSName, Path: p.Leak.DNSDoHPath,
-				Mark: mark, Disabled: st.ActiveTunnel == ""},
+				Mark: mark, Iface: iface, Disabled: st.ActiveTunnel == ""},
 		})
 	}
 	return out
