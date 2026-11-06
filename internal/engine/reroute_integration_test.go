@@ -104,6 +104,14 @@ except Exception as e:
 		_ = cli.Process.Kill()
 		t.Fatalf("connection over WAN did not work: %q", out.String())
 	}
+	// Firmware classification can replace a WAN connmark with bits equal
+	// to a policy id. The NAT binding must win over both that connmark and
+	// a policy-looking packet mark. This reproduces GitHub downloads that
+	// connected normally and then stalled after a few response records.
+	sh(t, "conntrack -U -p tcp -s 192.168.77.2 -d 203.0.113.80 --mark 0x10000/0xff0000")
+	foreign := "-t mangle -I PREROUTING 1 -i br0 -d 203.0.113.80 -p tcp --tcp-flags SYN,ACK ACK -j MARK --set-xmark 0x10000/0xff0000"
+	sh(t, "iptables "+foreign)
+	defer exec.Command("sh", "-c", "iptables "+strings.Replace(foreign, "-I PREROUTING 1", "-D PREROUTING", 1)).Run()
 	sh(t, "ipset add SNK_1_d4 203.0.113.80") // e.g. a shared CDN address answered for a policy domain
 	_ = os.WriteFile(flag, nil, 0o600)
 	_ = cli.Wait()

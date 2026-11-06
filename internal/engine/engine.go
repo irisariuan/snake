@@ -170,6 +170,7 @@ func (e *Engine) Load() error {
 	e.mu.Lock()
 	e.cfg, e.rt = c, c.Runtime()
 	e.rtc.MarkMask = c.Settings.MarkMask
+	e.rtc.ConnMask = c.Settings.ConnMarkMask
 	e.asnCache = &asn.Cache{Dir: e.P.ASNDir, MaxAge: time.Duration(c.Settings.ASNRefresh) * time.Hour}
 	e.mu.Unlock()
 	return e.openLearnings()
@@ -214,6 +215,7 @@ func (e *Engine) SetConfig(c *config.Config) error {
 	e.mu.Lock()
 	e.cfg, e.rt = c, c.Runtime()
 	e.rtc.MarkMask = c.Settings.MarkMask
+	e.rtc.ConnMask = c.Settings.ConnMarkMask
 	e.asnCache = &asn.Cache{Dir: e.P.ASNDir, MaxAge: time.Duration(c.Settings.ASNRefresh) * time.Hour}
 	e.mu.Unlock()
 	e.event("", "config", "configuration saved")
@@ -545,7 +547,7 @@ func (e *Engine) Apply(reason string) error {
 		dnsQueue = s.QueueBase
 	}
 	plan := netfilter.Build(s, states, netfilter.Options{IPv6: caps.IPv6, IPv6NAT: caps.IPv6NAT, DNSQueue: dnsQueue, Existing: existing,
-		TunnelAddrs: tunnelAddrs(usedTunnels(cfg))})
+		TunnelAddrs: tunnelAddrs(usedTunnels(cfg)), WANAddrs: e.wanAddrs()})
 	if err := nf.Apply(plan); err != nil {
 		errs = append(errs, err.Error())
 	}
@@ -602,7 +604,7 @@ func (e *Engine) Apply(reason string) error {
 		}
 		tracks = append(tracks, webrtc.PolicyTrack{ID: st.Policy.ID, Queue: uint16(s.QueueBase + st.Policy.ID), Mark: s.PolicyMark(st.Policy.ID)})
 	}
-	key := fmt.Sprintf("%v%v%x", tracks, caps.NFQueue, s.MarkMask)
+	key := fmt.Sprintf("%v%v%x%x", tracks, caps.NFQueue, s.MarkMask, s.ConnMarkMask)
 	e.mu.Lock()
 	rtcChanged := key != e.rtcKey
 	e.rtcKey = key
@@ -634,6 +636,25 @@ func (e *Engine) Apply(reason string) error {
 	}
 	logx.Infof("applied (%s): %d policies", reason, len(states))
 	return nil
+}
+
+// wanAddrs includes both WAN units so existing flows retain their exit on
+// dual-WAN routers. Reject unset/disconnected NVRAM values.
+func (e *Engine) wanAddrs() []string {
+	nv := system.NVRAM{R: e.R}
+	var out []string
+	for _, key := range []string{"wan0_ipaddr", "wan1_ipaddr"} {
+		ip := net.ParseIP(nv.Get(key))
+		if ip == nil || ip.To4() == nil || ip.IsUnspecified() || ip.IsLoopback() {
+			continue
+		}
+		addr := ip.String()
+		if len(out) == 0 || out[0] != addr {
+			out = append(out, addr)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // tunnelAddrs returns the global addresses of each tunnel interface.
@@ -835,12 +856,18 @@ func LocalResolver() *net.Resolver {
 // connections still carrying marks in the old bits, so they do not keep
 // those bits and reconnect on the new marks.
 func (e *Engine) migrateMarks(c *config.Config, old uint32) {
-	e.event("", "config", "mark mask moved from 0x%08x back to 0x%08x (the old bits are Broadcom packet fields)", old, c.Settings.MarkMask)
+	e.event("", "config", "connection policy marks now use isolated mask 0x%08x; retired mark mask 0x%08x", c.Settings.ConnMarkMask, old)
 	if e.DryRun {
 		return
 	}
 	if err := config.Save(e.P.Config, c); err != nil {
 		logx.Warnf("save migrated config: %v", err)
+	}
+	// Old packet bits are also firmware classification bits. Do not
+	// delete those WAN sessions on upgrade. Existing tunnel sessions are
+	// adopted by their NAT address and receive the new connection mark.
+	if old != config.BadMarkMask {
+		return
 	}
 	if !system.Exists("conntrack") {
 		return
@@ -866,9 +893,8 @@ func (e *Engine) Warnings() []string {
 	cfg := e.runtime()
 	caps := e.Caps()
 	var w []string
-	if caps.AdaptiveQoS && cfg.Settings.MarkMask&config.AdaptiveQoSMask != 0 {
-		w = append(w, fmt.Sprintf("Adaptive QoS is on and shares mark bits with snake (0x%08x vs 0x%08x). If WAN downloads stall partway, check whether their connection mark equals a policy mark (snake test / conntrack) and report it.",
-			cfg.Settings.MarkMask, config.AdaptiveQoSMask))
+	if caps.AdaptiveQoS && cfg.Settings.ConnMarkMask&config.AdaptiveQoSMask != 0 {
+		w = append(w, "connection policy marks overlap Adaptive QoS; use the default connection mark mask")
 	}
 	return w
 }
@@ -882,7 +908,7 @@ func (e *Engine) flushConntrack(id int) {
 	if !cfg.Settings.FlushConntrack || !caps.Conntrack || e.DryRun {
 		return
 	}
-	m := fmt.Sprintf("0x%x/0x%x", cfg.Settings.PolicyMark(id), cfg.Settings.MarkMask)
+	m := fmt.Sprintf("0x%x/0x%x", cfg.Settings.ConnMark(id), cfg.Settings.ConnMarkMask)
 	_, _ = e.R.Run("conntrack", "-D", "-f", "ipv4", "--mark", m)
 	if caps.IPv6 {
 		_, _ = e.R.Run("conntrack", "-D", "-f", "ipv6", "--mark", m)

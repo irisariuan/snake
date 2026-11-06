@@ -211,10 +211,10 @@ func TestMigrateMarkMask(t *testing.T) {
 	if c.Settings.MarkMask != DefaultMarkMask || c.MigratedMarkMask() != BadMarkMask || c.Version != CurrentVersion {
 		t.Fatalf("not migrated: mask %#x migrated %#x version %d", c.Settings.MarkMask, c.MigratedMarkMask(), c.Version)
 	}
-	// Version 1 on the default, and custom masks, are left alone.
+	// Legacy packet masks stay unchanged; their conntrack bits are retired.
 	for _, js := range []string{`{"version":1,"settings":{"mark_mask":16711680}}`, `{"version":2,"settings":{"mark_mask":65280}}`} {
 		c := load(js)
-		if c.MigratedMarkMask() != 0 || c.Version != CurrentVersion || (c.Settings.MarkMask != DefaultMarkMask && c.Settings.MarkMask != 0xff00) {
+		if c.MigratedMarkMask() != c.Settings.MarkMask || c.Version != CurrentVersion || (c.Settings.MarkMask != DefaultMarkMask && c.Settings.MarkMask != 0xff00) {
 			t.Fatalf("%s: mask %#x migrated %#x", js, c.Settings.MarkMask, c.MigratedMarkMask())
 		}
 	}

@@ -37,6 +37,9 @@ func (f fakeMerlin) Run(name string, args ...string) (string, error) {
 func (f fakeMerlin) RunInput(in, name string, args ...string) (string, error) {
 	switch name {
 	case "nvram":
+		if len(args) == 2 && args[1] == "wan0_ipaddr" {
+			return "198.18.0.1", nil
+		}
 		if len(args) == 2 && args[1] == "ipv6_service" {
 			return "native", nil
 		}

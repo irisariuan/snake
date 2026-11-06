@@ -95,7 +95,8 @@ while True:
 	defer exec.Command("sh", "-c", "iptables "+strings.Replace(foreign, "-A", "-D", 1)).Run()
 
 	time.Sleep(300 * time.Millisecond)
-	cli := exec.Command("ip", "netns", "exec", "snakelan", "python3", "-c", `
+	runClient := func(label string) {
+		cli := exec.Command("ip", "netns", "exec", "snakelan", "python3", "-c", `
 import socket
 try:
     c = socket.create_connection(("203.0.113.80", 80), timeout=3); f = c.makefile("rwb")
@@ -104,14 +105,43 @@ try:
 except Exception as e:
     print("stalled " + type(e).__name__, flush=True)
 `)
-	out, _ := cli.CombinedOutput()
-	if got := strings.Fields(string(out)); strings.Join(got, " ") != "one two three" {
-		t.Errorf("tunnel connection broke while another component rewrote its conntrack mark: %q", out)
+		out, err := cli.CombinedOutput()
+		if got := strings.Fields(string(out)); err != nil || strings.Join(got, " ") != "one two three" {
+			t.Fatalf("%s: connection failed: %q (%v)", label, out, err)
+		}
 	}
+	runClient("tunnel with overwritten connmark")
 	// The packets after the first were carried by the rule that recognises
 	// tunnel connections by their NAT address.
 	rec := sh(t, "iptables -t mangle -L SNAKE -v -n -x | grep ctrepldst || true")
 	if f := strings.Fields(rec); len(f) == 0 || f[0] == "0" {
 		t.Errorf("tunnel recovery rule missing or unused:\n%s", rec)
 	}
+
+	// Simulate Adaptive QoS on both NEW and ESTABLISHED packets. Its
+	// category deliberately equals policy 1 in the old shared mark bits.
+	// Separate policy ownership must survive classification, QoS bits
+	// must survive policy assignment, and the egress packet must have its
+	// QoS classification restored after the routing decision.
+	sh(t, "iptables "+strings.Replace(foreign, "-A", "-D", 1))
+	sh(t, "iptables -t mangle -N TEST_CLASSIFY; iptables -t mangle -A TEST_CLASSIFY -j CONNMARK --set-xmark 0x80010002/0xc03fffff; iptables -t mangle -A TEST_CLASSIFY -j MARK --set-xmark 0x80010002/0xc03fffff; iptables -t mangle -I PREROUTING 1 -i br0 -d 203.0.113.80 -j TEST_CLASSIFY")
+	defer exec.Command("sh", "-c", "iptables -t mangle -D PREROUTING -i br0 -d 203.0.113.80 -j TEST_CLASSIFY; iptables -t mangle -F TEST_CLASSIFY; iptables -t mangle -X TEST_CLASSIFY").Run()
+	sh(t, "iptables -t mangle -N TEST_QOS; iptables -t mangle -A TEST_QOS -j RETURN; iptables -t mangle -A POSTROUTING -o wgc1 -m mark --mark 0x80010002/0xc03fffff -j TEST_QOS")
+	defer exec.Command("sh", "-c", "iptables -t mangle -D POSTROUTING -o wgc1 -m mark --mark 0x80010002/0xc03fffff -j TEST_QOS; iptables -t mangle -F TEST_QOS; iptables -t mangle -X TEST_QOS").Run()
+	runClient("tunnel with QoS enabled")
+	sh(t, "conntrack -L -p tcp -s 192.168.77.2 -d 203.0.113.80 --mark 0x80410002/0xffffffff")
+	counters := sh(t, "iptables -t mangle -nvxL TEST_QOS")
+	seen := false
+	for _, line := range strings.Split(counters, "\n") {
+		f := strings.Fields(line)
+		if len(f) > 2 && f[2] == "RETURN" && f[0] != "0" {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatalf("VPN egress lost QoS classification:\n%s", counters)
+	}
+	sh(t, "ipset del SNK_1_d4 203.0.113.80")
+	runClient("WAN with QoS enabled")
+	sh(t, "conntrack -L -p tcp -s 192.168.77.2 -d 203.0.113.80 --mark 0x80010002/0xffffffff")
 }

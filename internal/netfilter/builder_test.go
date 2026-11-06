@@ -45,10 +45,10 @@ func TestBuild(t *testing.T) {
 	plan := Build(c.Settings, st, Options{IPv6: true, IPv6NAT: true, Existing: map[string][]string{"4/mangle": {"SNAKE", "SNAKE_P9", "SNAKE_M9"}}})
 	m4 := plan.Restore["4/mangle"]
 	mustContain(t, m4,
-		"-A SNAKE -m mark --mark 0/0xff0000 -j CONNMARK --restore-mark --nfmask 0xff0000 --ctmask 0xff0000",
-		"-A SNAKE -m mark ! --mark 0/0xff0000 -g SNAKE_SAVE",
-		"-A SNAKE -m mark --mark 0/0xff0000 -m conntrack ! --ctstate NEW -j RETURN",
-		"-A SNAKE_M1 -j MARK --set-xmark 0x10000/0xff0000",
+		"-A SNAKE -m connmark --mark 0x400000/0x3fc00000 -g SNAKE_M1",
+		"-A SNAKE -m mark ! --mark 0/0xff0000 -m mark --mark 0/0xc0000000 -g SNAKE_SAVE",
+		"-A SNAKE -m conntrack ! --ctstate NEW -j RETURN",
+		"-A SNAKE_M1 -j MARK --set-xmark 0x10000/0xc0ff0000",
 		"-A SNAKE_P1 -m set --match-set SNK_1_d4 dst -g SNAKE_M1",
 		"-A SNAKE_P1 -m set --match-set SNK_1_n4 dst -g SNAKE_M1",
 		// session refresh + learned peers + nfqueue
@@ -82,7 +82,7 @@ func TestBuild(t *testing.T) {
 	}
 	n4 := plan.Restore["4/nat"]
 	// policies 1 (global) and 2 (devices) both hijack: global wins, no per-mac duplicates
-	mustContain(t, n4, "-A SNAKE_DNS -i br+ -p udp --dport 53 -j REDIRECT --to-ports 53", "-A SNAKE_NAT -o wgc1 -m mark ! --mark 0/0xff0000 -j MASQUERADE")
+	mustContain(t, n4, "-A SNAKE_DNS -i br+ -p udp --dport 53 -j REDIRECT --to-ports 53", "-A SNAKE_NAT -o wgc1 -m connmark --mark 0x400000/0x3fc00000 -j MASQUERADE")
 	if strings.Contains(n4, "--mac-source") {
 		t.Error("global DNS hijack should not need per-MAC rules")
 	}
@@ -106,7 +106,7 @@ func TestBuild(t *testing.T) {
 	if strings.Contains(m4, "NFQUEUE --queue-num 4200") {
 		t.Error("DNS queue rule without DNSQueue option")
 	}
-	if len(plan.Hooks) != 12 {
+	if len(plan.Hooks) != 14 {
 		t.Errorf("hooks = %d", len(plan.Hooks))
 	}
 }
@@ -228,8 +228,8 @@ func TestBuildTunnelConnectionRecovery(t *testing.T) {
 		"wgc1": {"10.66.0.2", "fd00::2"}, "wgc2": {"10.77.0.2"},
 	}})
 	m4, m6 := plan.Restore["4/mangle"], plan.Restore["6/mangle"]
-	rec := "-A SNAKE -m mark --mark 0/0xff0000 -m conntrack --ctstate ESTABLISHED,RELATED --ctrepldst 10.66.0.2 -g SNAKE_M1"
-	ret := "-A SNAKE -m mark --mark 0/0xff0000 -m conntrack ! --ctstate NEW -j RETURN"
+	rec := "-A SNAKE -m conntrack --ctstate ESTABLISHED,RELATED --ctrepldst 10.66.0.2 -g SNAKE_M1"
+	ret := "-A SNAKE -m conntrack ! --ctstate NEW -j RETURN"
 	mustContain(t, m4, rec, "--ctrepldst 10.77.0.2 -g SNAKE_M2", ret)
 	if strings.Index(m4, rec) > strings.Index(m4, ret) {
 		t.Error("recovery rule after the WAN-affinity RETURN")
@@ -242,5 +242,25 @@ func TestBuildTunnelConnectionRecovery(t *testing.T) {
 	// Policy 3 has no active tunnel: nothing recovers into it.
 	if regexp.MustCompile(`ctrepldst \S+ -g SNAKE_M3`).MatchString(m4) {
 		t.Error("recovery rule for a policy without tunnel")
+	}
+}
+
+func TestBuildWANIdentityBeforeMarks(t *testing.T) {
+	c, st := states(t)
+	plan := Build(c.Settings, st, Options{IPv6: true, WANAddrs: []string{"198.51.100.20", "0.0.0.0", "invalid", "2001:db8::20"}})
+	for _, family := range []string{"4", "6"} {
+		m := plan.Restore[family+"/mangle"]
+		guard := strings.Index(m, "--ctrepldst")
+		restore := strings.Index(m, "-A SNAKE -m connmark --mark")
+		if guard < 0 || restore < 0 || guard > restore {
+			t.Errorf("%s: WAN guard must precede foreign mark restoration", family)
+		}
+		mustContain(t, m, "-g SNAKE_WAN", "-A SNAKE_WAN -m mark --mark 0/0xc0000000 -j MARK --set-xmark 0/0xff0000", "-A SNAKE_WAN -j RETURN")
+		if strings.Contains(m, "--ctrepldst 0.0.0.0") || strings.Contains(m, "invalid") {
+			t.Error("invalid WAN address accepted")
+		}
+	}
+	if strings.Contains(plan.Restore["4/mangle"], "2001:db8::20") || strings.Contains(plan.Restore["6/mangle"], "198.51.100.20") {
+		t.Error("WAN guard used an address from the other family")
 	}
 }

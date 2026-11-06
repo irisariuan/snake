@@ -132,6 +132,9 @@ One rule per line:
   firmware component rewrites its conntrack mark.
   Accelerated packets reported as INVALID or UNTRACKED keep their existing
   route too; only NEW connections are evaluated against policy destinations.
+  Existing WAN connections are recognised by their NAT address before marks
+  are restored: firmware can overwrite a WAN connection mark with bits that
+  look like a VPN policy, even with Adaptive QoS disabled.
 * **Exclusions** veto a policy for that answer. A later policy can still match it.
 * **Drop rules** block instead of route. DNS still answers, but the answered
   addresses go into the policy's drop set (`SNK_<id>_x4/6`; `drop:asn:` and

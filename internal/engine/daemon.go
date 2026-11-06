@@ -118,6 +118,8 @@ func (e *Engine) checkHealth(geo bool) {
 		ifc := config.TunnelInterface(t)
 		lk = append(lk, ifc+"="+strings.Join(addrs[ifc], "/"))
 	}
+	// Refresh WAN-affinity guards after a DHCP/PPPoE address change too.
+	lk = append(lk, "wan="+strings.Join(e.wanAddrs(), "/"))
 	linkKey := strings.Join(lk, ",")
 	e.mu.Lock()
 	linkChanged := linkKey != e.linkKey

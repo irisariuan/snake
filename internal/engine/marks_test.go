@@ -3,7 +3,6 @@ package engine
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/irisariuan/snake/internal/config"
@@ -33,8 +32,8 @@ func TestBadMarkMaskMigratedBack(t *testing.T) {
 		t.Fatalf("migration not saved: version %d mask %#x", saved.Version, saved.Settings.MarkMask)
 	}
 
-	// Adaptive QoS shares bits with the default mask: it is pointed out.
-	if w := e.Warnings(); len(w) != 1 || !strings.Contains(w[0], "Adaptive QoS") {
+	// The separate connection mask is safe with Adaptive QoS enabled.
+	if w := e.Warnings(); len(w) != 0 {
 		t.Fatalf("warnings %v", w)
 	}
 }

@@ -48,6 +48,9 @@ type Options struct {
 	// destination, which identifies them even when their conntrack mark is
 	// lost.
 	TunnelAddrs map[string][]string
+	// WANAddrs identify connections already NATed onto WAN. Firmware can
+	// overwrite their conntrack mark with a value that resembles a policy.
+	WANAddrs []string
 }
 
 // Plan is a set of iptables-restore payloads keyed by "family/table".
@@ -137,6 +140,7 @@ func Build(s config.Settings, states []PolicyState, opt Options) Plan {
 		plan.Hooks = append(plan.Hooks,
 			Hook{V6: v6, Table: "mangle", Chain: "PREROUTING", Args: []string{"-i", lan, "-j", ChainMain}},
 			Hook{V6: v6, Table: "mangle", Chain: "FORWARD", Args: []string{"-j", ChainMSS}},
+			Hook{V6: v6, Table: "mangle", Chain: "POSTROUTING", Args: []string{"-j", ChainQoS}},
 			Hook{V6: v6, Table: "mangle", Chain: "OUTPUT", Args: []string{"-p", "udp", "--sport", "53", "-j", ChainDNSOut}},
 			Hook{V6: v6, Table: "filter", Chain: "FORWARD", Args: []string{"-j", ChainFwd}},
 		)
@@ -153,8 +157,11 @@ func Build(s config.Settings, states []PolicyState, opt Options) Plan {
 func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) (mangle, nat, filter *table) {
 	mangle, nat, filter = &table{}, &table{}, &table{}
 	mask := hex(s.MarkMask)
+	rmask := hex(s.RouteMask())
+	cmask := hex(s.ConnMarkMask)
+	qdir := hex(config.QoSDirMask)
 	lan := s.LANInterfaces
-	for _, c := range []string{ChainMain, ChainSave, ChainRTC, ChainMSS, ChainDNSOut} {
+	for _, c := range []string{ChainMain, ChainSave, ChainRTC, ChainMSS, ChainDNSOut, ChainQoS} {
 		mangle.chain(c)
 	}
 	if opt.DNSQueue > 0 {
@@ -173,12 +180,27 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		reject = "icmp6-port-unreachable"
 	}
 
-	// Connection affinity: restore the policy mark of an existing connection,
-	// and stop processing anything that already carries a policy mark.
-	mangle.add(ChainSave, "-j CONNMARK --save-mark --nfmask", mask, "--ctmask", mask)
-	mangle.add(ChainMain, "-m mark --mark 0/"+mask, "-j CONNMARK --restore-mark --nfmask", mask, "--ctmask", mask)
-	mangle.add(ChainMain, "-m mark ! --mark 0/"+mask, "-g", ChainSave)
-	mangle.add(ChainMain, "-d", strings.Join(private, ","), "-j RETURN")
+	// Policy ownership lives in separate conntrack bits, never in the
+	// firmware's QoS category/flow-id bits. Translate explicitly below.
+	// NAT identity takes precedence over shared firmware marks. A WAN flow
+	// can acquire a policy-looking connmark after classification, even with
+	// Adaptive QoS disabled. Restoring it would move that flow into a VPN.
+	// Clear only snake's packet bits; leave the firmware's connmark alone.
+	for _, addr := range opt.WANAddrs {
+		ip := net.ParseIP(addr)
+		if ip == nil || ip.IsUnspecified() || (ip.To4() == nil) != v6 {
+			continue
+		}
+		mangle.chain(ChainWAN)
+		mangle.add(ChainMain, "-m conntrack --ctstate ESTABLISHED,RELATED --ctrepldst", ip.String(), "-g", ChainWAN)
+	}
+	if mangle.seen[ChainWAN] {
+		// A real QoS packet mark is preserved in full; RouteMask prevents
+		// it from matching a VPN ip rule. Clear ambiguous policy-looking
+		// packet bits only when no QoS direction is present.
+		mangle.add(ChainWAN, "-m mark --mark 0/"+qdir, "-j MARK --set-xmark", "0/"+mask)
+		mangle.add(ChainWAN, "-j RETURN")
+	}
 	// A connection NATed out a tunnel (reply destination = the tunnel's
 	// address) stays in that tunnel even if its conntrack mark was lost:
 	// other firmware components rewrite conntrack marks, and without this
@@ -199,9 +221,27 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 			if ip == nil || (ip.To4() == nil) != v6 {
 				continue
 			}
-			mangle.add(ChainMain, "-m mark --mark 0/"+mask, "-m conntrack --ctstate ESTABLISHED,RELATED --ctrepldst", a, "-g", MarkChain(st.Policy.ID))
+			mangle.add(ChainMain, "-m conntrack --ctstate ESTABLISHED,RELATED --ctrepldst", a, "-g", MarkChain(st.Policy.ID))
 		}
 	}
+	for _, st := range states {
+		if !st.Policy.Enabled || (v6 && st.IPv6Mode == V6Off) {
+			continue
+		}
+		id := st.Policy.ID
+		mark, conn := hex(s.PolicyMark(id)), hex(s.ConnMark(id))
+		mangle.add(ChainSave, "-m mark --mark", mark+"/"+rmask, "-j CONNMARK --set-xmark", conn+"/"+cmask)
+		mangle.add(ChainMain, "-m connmark --mark", conn+"/"+cmask, "-g", MarkChain(id))
+		// Routing has finished at POSTROUTING. Put the firmware's QoS
+		// classification back on routed packets for egress scheduling.
+		// NAT matches the isolated connection mark, not these packet bits.
+		mangle.add(ChainQoS, "-m connmark --mark", conn+"/"+cmask, "-m connmark ! --mark 0/"+qdir,
+			"-j CONNMARK --restore-mark --nfmask", hex(config.AdaptiveQoSMask), "--ctmask", hex(config.AdaptiveQoSMask))
+	}
+	// NFQUEUE repeats a new STUN packet with an explicit policy mark.
+	// QoS marks must never be saved as policy ownership.
+	mangle.add(ChainMain, "-m mark ! --mark 0/"+mask, "-m mark --mark 0/"+qdir, "-g", ChainSave)
+	mangle.add(ChainMain, "-d", strings.Join(private, ","), "-j RETURN")
 	// A connection keeps the route it started with. One that began on WAN
 	// (no policy mark) must not move into a tunnel when its destination
 	// joins a policy set later (e.g. a CDN address shared with a policy
@@ -211,8 +251,8 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 	// stay on their route too: on Broadcom routers many packets of
 	// accelerated WAN flows are seen that way, and matching them against
 	// policies pushed some into a tunnel and slowed WAN traffic (v1.0.5).
-	mangle.add(ChainMain, "-m mark --mark 0/"+mask, "-m conntrack ! --ctstate NEW -j RETURN")
-	mangle.add(ChainRTC, "-m mark ! --mark 0/"+mask, "-j RETURN")
+	mangle.add(ChainMain, "-m conntrack ! --ctstate NEW -j RETURN")
+	mangle.add(ChainRTC, "-m mark ! --mark 0/"+mask, "-m mark --mark 0/"+qdir, "-j RETURN")
 
 	tunnels := map[string]bool{}
 	type scope struct {
@@ -268,7 +308,7 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		pc, mc := PolicyChain(id), MarkChain(id)
 		mangle.chain(pc)
 		mangle.chain(mc)
-		mangle.add(mc, "-j MARK --set-xmark", mark+"/"+mask)
+		mangle.add(mc, "-j MARK --set-xmark", mark+"/"+rmask)
 		mangle.add(mc, "-g", ChainSave)
 
 		dsets := []string{}
@@ -303,7 +343,7 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		}
 
 		mangle.add(ChainMain, "-j", pc)
-		mangle.add(pc, "-m mark ! --mark 0/"+mask, "-j RETURN")
+		mangle.add(pc, "-m mark ! --mark 0/"+mask, "-m mark --mark 0/"+qdir, "-j RETURN")
 		switch {
 		case len(st.MACs) > 0 && len(dsets) == 0: // whole device
 			for _, m := range st.MACs {
@@ -419,7 +459,11 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 	sort.Strings(ifaces)
 	for _, ifc := range ifaces {
 		mangle.add(ChainMSS, "-o", ifc, "-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu")
-		nat.add(ChainNAT, "-o", ifc, "-m mark ! --mark 0/"+mask, "-j MASQUERADE")
+		for _, st := range states {
+			if st.Policy.Enabled && (!v6 || st.IPv6Mode != V6Off) {
+				nat.add(ChainNAT, "-o", ifc, "-m connmark --mark", hex(s.ConnMark(st.Policy.ID))+"/"+cmask, "-j MASQUERADE")
+			}
+		}
 		filter.add(ChainFwd, "-i", lan, "-o", ifc, "-m mark ! --mark 0/"+mask, "-j ACCEPT")
 		filter.add(ChainFwd, "-i", ifc, "-o", lan, "-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT")
 	}
