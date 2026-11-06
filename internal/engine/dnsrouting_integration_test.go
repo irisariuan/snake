@@ -166,7 +166,7 @@ func TestIntegrationSharedDNSResolver(t *testing.T) {
 				t.Fatal(err)
 			}
 			if answer, err := dnsinspect.Query(m.Stats()[1].Listen, "test.example", 2*time.Second); err == nil && len(answer.IPs) > 0 {
-				t.Fatal("down tunnel leaked DNS through another route")
+				t.Fatalf("down tunnel still answered DNS: %v; routes: %s", answer.IPs, sh(t, "ip -4 route show table 1301"))
 			}
 			probes[0].Up = true
 			if err := rm.Sync(s, nil, probes, false); err != nil {

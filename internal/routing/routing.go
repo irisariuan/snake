@@ -215,9 +215,18 @@ func (m Manager) setDefault(v6 bool, table, iface string, kill bool) error {
 	switch {
 	case iface != "":
 		_, err := m.ip(v6, "route", "replace", "default", "dev", iface, "table", table)
+		if err == nil {
+			// A type/scope change can leave both route aliases present.
+			// Install the desired route first, then remove the opposite
+			// type, so there is never a fall-through gap to WAN.
+			_, _ = m.ip(v6, "route", "del", "unreachable", "default", "table", table)
+		}
 		return err
 	case kill:
 		_, err := m.ip(v6, "route", "replace", "unreachable", "default", "table", table)
+		if err == nil {
+			_, _ = m.ip(v6, "route", "del", "unicast", "default", "table", table)
+		}
 		return err
 	}
 	_, _ = m.ip(v6, "route", "flush", "table", table)
