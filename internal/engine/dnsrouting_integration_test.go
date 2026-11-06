@@ -34,6 +34,15 @@ func TestIntegrationSharedDNSResolver(t *testing.T) {
 		t.Fatal("dnsmasq required for resolver isolation regression")
 	}
 	sh(t, "ip link set lo up")
+	// This fixture has two exits to the same remote address and no WAN
+	// default. Reverse-path filtering would reject both replies before the
+	// DNS clients see them, independently of the policy routing under test.
+	allRP := strings.TrimSpace(sh(t, "sysctl -n net.ipv4.conf.all.rp_filter"))
+	defaultRP := strings.TrimSpace(sh(t, "sysctl -n net.ipv4.conf.default.rp_filter"))
+	sh(t, "sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0")
+	t.Cleanup(func() {
+		_ = exec.Command("sysctl", "-qw", "net.ipv4.conf.all.rp_filter="+allRP, "net.ipv4.conf.default.rp_filter="+defaultRP).Run()
+	})
 	dir := t.TempDir()
 	certServer := httptest.NewTLSServer(http.NotFoundHandler())
 	cert := certServer.TLS.Certificates[0]
