@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/irisariuan/snake/internal/config"
+	"github.com/irisariuan/snake/internal/match"
 )
 
 // DefaultDir is where domain_vpn_routing keeps its configuration.
@@ -51,7 +52,16 @@ func Read(dir string) (Result, error) {
 		}
 		p := newPolicy(name, iface)
 		for _, d := range domains {
-			if d = config.NormalizeDomain(d); d != "" {
+			if strings.HasPrefix(d, "/") || strings.HasPrefix(d, "re:") {
+				d = match.Normalize(d)
+			} else {
+				d = config.NormalizeDomain(d)
+			}
+			if d != "" {
+				if _, err := match.Parse(d); err != nil {
+					res.Warnings = append(res.Warnings, fmt.Sprintf("policy %s: invalid rule %q: %v", name, d, err))
+					continue
+				}
 				p.Domains = append(p.Domains, d)
 			}
 		}

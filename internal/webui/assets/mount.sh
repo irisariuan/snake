@@ -3,12 +3,11 @@
 # Follows the Asuswrt-Merlin Addons API. Called with: mount.sh <asp-source>
 ASP_SRC="$1"
 TITLE="snake"
-. /usr/sbin/helper.sh
-
-if [ "$(nvram get buildno | cut -d. -f1)" -lt 384 ] 2>/dev/null; then
+if [ ! -r /usr/sbin/helper.sh ] || ! grep -q '^am_get_webui_page()' /usr/sbin/helper.sh; then
   echo "snake: firmware does not support the Addons API" >&2
   exit 1
 fi
+. /usr/sbin/helper.sh
 
 # Wait for the web server lock used by other addons.
 i=0
