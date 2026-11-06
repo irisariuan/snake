@@ -157,7 +157,7 @@ func TestIntegrationApply(t *testing.T) {
 		if r := sh(t, "ip -6 route show table 1001"); !strings.Contains(r, "unreachable default") {
 			t.Errorf("v6 after failover to v4-only tunnel should be unreachable: %s", r)
 		}
-		if !strings.Contains(sh(t, "ip6tables-save -t filter"), "-A SNAKE_FWD -m mark --mark 0x10000/0xc0ff0000 -j REJECT") {
+		if !strings.Contains(sh(t, "ip6tables-save -t filter"), "-A SNAKE_FWD -m connmark --mark 0x400000/0x3fc00000 -j REJECT") {
 			t.Error("v6 block rule not installed after failover to v4-only tunnel")
 		}
 	}

@@ -37,7 +37,6 @@ const (
 	ChainMain   = "SNAKE"
 	ChainSave   = "SNAKE_SAVE"
 	ChainWAN    = "SNAKE_WAN"
-	ChainQoS    = "SNAKE_QOS"
 	ChainRTC    = "SNAKE_RTC"
 	ChainMSS    = "SNAKE_MSS"
 	ChainDNS    = "SNAKE_DNS"

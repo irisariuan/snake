@@ -140,7 +140,6 @@ func Build(s config.Settings, states []PolicyState, opt Options) Plan {
 		plan.Hooks = append(plan.Hooks,
 			Hook{V6: v6, Table: "mangle", Chain: "PREROUTING", Args: []string{"-i", lan, "-j", ChainMain}},
 			Hook{V6: v6, Table: "mangle", Chain: "FORWARD", Args: []string{"-j", ChainMSS}},
-			Hook{V6: v6, Table: "mangle", Chain: "POSTROUTING", Args: []string{"-j", ChainQoS}},
 			Hook{V6: v6, Table: "mangle", Chain: "OUTPUT", Args: []string{"-p", "udp", "--sport", "53", "-j", ChainDNSOut}},
 			Hook{V6: v6, Table: "filter", Chain: "FORWARD", Args: []string{"-j", ChainFwd}},
 		)
@@ -161,7 +160,7 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 	cmask := hex(s.ConnMarkMask)
 	qdir := hex(config.QoSDirMask)
 	lan := s.LANInterfaces
-	for _, c := range []string{ChainMain, ChainSave, ChainRTC, ChainMSS, ChainDNSOut, ChainQoS} {
+	for _, c := range []string{ChainMain, ChainSave, ChainRTC, ChainMSS, ChainDNSOut} {
 		mangle.chain(c)
 	}
 	if opt.DNSQueue > 0 {
@@ -232,10 +231,12 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		mark, conn := hex(s.PolicyMark(id)), hex(s.ConnMark(id))
 		mangle.add(ChainSave, "-m mark --mark", mark+"/"+rmask, "-j CONNMARK --set-xmark", conn+"/"+cmask)
 		mangle.add(ChainMain, "-m connmark --mark", conn+"/"+cmask, "-g", MarkChain(id))
-		// Routing has finished at POSTROUTING. Put the firmware's QoS
-		// classification back on routed packets for egress scheduling.
-		// NAT matches the isolated connection mark, not these packet bits.
-		mangle.add(ChainQoS, "-m connmark --mark", conn+"/"+cmask, "-m connmark ! --mark 0/"+qdir,
+		// Routing has finished at FORWARD. Reuse the existing MSS hook
+		// to restore QoS classification for egress scheduling. Filter and
+		// NAT policy checks use isolated connection ownership instead of
+		// the now-restored QoS packet bits. Reusing the hook also keeps
+		// rollback compatible with older versions' hook cleanup.
+		mangle.add(ChainMSS, "-m connmark --mark", conn+"/"+cmask, "-m connmark ! --mark 0/"+qdir,
 			"-j CONNMARK --restore-mark --nfmask", hex(config.AdaptiveQoSMask), "--ctmask", hex(config.AdaptiveQoSMask))
 	}
 	// NFQUEUE repeats a new STUN packet with an explicit policy mark.
@@ -391,8 +392,8 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		// IPv6 block: policy traffic that cannot be carried over IPv6 is rejected
 		// so clients fall back to IPv4 (which goes through the tunnel).
 		if v6 && st.IPv6Mode == V6Block {
-			filter.add(ChainFwd, "-m mark --mark", mark+"/"+rmask, "-p tcp -j REJECT --reject-with tcp-reset")
-			filter.add(ChainFwd, "-m mark --mark", mark+"/"+rmask, "-j REJECT --reject-with icmp6-adm-prohibited")
+			filter.add(ChainFwd, "-m connmark --mark", hex(s.ConnMark(id))+"/"+cmask, "-p tcp -j REJECT --reject-with tcp-reset")
+			filter.add(ChainFwd, "-m connmark --mark", hex(s.ConnMark(id))+"/"+cmask, "-j REJECT --reject-with icmp6-adm-prohibited")
 		}
 
 		l := p.Leak
@@ -466,9 +467,9 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 				// connmark before first-packet NAT. The routing mark is
 				// still usable when no QoS direction bits are present.
 				nat.add(ChainNAT, "-o", ifc, "-m mark --mark", hex(s.PolicyMark(st.Policy.ID))+"/"+rmask, "-j MASQUERADE")
+				filter.add(ChainFwd, "-i", lan, "-o", ifc, "-m connmark --mark", hex(s.ConnMark(st.Policy.ID))+"/"+cmask, "-j ACCEPT")
 			}
 		}
-		filter.add(ChainFwd, "-i", lan, "-o", ifc, "-m mark ! --mark 0/"+mask, "-m mark --mark 0/"+qdir, "-j ACCEPT")
 		filter.add(ChainFwd, "-i", ifc, "-o", lan, "-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT")
 	}
 	return mangle, nat, filter
