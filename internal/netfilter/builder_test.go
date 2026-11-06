@@ -47,7 +47,7 @@ func TestBuild(t *testing.T) {
 	mustContain(t, m4,
 		"-A SNAKE -m mark --mark 0/0xff0000 -j CONNMARK --restore-mark --nfmask 0xff0000 --ctmask 0xff0000",
 		"-A SNAKE -m mark ! --mark 0/0xff0000 -g SNAKE_SAVE",
-		"-A SNAKE -m mark --mark 0/0xff0000 -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN",
+		"-A SNAKE -m mark --mark 0/0xff0000 -m conntrack ! --ctstate NEW -j RETURN",
 		"-A SNAKE_M1 -j MARK --set-xmark 0x10000/0xff0000",
 		"-A SNAKE_P1 -m set --match-set SNK_1_d4 dst -g SNAKE_M1",
 		"-A SNAKE_P1 -m set --match-set SNK_1_n4 dst -g SNAKE_M1",
@@ -229,7 +229,7 @@ func TestBuildTunnelConnectionRecovery(t *testing.T) {
 	}})
 	m4, m6 := plan.Restore["4/mangle"], plan.Restore["6/mangle"]
 	rec := "-A SNAKE -m mark --mark 0/0xff0000 -m conntrack --ctstate ESTABLISHED,RELATED --ctrepldst 10.66.0.2 -g SNAKE_M1"
-	ret := "-A SNAKE -m mark --mark 0/0xff0000 -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN"
+	ret := "-A SNAKE -m mark --mark 0/0xff0000 -m conntrack ! --ctstate NEW -j RETURN"
 	mustContain(t, m4, rec, "--ctrepldst 10.77.0.2 -g SNAKE_M2", ret)
 	if strings.Index(m4, rec) > strings.Index(m4, ret) {
 		t.Error("recovery rule after the WAN-affinity RETURN")

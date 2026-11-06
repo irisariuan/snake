@@ -207,9 +207,11 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 	// joins a policy set later (e.g. a CDN address shared with a policy
 	// domain): its NAT binding is WAN's, so in the tunnel it would stall.
 	// Only new connections are matched against policies; failover clears
-	// the conntrack entries it needs to move. Packets without a usable
-	// conntrack entry (INVALID, UNTRACKED) are matched normally.
-	mangle.add(ChainMain, "-m mark --mark 0/"+mask, "-m conntrack --ctstate ESTABLISHED,RELATED -j RETURN")
+	// the conntrack entries it needs to move. INVALID and UNTRACKED packets
+	// stay on their route too: on Broadcom routers many packets of
+	// accelerated WAN flows are seen that way, and matching them against
+	// policies pushed some into a tunnel and slowed WAN traffic (v1.0.5).
+	mangle.add(ChainMain, "-m mark --mark 0/"+mask, "-m conntrack ! --ctstate NEW -j RETURN")
 	mangle.add(ChainRTC, "-m mark ! --mark 0/"+mask, "-j RETURN")
 
 	tunnels := map[string]bool{}
