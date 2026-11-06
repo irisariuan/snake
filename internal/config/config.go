@@ -144,6 +144,28 @@ type Settings struct {
 	DNSForwardPort int `json:"dns_forward_port"`
 }
 
+// CurrentVersion is the configuration format version.
+//
+//	2: the default mark mask moved from 0x00ff0000 to 0x3fc00000.
+const CurrentVersion = 2
+
+// Mark bits.
+const (
+	// DefaultMarkMask is bits 22-29: clear of Merlin's VPN Director
+	// (0x0000f000) and Adaptive QoS / bwdpi (0xc03fffff).
+	DefaultMarkMask uint32 = 0x3fc00000
+	// LegacyMarkMask was the default before version 2. It overlaps the
+	// Adaptive QoS category bits (0x003f0000).
+	LegacyMarkMask uint32 = 0x00ff0000
+	// AdaptiveQoSMask is the mark bits Adaptive QoS (bwdpi) classifies with.
+	AdaptiveQoSMask uint32 = 0xc03fffff
+)
+
+// MigratedMarkMask returns the mark mask Load replaced (0 if none). The
+// caller should save the configuration and clear connections still marked
+// with the old bits.
+func (c *Config) MigratedMarkMask() uint32 { return c.migratedMask }
+
 // Router-wide blocking modes for DoT and DoH.
 const (
 	BlockPolicy = "policy"
@@ -227,6 +249,8 @@ type Config struct {
 	Groups    []Group    `json:"groups"`
 	RuleLists []RuleList `json:"rule_lists"`
 	Policies  []Policy   `json:"policies"`
+
+	migratedMask uint32 // set by Load, see MigratedMarkMask
 }
 
 // List returns a rule list by name.
@@ -288,7 +312,7 @@ func dedupKeepComments(in []string) []string {
 // DefaultSettings returns sane defaults.
 func DefaultSettings() Settings {
 	return Settings{
-		MarkMask:         0x00ff0000,
+		MarkMask:         DefaultMarkMask,
 		APIPort:          8444,
 		QueueBase:        4200,
 		DomainSetTimeout: 0,
@@ -337,7 +361,7 @@ func DefaultLeak() Leak {
 
 // Default returns an empty configuration.
 func Default() *Config {
-	return &Config{Version: 1, Settings: DefaultSettings()}
+	return &Config{Version: CurrentVersion, Settings: DefaultSettings()}
 }
 
 // ApplyDefaults fills zero-valued settings, keeping explicit values.
@@ -836,6 +860,13 @@ func Load(path string) (*Config, error) {
 	c := Default()
 	if err := json.Unmarshal(b, c); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if c.Version < 2 {
+		if c.Settings.MarkMask == LegacyMarkMask {
+			c.Settings.MarkMask = DefaultMarkMask
+			c.migratedMask = LegacyMarkMask
+		}
+		c.Version = 2
 	}
 	c.ApplyDefaults()
 	return c, nil

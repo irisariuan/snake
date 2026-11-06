@@ -154,7 +154,7 @@ func TestIntegrationApply(t *testing.T) {
 		if r := sh(t, "ip -6 route show table 1001"); !strings.Contains(r, "unreachable default") {
 			t.Errorf("v6 after failover to v4-only tunnel should be unreachable: %s", r)
 		}
-		if !strings.Contains(sh(t, "ip6tables-save -t filter"), "-A SNAKE_FWD -m mark --mark 0x10000/0xff0000 -j REJECT") {
+		if !strings.Contains(sh(t, "ip6tables-save -t filter"), "-A SNAKE_FWD -m mark --mark 0x400000/0x3fc00000 -j REJECT") {
 			t.Error("v6 block rule not installed after failover to v4-only tunnel")
 		}
 	}
@@ -197,7 +197,7 @@ func TestIntegrationApply(t *testing.T) {
 		// Real STUN through the queue: a plain binding request is learned as
 		// a server, an ICE connectivity check as a peer.
 		sh(t, "ip tuntap add mode tun dev stunout && ip link set stunout up && ip addr add 192.0.2.1/24 dev stunout && ip route add 203.0.113.0/24 dev stunout && ip route add 198.51.100.0/24 dev stunout")
-		sh(t, "iptables -t mangle -I OUTPUT -p udp --dport 3478 -m mark --mark 0/0xff0000 -j NFQUEUE --queue-num 4201 --queue-bypass")
+		sh(t, "iptables -t mangle -I OUTPUT -p udp --dport 3478 -m mark --mark 0/0x3fc00000 -j NFQUEUE --queue-num 4201 --queue-bypass")
 		sendSTUN(t, "203.0.113.7:3478", stunPacket(0x0001))
 		sendSTUN(t, "198.51.100.5:3478", stunPacket(0x0001, 0x0006, 0x0024, 0x802A))
 		deadline := time.Now().Add(3 * time.Second)
@@ -211,7 +211,7 @@ func TestIntegrationApply(t *testing.T) {
 			t.Errorf("peer set:\n%s", peers)
 		}
 		t.Logf("webrtc stats: %+v", e.rtc.Stats()[1])
-		sh(t, "iptables -t mangle -D OUTPUT -p udp --dport 3478 -m mark --mark 0/0xff0000 -j NFQUEUE --queue-num 4201 --queue-bypass")
+		sh(t, "iptables -t mangle -D OUTPUT -p udp --dport 3478 -m mark --mark 0/0x3fc00000 -j NFQUEUE --queue-num 4201 --queue-bypass")
 		e.rtc.Stop()
 	}
 	t.Logf("plan:\n%s", e.Plan().Restore["4/mangle"])

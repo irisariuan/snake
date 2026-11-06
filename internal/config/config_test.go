@@ -66,10 +66,10 @@ func TestValidateErrors(t *testing.T) {
 
 func TestMarks(t *testing.T) {
 	s := DefaultSettings()
-	if s.MarkShift() != 16 || s.MaxMarkValue() != 0xff {
+	if s.MarkShift() != 22 || s.MaxMarkValue() != 0xff {
 		t.Fatalf("shift %d max %x", s.MarkShift(), s.MaxMarkValue())
 	}
-	if s.PolicyMark(3) != 0x30000 {
+	if s.PolicyMark(3) != 0xc00000 {
 		t.Fatalf("mark %x", s.PolicyMark(3))
 	}
 	seen := map[uint32]bool{}
@@ -189,5 +189,31 @@ func TestEncryptedDNSConfig(t *testing.T) {
 	c.Settings.BlockDoT = "sometimes"
 	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "block_dot") {
 		t.Fatalf("bad block_dot accepted: %v", err)
+	}
+}
+
+func TestMigrateMarkMask(t *testing.T) {
+	dir := t.TempDir()
+	p := dir + "/config.json"
+	if err := os.WriteFile(p, []byte(`{"version":1,"settings":{"mark_mask":16711680}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Settings.MarkMask != DefaultMarkMask || c.MigratedMarkMask() != LegacyMarkMask || c.Version != CurrentVersion {
+		t.Fatalf("not migrated: mask %#x migrated %#x version %d", c.Settings.MarkMask, c.MigratedMarkMask(), c.Version)
+	}
+	if c.Settings.MarkMask&AdaptiveQoSMask != 0 || c.Settings.MarkMask&0xf000 != 0 {
+		t.Fatal("default mask overlaps Adaptive QoS or VPN Director")
+	}
+	// A custom mask, or the old mask chosen again in a current config, is kept.
+	for _, js := range []string{`{"version":1,"settings":{"mark_mask":65280}}`, `{"version":2,"settings":{"mark_mask":16711680}}`} {
+		_ = os.WriteFile(p, []byte(js), 0o644)
+		c, _ := Load(p)
+		if c.MigratedMarkMask() != 0 || (c.Settings.MarkMask != 0xff00 && c.Settings.MarkMask != LegacyMarkMask) {
+			t.Fatalf("%s: mask %#x migrated %#x", js, c.Settings.MarkMask, c.MigratedMarkMask())
+		}
 	}
 }

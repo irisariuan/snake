@@ -193,6 +193,7 @@ type Status struct {
 	Policies   []PolicyStatus           `json:"policies"`
 	Events     []Event                  `json:"events"`
 	DNS        *dnsinspect.Stats        `json:"dns_inspector,omitempty"`
+	Warnings   []string                 `json:"warnings,omitempty"`
 }
 
 // Status builds the status document.
@@ -224,6 +225,7 @@ func (e *Engine) Status() Status {
 	}
 	dnsOn := e.dnsOn
 	e.mu.Unlock()
+	st.Warnings = e.Warnings()
 	if st.Disabled {
 		if t := e.DisabledSince(); !t.IsZero() {
 			st.DisabledAt = &t

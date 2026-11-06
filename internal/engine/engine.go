@@ -74,6 +74,9 @@ type Caps struct {
 	// IPSetNetlink: set entries are added and tested over netlink instead
 	// of by running the ipset tool.
 	IPSetNetlink bool `json:"ipset_netlink"`
+	// AdaptiveQoS: Adaptive QoS (bwdpi) is on and marks packets with
+	// config.AdaptiveQoSMask.
+	AdaptiveQoS bool `json:"adaptive_qos"`
 }
 
 // Event is a notable state change.
@@ -161,6 +164,9 @@ func (e *Engine) Load() error {
 	if err := c.Validate(); err != nil {
 		return fmt.Errorf("invalid config: %w", err)
 	}
+	if old := c.MigratedMarkMask(); old != 0 {
+		e.migrateMarks(c, old)
+	}
 	e.mu.Lock()
 	e.cfg, e.rt = c, c.Runtime()
 	e.rtc.MarkMask = c.Settings.MarkMask
@@ -228,6 +234,7 @@ func (e *Engine) DetectCaps() {
 		_, err := e.R.Run("ip6tables", "-t", "nat", "-S", "POSTROUTING")
 		c.IPv6NAT = err == nil
 	}
+	c.AdaptiveQoS = nv.Get("qos_enable") == "1" && nv.Get("qos_type") == "1"
 	c.NFQueue = webrtc.Supported(e.R)
 	c.Conntrack = system.Exists("conntrack")
 	_, err := os.Stat("/proc/net/nf_conntrack")
@@ -252,7 +259,7 @@ func (e *Engine) DetectCaps() {
 	e.mu.Lock()
 	e.caps = c
 	e.mu.Unlock()
-	logx.Infof("capabilities: ipv6=%v ipv6nat=%v nfqueue=%v conntrack=%v ipset-netlink=%v", c.IPv6, c.IPv6NAT, c.NFQueue, c.Conntrack, c.IPSetNetlink)
+	logx.Infof("capabilities: ipv6=%v ipv6nat=%v nfqueue=%v conntrack=%v ipset-netlink=%v adaptive-qos=%v", c.IPv6, c.IPv6NAT, c.NFQueue, c.Conntrack, c.IPSetNetlink, c.AdaptiveQoS)
 }
 
 func (e *Engine) event(policy, kind, format string, a ...any) {
@@ -793,6 +800,48 @@ func LocalResolver() *net.Resolver {
 			return d.DialContext(ctx, "udp", "127.0.0.1:53")
 		},
 	}
+}
+
+// migrateMarks saves a configuration whose mark mask Load moved and drops
+// connections still carrying marks in the old bits: under the new mask they
+// would lose their route, and the old bits are Adaptive QoS categories.
+func (e *Engine) migrateMarks(c *config.Config, old uint32) {
+	e.event("", "config", "mark mask moved from 0x%08x to 0x%08x (clear of Adaptive QoS marks)", old, c.Settings.MarkMask)
+	if e.DryRun {
+		return
+	}
+	if err := config.Save(e.P.Config, c); err != nil {
+		logx.Warnf("save migrated config: %v", err)
+	}
+	if !system.Exists("conntrack") {
+		return
+	}
+	legacy := c.Settings
+	legacy.MarkMask = old
+	marks := map[uint32]bool{}
+	for _, p := range c.Policies {
+		marks[legacy.PolicyMark(p.ID)] = true
+	}
+	for _, t := range config.TunnelNames {
+		marks[legacy.ProbeMark(t)] = true
+	}
+	for m := range marks {
+		arg := fmt.Sprintf("0x%x/0x%x", m, old)
+		_, _ = e.R.Run("conntrack", "-D", "-f", "ipv4", "--mark", arg)
+		_, _ = e.R.Run("conntrack", "-D", "-f", "ipv6", "--mark", arg)
+	}
+}
+
+// Warnings are configuration problems detected against the router.
+func (e *Engine) Warnings() []string {
+	cfg := e.runtime()
+	caps := e.Caps()
+	var w []string
+	if caps.AdaptiveQoS && cfg.Settings.MarkMask&config.AdaptiveQoSMask != 0 {
+		w = append(w, fmt.Sprintf("Mark mask 0x%08x overlaps the marks Adaptive QoS uses (0x%08x): QoS can mark WAN connections as if they belonged to a policy, which sends their packets into a tunnel and stalls them, and snake overwrites QoS categories. Set the mark mask to 0x%08x in Settings → Advanced.",
+			cfg.Settings.MarkMask, config.AdaptiveQoSMask, config.DefaultMarkMask))
+	}
+	return w
 }
 
 // flushConntrack drops conntrack entries of a policy so flows re-route after

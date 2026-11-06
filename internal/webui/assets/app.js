@@ -189,6 +189,7 @@
     var s = state.status;
     if (!s) return;
     if (s.last_error) b.appendChild(el('div', { class: 'err' }, 'Last apply error: ' + s.last_error));
+    (s.warnings || []).forEach(function (w) { b.appendChild(el('div', { class: 'banner' }, w)); });
     b.appendChild(el('div', { class: 'row', style: 'margin-bottom:10px' },
       btn('Re-check tunnels', function () { api('POST', '/api/recheck').then(function () { toast('Health check scheduled'); setTimeout(refreshStatus, 4000); }); }),
       btn('Re-apply rules', function () { api('POST', '/api/apply').then(function () { toast('Applied'); refreshStatus(); }).catch(function (e) { toast(e.message); }); }),
@@ -849,7 +850,7 @@
         num('queue_base', 'NFQUEUE base number'),
         el('label', { class: 'f' }, 'Mark mask (hex)'),
         el('input', { type: 'text', value: '0x' + (s.mark_mask >>> 0).toString(16), onchange: function (e) { s.mark_mask = parseInt(e.target.value, 16) >>> 0; markDirty(); } }),
-        el('div', { class: 'small muted' }, 'fwmark bits owned by snake. Default 0xff0000 avoids Merlin VPN Director (0xf000) and QoS bits.')),
+        el('div', { class: 'small muted' }, 'fwmark bits owned by snake (8 contiguous bits). Default 0x3fc00000 avoids Merlin VPN Director (0xf000) and Adaptive QoS (0xc03fffff). Must not overlap them.')),
       viewDNSSettings(num),
       viewUpdates(bool, txt)));
   }

@@ -44,10 +44,10 @@ func TestBuild(t *testing.T) {
 	plan := Build(c.Settings, st, Options{IPv6: true, IPv6NAT: true, Existing: map[string][]string{"4/mangle": {"SNAKE", "SNAKE_P9", "SNAKE_M9"}}})
 	m4 := plan.Restore["4/mangle"]
 	mustContain(t, m4,
-		"-A SNAKE -m mark --mark 0/0xff0000 -j CONNMARK --restore-mark --nfmask 0xff0000 --ctmask 0xff0000",
-		"-A SNAKE -m mark ! --mark 0/0xff0000 -g SNAKE_SAVE",
-		"-A SNAKE -m mark --mark 0/0xff0000 -m conntrack ! --ctstate NEW -j RETURN",
-		"-A SNAKE_M1 -j MARK --set-xmark 0x10000/0xff0000",
+		"-A SNAKE -m mark --mark 0/0x3fc00000 -j CONNMARK --restore-mark --nfmask 0x3fc00000 --ctmask 0x3fc00000",
+		"-A SNAKE -m mark ! --mark 0/0x3fc00000 -g SNAKE_SAVE",
+		"-A SNAKE -m mark --mark 0/0x3fc00000 -m conntrack ! --ctstate NEW -j RETURN",
+		"-A SNAKE_M1 -j MARK --set-xmark 0x400000/0x3fc00000",
 		"-A SNAKE_P1 -m set --match-set SNK_1_d4 dst -g SNAKE_M1",
 		"-A SNAKE_P1 -m set --match-set SNK_1_n4 dst -g SNAKE_M1",
 		// session refresh + learned peers + nfqueue
@@ -81,7 +81,7 @@ func TestBuild(t *testing.T) {
 	}
 	n4 := plan.Restore["4/nat"]
 	// policies 1 (global) and 2 (devices) both hijack: global wins, no per-mac duplicates
-	mustContain(t, n4, "-A SNAKE_DNS -i br+ -p udp --dport 53 -j REDIRECT --to-ports 53", "-A SNAKE_NAT -o wgc1 -m mark ! --mark 0/0xff0000 -j MASQUERADE")
+	mustContain(t, n4, "-A SNAKE_DNS -i br+ -p udp --dport 53 -j REDIRECT --to-ports 53", "-A SNAKE_NAT -o wgc1 -m mark ! --mark 0/0x3fc00000 -j MASQUERADE")
 	if strings.Contains(n4, "--mac-source") {
 		t.Error("global DNS hijack should not need per-MAC rules")
 	}
@@ -90,7 +90,7 @@ func TestBuild(t *testing.T) {
 		"-A SNAKE_FWD -i br+ -p tcp --dport 853 -j REJECT --reject-with tcp-reset",
 		"-A SNAKE_FWD -i br+ -p tcp --dport 443 -m set --match-set SNK_DOH4 dst -j REJECT --reject-with tcp-reset",
 		"-A SNAKE_FWD -i br+ -m mac --mac-source aa:bb:cc:00:00:09 -p udp --dport 443 -j REJECT",
-		"-A SNAKE_FWD -i br+ -o wgc1 -m mark ! --mark 0/0xff0000 -j ACCEPT",
+		"-A SNAKE_FWD -i br+ -o wgc1 -m mark ! --mark 0/0x3fc00000 -j ACCEPT",
 	)
 	// leak blocks must precede accepts
 	if strings.Index(f4, "--dport 853") > strings.Index(f4, "-j ACCEPT") {
@@ -101,7 +101,7 @@ func TestBuild(t *testing.T) {
 	if strings.Contains(m6, "SNAKE_P3") {
 		t.Error("ipv6 off policy present in v6 rules")
 	}
-	mustContain(t, f6, "-A SNAKE_FWD -m mark --mark 0x20000/0xff0000 -j REJECT --reject-with icmp6-adm-prohibited", "icmp6-port-unreachable")
+	mustContain(t, f6, "-A SNAKE_FWD -m mark --mark 0x800000/0x3fc00000 -j REJECT --reject-with icmp6-adm-prohibited", "icmp6-port-unreachable")
 	if strings.Contains(m4, "NFQUEUE --queue-num 4200") {
 		t.Error("DNS queue rule without DNSQueue option")
 	}
