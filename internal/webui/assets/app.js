@@ -227,7 +227,7 @@
           el('td', null, el('b', null, p.name), p.domain_mode ? el('div', { class: 'small ' + (p.domain_mode.indexOf('degraded') === 0 ? '' : 'muted'), style: p.domain_mode.indexOf('degraded') === 0 ? 'color:var(--warn)' : '' }, 'domains: ' + p.domain_mode) : null,
             (p.asn_errors || []).map(function (e) { return el('div', { class: 'small', style: 'color:var(--warn)' }, e); }),
             p.sni_matched !== undefined ? el('div', { class: 'small muted' }, 'SNI: ' + p.sni_matched + ' connections routed by server name') : null,
-            p.dns_upstream ? el('div', { class: 'small muted' }, 'DNS: ' + p.dns_upstream.upstream + ' · ' + p.dns_upstream.queries + ' queries' +
+            p.dns_upstream ? el('div', { class: 'small muted' }, 'DNS: ' + p.dns_upstream.upstream + ' · local ' + p.dns_upstream.listen + ' · ' + p.dns_upstream.queries + ' queries' +
               (p.dns_upstream.queries > p.dns_upstream.errors ? ', ' + p.dns_upstream.avg_ms.toFixed(0) + ' ms avg' : '') + (p.dns_upstream.errors ? ', ' + p.dns_upstream.errors + ' failed' : '')) : null,
             p.dns_upstream && p.dns_upstream.last_error && (Date.now() - new Date(p.dns_upstream.last_error_at).getTime()) < 600000 ?
               el('div', { class: 'small', style: 'color:var(--warn)' }, 'DNS error ' + ago(p.dns_upstream.last_error_at) + ': ' + p.dns_upstream.last_error) : null),
