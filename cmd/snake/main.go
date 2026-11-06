@@ -52,6 +52,9 @@ Usage: snake <command> [args]
   disable | enable        emergency switch: remove all rules (traffic uses WAN,
                           kill switches off) and stop applying / turn back on
   status                  show tunnels and policies
+  update [--check] [--yes] [--force]
+                          install the latest GitHub release (restarts the daemon)
+  rollback [--yes]        go back to the version before the last update
   apply [--dry-run]       re-apply rules (dry run prints the generated commands)
   reload                  reload config.json from disk and apply
   policy list             list policies
@@ -94,6 +97,10 @@ func main() {
 		err = enableCmd()
 	case "status":
 		err = status()
+	case "update":
+		err = updateCmd(args)
+	case "rollback":
+		err = rollbackCmd(args)
 	case "apply":
 		if hasFlag(args, "--dry-run") {
 			err = dryRun()
@@ -213,7 +220,9 @@ func runDaemon() error {
 		return err
 	}
 	lanIP := system.NVRAM{R: system.Exec{}}.Get("lan_ipaddr")
-	srv := &api.Server{E: e, Token: tok}
+	u := newUpdater(func() string { return e.Config().Settings.UpdateRepo })
+	srv := &api.Server{E: e, Token: tok, U: u, Restart: restartVerified}
+	go autoUpdate(ctx, e, u)
 	go func() {
 		if err := srv.Serve(ctx, p.Socket, lanIP, cfg.Settings.APIPort); err != nil {
 			logx.Errorf("api: %v", err)
@@ -261,9 +270,13 @@ func start() error {
 		fmt.Println("snake daemon already running")
 		return nil
 	}
-	self, err := os.Executable()
-	if err != nil {
-		return err
+	// The installed binary, so a start from another copy (the rollback
+	// helper, an installer in /tmp) runs the current version.
+	self := binPath
+	if _, err := os.Stat(self); err != nil {
+		if self, err = os.Executable(); err != nil {
+			return err
+		}
 	}
 	devnull, _ := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	cmd := exec.Command(self, "daemon")
@@ -580,6 +593,8 @@ func hook(args []string) error {
 		return start()
 	case "services-stop":
 		return stop(false)
+	case "restart-verify":
+		return hookRestartVerify()
 	case "firewall":
 		// firewall-start and nat-start: rules were wiped, put them back now.
 		return applyCmd("firewall hook")
@@ -755,6 +770,7 @@ func uninstall(purge bool) error {
 		_ = os.WriteFile(customSettings, []byte(strings.Join(keep, "\n")+"\n"), 0o644)
 	}
 	_ = os.Remove("/opt/bin/snake")
+	_ = os.Remove(paths().Disabled) // a reinstall starts enabled
 	if purge {
 		_ = os.RemoveAll(baseDir)
 		fmt.Println("removed", baseDir)

@@ -42,6 +42,10 @@ stays up but carries nothing until snake routes traffic into it.
 
 ## Install
 
+Download `snake-arm64` (64-bit HND models) or `snake-armv7` (32-bit) from the
+[latest release](https://github.com/irisariuan/snake/releases/latest), or
+build it yourself:
+
 ```sh
 make arm64          # 64-bit HND models (RT-AX86U/AX88U/GT-AX6000/BE series)
 make armv7          # 32-bit userspace models
@@ -53,6 +57,28 @@ ssh admin@router '/tmp/snake install'
 `/jffs/scripts/*`, installs the web page and a cron watchdog, then starts the
 daemon. Open the router WebUI → **Addons → snake**. If no other addon has
 created an Addons menu, the page is under **Tools → snake**.
+
+### Updates and rollback
+
+**Settings → Updates** in the web UI shows the running version and the latest
+[GitHub release](https://github.com/irisariuan/snake/releases), with
+**Install** and **Roll back** buttons. Over SSH: `snake update [--check]` and
+`snake rollback`.
+
+* The daemon checks for a new release a few minutes after it starts and then
+  twice a day. Turn on **Install updates automatically** to install new
+  releases without asking.
+* An update downloads the binary for this router's CPU, verifies it against
+  the release's `SHA256SUMS`, and checks that it runs before replacing
+  anything. The old binary is kept as `/jffs/addons/snake/snake.prev`.
+* After an update or rollback the daemon restarts. If the new version does not
+  start and answer within a minute, snake rolls back by itself and logs it to
+  syslog.
+* **Roll back** swaps the current and previous binaries, so rolling back twice
+  returns you to where you started. Your configuration is not changed.
+* Development builds (not a release tag) are never auto-updated. You can still
+  install the latest release by hand.
+* To use releases from a fork, change **Release repository**.
 
 Uninstall with `snake uninstall`. This removes rules, routes, sets, hooks and
 the page; add `--purge` to delete the config too.
@@ -429,6 +455,8 @@ snake import-dvr [--dir /jffs/configs/domain_vpn_routing] [--yes]
 snake token [--rotate]       API token for the standalone UI at http://router:8444/
 snake start | stop [--flush] | restart
 snake disable | enable       emergency switch (see below)
+snake update [--check]       install the latest release (see Updates and rollback)
+snake rollback               go back to the version before the last update
 ```
 
 ### Emergency disable
@@ -494,6 +522,11 @@ hand and run `snake reload`. See `testdata/config.json` for an example.
   IPv6 policy traffic is blocked rather than leaked.
 
 ## Development
+
+Releases are built by GitHub Actions: push a tag like `v1.2.3` and
+`.github/workflows/release.yml` tests, builds `snake-arm64` and `snake-armv7`,
+and publishes them with `SHA256SUMS` as a GitHub release. Every push also runs
+tests and builds (`ci.yml`).
 
 ```
 make test          # unit tests

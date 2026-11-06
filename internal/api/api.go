@@ -21,6 +21,7 @@ import (
 	"github.com/irisariuan/snake/internal/engine"
 	"github.com/irisariuan/snake/internal/importdvr"
 	"github.com/irisariuan/snake/internal/logx"
+	"github.com/irisariuan/snake/internal/update"
 	"github.com/irisariuan/snake/internal/webui"
 )
 
@@ -28,6 +29,11 @@ import (
 type Server struct {
 	E     *engine.Engine
 	Token string
+	// U installs updates and rolls back; nil disables the update endpoints.
+	U *update.Updater
+	// Restart restarts the daemon after U changed the binary. It must
+	// return before the daemon stops so the response reaches the client.
+	Restart func() error
 }
 
 // LoadToken reads or creates the API token.
@@ -114,6 +120,7 @@ func (s *Server) routes(authed bool) http.Handler {
 		}
 		writeJSON(w, map[string]any{"result": "enabled", "disabled": false})
 	})
+	s.updateRoutes(mux)
 	mux.HandleFunc("POST /api/recheck", func(w http.ResponseWriter, r *http.Request) {
 		s.E.Kick()
 		writeJSON(w, map[string]string{"result": "scheduled"})

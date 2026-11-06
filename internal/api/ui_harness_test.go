@@ -4,6 +4,7 @@ package api
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"github.com/irisariuan/snake/internal/health"
 	"github.com/irisariuan/snake/internal/learn"
 	"github.com/irisariuan/snake/internal/system"
+	"github.com/irisariuan/snake/internal/update"
 )
 
 func TestUIHarness(t *testing.T) {
@@ -69,7 +71,19 @@ func TestUIHarness(t *testing.T) {
 		_ = st.Update(id3, learn.Patch{Name: &n3, Enabled: &off})
 		return nil
 	})
-	s := &Server{E: e, Token: "testtoken"}
+	// Fake GitHub releases: v1.1.0 is available, v0.9.0 is the rollback copy.
+	gh := http.NewServeMux()
+	gh.HandleFunc("/repos/irisariuan/snake/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"tag_name": "v1.1.0", "html_url": "https://github.com/irisariuan/snake/releases/tag/v1.1.0",
+			"body": "## What's changed\n* Emergency disable switch\n* Self-update and rollback", "published_at": time.Now().Add(-26 * time.Hour)})
+	})
+	ghl, _ := net.Listen("tcp", "127.0.0.1:0")
+	go func() { _ = http.Serve(ghl, gh) }()
+	bin := filepath.Join(dir, "snake")
+	_ = os.WriteFile(bin, []byte("#!/bin/sh\necho snake v1.0.0\n"), 0o755)
+	_ = os.WriteFile(bin+".prev", []byte("#!/bin/sh\necho snake v0.9.0\n"), 0o755)
+	u := &update.Updater{Bin: bin, Current: "v1.0.0", APIBase: "http://" + ghl.Addr().String()}
+	s := &Server{E: e, Token: "testtoken", U: u}
 	t.Log("listening on 127.0.0.1:18444")
 	_ = http.ListenAndServe("127.0.0.1:18444", s.routes(true))
 }

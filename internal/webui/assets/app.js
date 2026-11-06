@@ -844,7 +844,65 @@
         num('queue_base', 'NFQUEUE base number'),
         el('label', { class: 'f' }, 'Mark mask (hex)'),
         el('input', { type: 'text', value: '0x' + (s.mark_mask >>> 0).toString(16), onchange: function (e) { s.mark_mask = parseInt(e.target.value, 16) >>> 0; markDirty(); } }),
-        el('div', { class: 'small muted' }, 'fwmark bits owned by snake. Default 0xff0000 avoids Merlin VPN Director (0xf000) and QoS bits.'))));
+        el('div', { class: 'small muted' }, 'fwmark bits owned by snake. Default 0xff0000 avoids Merlin VPN Director (0xf000) and QoS bits.')),
+      viewUpdates(bool, txt)));
+  }
+
+  // ---------- updates ----------
+  function loadUpdate(refresh) {
+    state.updLoading = true;
+    return api('GET', '/api/update' + (refresh ? '?refresh=1' : '')).then(function (r) { state.upd = r; })
+      .catch(function (e) { state.upd = { error: e.message }; })
+      .then(function () { state.updLoading = false; if (state.tab === 'settings') render(); });
+  }
+  // After an update or rollback the daemon restarts: wait for it to answer
+  // with a different version, then reload everything.
+  function waitRestart(from) {
+    var tries = 0;
+    (function poll() {
+      tries++;
+      api('GET', '/api/status').then(function (s) {
+        if (s.version !== from || tries > 40) { state.upd = null; toast('snake ' + s.version + ' is running'); load(); return; }
+        setTimeout(poll, 3000);
+      }, function () { if (tries <= 40) setTimeout(poll, 3000); });
+    })();
+  }
+  function updAction(path, msg, question) {
+    if (!confirm(question)) return;
+    var from = state.status && state.status.version;
+    state.updBusy = msg; render();
+    api('POST', path).then(function (r) { toast(msg + ' ' + r.version + ', restarting…'); waitRestart(from); })
+      .catch(function (e) { toast(e.message); })
+      .then(function () { state.updBusy = ''; render(); });
+  }
+  function viewUpdates(bool, txt) {
+    var u = state.upd;
+    if (!u && !state.updLoading) loadUpdate(false);
+    var card = el('div', { class: 'card' }, el('b', null, 'Updates'));
+    if (!u) { card.appendChild(el('p', { class: 'muted' }, 'Checking…')); return card; }
+    var kv = el('div', { class: 'kv', style: 'margin:6px 0' },
+      el('span', null, 'Running'), el('span', null, u.current || '?', u.comparable === false ? el('span', { class: 'muted small' }, ' (development build)') : null),
+      el('span', null, 'Latest release'), el('span', null, u.latest ? (u.url ? el('a', { href: u.url, target: '_blank', rel: 'noopener', style: 'color:var(--info)' }, u.latest) : u.latest) : '–',
+        ' ', u.available ? badge('update available', 'info') : u.latest && u.comparable ? badge('up to date', 'ok') : null),
+      el('span', null, 'Checked'), el('span', null, ago(u.checked_at)),
+      el('span', null, 'Previous'), el('span', null, u.previous || 'none kept'));
+    card.appendChild(kv);
+    if (u.error) card.appendChild(el('div', { class: 'small', style: 'color:var(--warn)' }, u.error));
+    var busy = !!state.updBusy || u.busy;
+    var canInstall = u.latest && (u.available || !u.comparable);
+    card.appendChild(el('div', { class: 'row', style: 'margin:6px 0' },
+      btn(state.updLoading ? 'Checking…' : 'Check now', function () { loadUpdate(true); render(); }),
+      canInstall ? el('button', { type: 'button', class: 'btn pri', disabled: busy, onclick: function () {
+        updAction('/api/update', 'Updated to', 'Install snake ' + u.latest + ' and restart the daemon?\n\nThe current version is kept; if the new one does not start it is rolled back automatically.');
+      } }, 'Install ' + u.latest) : null,
+      u.previous ? el('button', { type: 'button', class: 'btn danger', disabled: busy, onclick: function () {
+        updAction('/api/rollback', 'Rolled back to', 'Roll back to snake ' + u.previous + ' and restart the daemon?\n\nRolling back again returns to ' + u.current + '.');
+      } }, 'Roll back to ' + u.previous) : null,
+      state.updBusy ? el('span', { class: 'muted small' }, state.updBusy.replace(/ to$/, '') + '…') : null));
+    if (u.available && u.notes) card.appendChild(el('details', null, el('summary', { class: 'small' }, 'Release notes'), el('pre', null, u.notes)));
+    card.appendChild(bool('auto_update', 'Install updates automatically', 'Checked twice a day. The daemon restarts after an update and rolls back by itself if the new version does not start.'));
+    card.appendChild(txt('update_repo', 'Release repository (GitHub owner/name)'));
+    return card;
   }
 
   // ---------- learnings ----------

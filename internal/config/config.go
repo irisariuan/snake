@@ -128,6 +128,8 @@ type Settings struct {
 	FlushConntrack   bool     `json:"flush_conntrack"`
 	LANInterfaces    string   `json:"lan_interfaces"` // iptables -i pattern
 	STUNTestServers  []string `json:"stun_test_servers"`
+	AutoUpdate       bool     `json:"auto_update"` // install new releases automatically
+	UpdateRepo       string   `json:"update_repo"` // GitHub owner/name releases come from
 }
 
 // Config is the root document.
@@ -224,6 +226,7 @@ func DefaultSettings() Settings {
 		FlushConntrack:   true,
 		LANInterfaces:    "br+",
 		STUNTestServers:  []string{"stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"},
+		UpdateRepo:       "irisariuan/snake",
 	}
 }
 
@@ -287,6 +290,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if len(s.STUNTestServers) == 0 {
 		s.STUNTestServers = d.STUNTestServers
+	}
+	if s.UpdateRepo == "" {
+		s.UpdateRepo = d.UpdateRepo
 	}
 	for i := range c.Policies {
 		p := &c.Policies[i]

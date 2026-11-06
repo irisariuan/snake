@@ -1,0 +1,55 @@
+name: Release
+
+# Push a tag like v1.2.3 to build and publish a release:
+#   git tag v1.2.3 && git push origin v1.2.3
+# Routers running snake find it with "Check now" / auto-update.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and publish, e.g. v1.2.3"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check tag
+        run: |
+          echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' || { echo "bad tag $TAG"; exit 1; }
+      - name: Test
+        run: make test
+      - name: Build
+        run: make arm64 armv7 VERSION="$TAG"
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum snake-arm64 snake-armv7 > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pre=""
+          case "$TAG" in *-*) pre="--prerelease" ;; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/snake-arm64 dist/snake-armv7 dist/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" dist/snake-arm64 dist/snake-armv7 dist/SHA256SUMS \
+              --title "snake $TAG" --generate-notes --verify-tag $pre
+          fi
