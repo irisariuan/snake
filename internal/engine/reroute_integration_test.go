@@ -117,4 +117,26 @@ except Exception as e:
 	if err := nc.Run(); err == nil {
 		t.Error("new connection reached the server over WAN instead of following the policy")
 	}
+
+	// Broadcom acceleration can expose WAN packets as UNTRACKED. Even
+	// though the destination now matches a policy, these packets must keep
+	// using WAN. v1.0.5 matched them as fresh traffic and sent them into
+	// the tunnel. Force that state with the raw-table NOTRACK target and
+	// count real packets after the routing decision.
+	sh(t, "iptables -t raw -A PREROUTING -i br0 -p udp --dport 19999 -j CT --notrack")
+	defer exec.Command("sh", "-c", "iptables -t raw -D PREROUTING -i br0 -p udp --dport 19999 -j CT --notrack").Run()
+	sh(t, "iptables -t mangle -N TEST_WAN; iptables -t mangle -A TEST_WAN -m conntrack --ctstate UNTRACKED -j RETURN; iptables -t mangle -A POSTROUTING -o wanv -p udp --dport 19999 -j TEST_WAN")
+	defer exec.Command("sh", "-c", "iptables -t mangle -D POSTROUTING -o wanv -p udp --dport 19999 -j TEST_WAN; iptables -t mangle -F TEST_WAN; iptables -t mangle -X TEST_WAN").Run()
+	sh(t, `ip netns exec snakelan python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.sendto(b"wan affinity", ("203.0.113.80", 19999))'`)
+	counters := sh(t, "iptables -t mangle -nvxL TEST_WAN")
+	seen := false
+	for _, line := range strings.Split(counters, "\n") {
+		f := strings.Fields(line)
+		if len(f) > 2 && f[2] == "RETURN" && f[0] != "0" {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Errorf("untracked WAN packet was rerouted into the tunnel:\n%s", counters)
+	}
 }
