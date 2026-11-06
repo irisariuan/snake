@@ -15,7 +15,7 @@ func TestRead(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write("policy_nf_domainlist", "netflix.com\n*.nflxvideo.net\n\n")
+	write("policy_nf_domainlist", "netflix.com\n*.nflxvideo.net\n/Netflix/\nre:nflx\\d+\n/broken[/\n\n")
 	write("domain_vpn_routing.conf", "nf|"+filepath.Join(d, "policy_nf_domainlist")+"|x|wgc1|0|0|0\nbank|x|y|wan|0|0|0\n")
 	write("asn.conf", "AS2906|wgc1\nAS13335|ovpnc3\n")
 	res, err := Read(d)
@@ -26,13 +26,13 @@ func TestRead(t *testing.T) {
 		t.Fatalf("policies = %+v", res.Policies)
 	}
 	nf := res.Policies[0]
-	if nf.Name != "nf" || len(nf.Domains) != 2 || nf.Domains[1] != "nflxvideo.net" || len(nf.ASNs) != 1 || nf.ASNs[0] != 2906 {
+	if nf.Name != "nf" || len(nf.Domains) != 4 || nf.Domains[1] != "nflxvideo.net" || nf.Domains[2] != "/Netflix/" || nf.Domains[3] != `re:nflx\d+` || len(nf.ASNs) != 1 || nf.ASNs[0] != 2906 {
 		t.Fatalf("nf = %+v", nf)
 	}
 	if res.Policies[1].Tunnels[0] != "ovpnc3" || res.Policies[1].ASNs[0] != 13335 {
 		t.Fatalf("asn policy = %+v", res.Policies[1])
 	}
-	if len(res.Warnings) != 1 {
+	if len(res.Warnings) != 2 {
 		t.Fatalf("warnings = %v", res.Warnings)
 	}
 	c := config.Default()
