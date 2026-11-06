@@ -462,6 +462,10 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		for _, st := range states {
 			if st.Policy.Enabled && (!v6 || st.IPv6Mode != V6Off) {
 				nat.add(ChainNAT, "-o", ifc, "-m connmark --mark", hex(s.ConnMark(st.Policy.ID))+"/"+cmask, "-j MASQUERADE")
+				// A firmware POSTROUTING hook may erase the entire
+				// connmark before first-packet NAT. The routing mark is
+				// still usable when no QoS direction bits are present.
+				nat.add(ChainNAT, "-o", ifc, "-m mark --mark", hex(s.PolicyMark(st.Policy.ID))+"/"+rmask, "-j MASQUERADE")
 			}
 		}
 		filter.add(ChainFwd, "-i", lan, "-o", ifc, "-m mark ! --mark 0/"+mask, "-j ACCEPT")
