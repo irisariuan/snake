@@ -214,7 +214,7 @@
     b.appendChild(el('div', { class: 'scroll' }, el('table', null,
       el('tr', null, ['Policy', 'Scope', 'Route', 'IPv6', 'WebRTC', 'Learned', 'Traffic'].map(function (h) { return el('th', null, h); })),
       (s.policies || []).map(function (p) {
-        var route = !p.enabled ? badge('disabled') : p.active ? badge(p.active + (p.country ? ' ' + p.country : ''), 'ok') :
+        var route = !p.enabled ? badge('disabled') : s.disabled ? badge('WAN (snake disabled)', 'bad') : p.active ? badge(p.active + (p.country ? ' ' + p.country : ''), 'ok') :
           p.kill_engaged ? badge('kill switch: blocked', 'warn') : badge('WAN (no tunnel)', 'bad');
         var sets = Object.keys(p.sets || {}).map(function (k) { return k.replace(/^SNK_\d+_/, '') + ':' + p.sets[k]; }).join(' ');
         var cands = (p.candidates || []).map(function (c) { return el('div', { class: 'small ' + (c.ok ? '' : 'muted') }, (c.ok ? '✓ ' : '✗ ') + c.tunnel + (c.reason ? ' (' + c.reason + ')' : '')); });
