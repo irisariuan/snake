@@ -480,6 +480,9 @@ hand and run `snake reload`. See `testdata/config.json` for an example.
 
 ## Development
 
+Building needs Go 1.26 or newer (with the default `GOTOOLCHAIN=auto`, an
+older `go` downloads it).
+
 ```
 make test          # unit tests
 make integration   # real iptables/ipset/ip in a throwaway netns (root)

@@ -549,7 +549,7 @@ func (c *Config) Validate() error {
 		}
 		ids[p.ID] = true
 		if len(p.Tunnels) == 0 {
-			add(pre + "at least one tunnel is required")
+			add("%sat least one tunnel is required", pre)
 		}
 		for _, t := range p.Tunnels {
 			if TunnelIndex(t) == 0 {
@@ -582,7 +582,7 @@ func (c *Config) Validate() error {
 			}
 		}
 		if ep := c.Expand(p); !ep.HasDomains() && !ep.HasDrops() && len(ep.ASNs)+len(ep.CIDRs)+len(p.Devices) == 0 {
-			add(pre + "needs at least one domain, ASN, CIDR, device or drop: rule")
+			add("%sneeds at least one domain, ASN, CIDR, device or drop: rule", pre)
 		}
 		switch p.Leak.IPv6 {
 		case IPv6Tunnel, IPv6Block, IPv6Off:
@@ -596,7 +596,7 @@ func (c *Config) Validate() error {
 		}
 		if p.Leak.DNSViaTunnel {
 			if ip := net.ParseIP(p.Leak.DNSServer); ip == nil || ip.To4() == nil {
-				add(pre + "dns_server must be an IPv4 address when dns_via_tunnel is on")
+				add("%sdns_server must be an IPv4 address when dns_via_tunnel is on", pre)
 			}
 		}
 	}
