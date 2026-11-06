@@ -5,6 +5,7 @@ package engine
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -77,8 +78,10 @@ type Engine struct {
 	DryRun bool
 
 	mu         sync.Mutex
-	applyMu    sync.Mutex // serialises kernel updates
-	cfg        *config.Config
+	applyMu    sync.Mutex     // serialises kernel updates
+	cfgMu      sync.Mutex     // serialises read-modify-write config updates
+	cfg        *config.Config // as stored (rule lists referenced by name)
+	rt         *config.Config // runtime copy: rule lists merged into policies
 	caps       Caps
 	mon        *health.Monitor
 	rtc        *webrtc.Tracker
@@ -129,7 +132,7 @@ func (e *Engine) Load() error {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 	e.mu.Lock()
-	e.cfg = c
+	e.cfg, e.rt = c, c.Runtime()
 	e.rtc.MarkMask = c.Settings.MarkMask
 	e.asnCache = &asn.Cache{Dir: e.P.ASNDir, MaxAge: time.Duration(c.Settings.ASNRefresh) * time.Hour}
 	e.mu.Unlock()
@@ -147,19 +150,16 @@ func cloneConfig(c *config.Config) *config.Config {
 	if c == nil {
 		return config.Default()
 	}
-	cp := *c
-	cp.Policies = append([]config.Policy(nil), c.Policies...)
-	for i := range cp.Policies {
-		p := &cp.Policies[i]
-		p.Tunnels = append([]string(nil), p.Tunnels...)
-		p.Domains = append([]string(nil), p.Domains...)
-		p.ASNs = append([]int(nil), p.ASNs...)
-		p.CIDRs = append([]string(nil), p.CIDRs...)
-		p.Devices = append([]string(nil), p.Devices...)
+	// Round-trip through JSON: a true deep copy that keeps empty lists as []
+	// (not null) for API clients.
+	b, err := json.Marshal(c)
+	if err != nil {
+		return config.Default()
 	}
-	cp.Groups = append([]config.Group(nil), c.Groups...)
-	cp.Devices = append([]config.Device(nil), c.Devices...)
-	cp.Settings.ProbeTargets = append([]string(nil), c.Settings.ProbeTargets...)
+	var cp config.Config
+	if err := json.Unmarshal(b, &cp); err != nil {
+		return config.Default()
+	}
 	return &cp
 }
 
@@ -176,7 +176,7 @@ func (e *Engine) SetConfig(c *config.Config) error {
 		}
 	}
 	e.mu.Lock()
-	e.cfg = c
+	e.cfg, e.rt = c, c.Runtime()
 	e.rtc.MarkMask = c.Settings.MarkMask
 	e.asnCache = &asn.Cache{Dir: e.P.ASNDir, MaxAge: time.Duration(c.Settings.ASNRefresh) * time.Hour}
 	e.mu.Unlock()
@@ -241,7 +241,7 @@ func usedTunnels(c *config.Config) []string {
 // decide runs failover for every policy; returns the ids whose active tunnel changed.
 func (e *Engine) decide() []int {
 	e.mu.Lock()
-	cfg := e.cfg
+	cfg := e.rt
 	e.mu.Unlock()
 	snap := e.mon.Snapshot()
 	now := time.Now()
@@ -371,7 +371,7 @@ func (e *Engine) Apply(reason string) error {
 	e.applyMu.Lock()
 	defer e.applyMu.Unlock()
 	e.mu.Lock()
-	cfg := e.cfg
+	cfg := e.rt
 	caps := e.caps
 	e.mu.Unlock()
 	if cfg == nil {
@@ -601,7 +601,7 @@ func (e *Engine) netEntries(p config.Policy) []string {
 // refreshASNs fetches stale ASN prefix lists and re-applies if anything changed.
 func (e *Engine) refreshASNs(force bool) {
 	e.mu.Lock()
-	cfg, cache := e.cfg, e.asnCache
+	cfg, cache := e.rt, e.asnCache
 	e.mu.Unlock()
 	if cfg == nil || cache == nil || e.DryRun {
 		return
@@ -639,7 +639,7 @@ func (e *Engine) refreshASNs(force bool) {
 // warm before clients use cached answers.
 func (e *Engine) PreResolve() {
 	e.mu.Lock()
-	cfg := e.cfg
+	cfg := e.rt
 	e.mu.Unlock()
 	if cfg == nil || !cfg.Settings.PreResolve || e.DryRun {
 		return
@@ -683,7 +683,7 @@ func LocalResolver() *net.Resolver {
 // a failover instead of sticking to the dead tunnel's NAT binding.
 func (e *Engine) flushConntrack(id int) {
 	e.mu.Lock()
-	cfg, caps := e.cfg, e.caps
+	cfg, caps := e.rt, e.caps
 	e.mu.Unlock()
 	if !cfg.Settings.FlushConntrack || !caps.Conntrack || e.DryRun {
 		return
@@ -698,7 +698,7 @@ func (e *Engine) flushConntrack(id int) {
 // SeedHealth fills link-level health for all used tunnels (no network probes).
 func (e *Engine) SeedHealth() {
 	e.mu.Lock()
-	cfg := e.cfg
+	cfg := e.rt
 	e.mu.Unlock()
 	for _, t := range usedTunnels(cfg) {
 		e.mon.Seed(cfg.Settings, t)
@@ -742,4 +742,29 @@ func (e *Engine) Caps() Caps {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.caps
+}
+
+// runtime returns the expanded configuration used for routing decisions.
+func (e *Engine) runtime() *config.Config {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.rt == nil {
+		return config.Default()
+	}
+	return cloneConfig(e.rt)
+}
+
+// UpdateConfig applies fn to a copy of the configuration, then validates,
+// saves and applies it.
+func (e *Engine) UpdateConfig(fn func(c *config.Config) error) (*config.Config, error) {
+	e.cfgMu.Lock()
+	defer e.cfgMu.Unlock()
+	c := e.Config()
+	if err := fn(c); err != nil {
+		return nil, err
+	}
+	if err := e.SetConfig(c); err != nil {
+		return nil, err
+	}
+	return e.Config(), nil
 }

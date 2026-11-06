@@ -166,10 +166,16 @@ func Parse(raw string) (Pattern, error) {
 		if !validDomain(d) {
 			return p, fmt.Errorf("invalid domain %q", d)
 		}
+		if !strings.Contains(d, ".") {
+			return p, fmt.Errorf("%q would match a whole top-level domain; use **.%s if you really mean it", s, d)
+		}
 		p.Kind, p.Value, p.Base = Subdomains, d, d
 	default:
 		if !validDomain(s) {
 			return p, fmt.Errorf("invalid domain %q", s)
+		}
+		if !strings.Contains(s, ".") {
+			return p, fmt.Errorf("%q would match a whole top-level domain; use **.%s if you really mean it", s, s)
 		}
 		p.Kind, p.Value, p.Base = Suffix, s, s
 	}

@@ -98,3 +98,36 @@ func TestParseASN(t *testing.T) {
 		t.Error("expected error")
 	}
 }
+
+func TestRuleListsExpand(t *testing.T) {
+	c := Default()
+	c.RuleLists = []RuleList{
+		{Name: "nf", Domains: []string{"netflix.com", "!=ads.netflix.com"}, ASNs: []int{2906}, CIDRs: []string{"23.246.0.0/18"}},
+		{Name: "dis", Domains: []string{"disneyplus.com", "netflix.com"}},
+	}
+	c.Policies = []Policy{
+		{Name: "only lists", Enabled: true, Tunnels: []string{"wgc1"}, Lists: []string{"nf", "dis"}, Leak: Leak{IPv6: "off", WebRTC: "off"}},
+	}
+	c.Normalize()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("a policy whose rules all come from lists is valid: %v", err)
+	}
+	rt := c.Runtime()
+	p := rt.Policies[0]
+	if strings.Join(p.Domains, ",") != "netflix.com,!=ads.netflix.com,disneyplus.com" || len(p.ASNs) != 1 || len(p.CIDRs) != 1 || p.Lists != nil {
+		t.Fatalf("expanded = %+v", p)
+	}
+	if len(c.Policies[0].Domains) != 0 {
+		t.Fatal("Runtime must not modify the stored config")
+	}
+	c.Policies[0].Lists = []string{"missing"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "unknown rule list") {
+		t.Fatalf("err = %v", err)
+	}
+	c.Policies[0].Lists = nil
+	c.RuleLists = append(c.RuleLists, RuleList{Name: "nf", Domains: []string{"bad domain"}})
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "duplicate rule list") || !strings.Contains(err.Error(), "invalid domain") {
+		t.Fatalf("err = %v", err)
+	}
+}

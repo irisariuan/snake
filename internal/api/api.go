@@ -21,7 +21,6 @@ import (
 	"github.com/irisariuan/snake/internal/engine"
 	"github.com/irisariuan/snake/internal/importdvr"
 	"github.com/irisariuan/snake/internal/logx"
-	"github.com/irisariuan/snake/internal/match"
 	"github.com/irisariuan/snake/internal/webui"
 )
 
@@ -124,7 +123,7 @@ func (s *Server) routes(authed bool) http.Handler {
 	mux.HandleFunc("GET /api/clients", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, engine.Clients()) })
 	mux.HandleFunc("GET /api/leaks", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, s.E.LeakChecks()) })
 	mux.HandleFunc("GET /api/logs", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, logx.Recent()) })
-	mux.HandleFunc("POST /api/rules/check", s.checkRules)
+	s.ruleRoutes(mux)
 	mux.HandleFunc("GET /api/plan", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, s.E.Plan()) })
 	mux.HandleFunc("POST /api/import-dvr", s.importDVR)
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
@@ -194,34 +193,6 @@ func (s *Server) putConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, s.E.Config())
-}
-
-// checkRules validates domain rules and optionally tests a name against them
-// (used by the policy editor while typing).
-func (s *Server) checkRules(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Rules []string `json:"rules"`
-		Name  string   `json:"name"`
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		writeErr(w, 400, err)
-		return
-	}
-	set, errs := match.Compile(req.Rules)
-	var pats []match.Pattern
-	for _, raw := range req.Rules {
-		if match.StripComment(raw) == "" {
-			continue
-		}
-		if p, err := match.Parse(raw); err == nil {
-			pats = append(pats, p)
-		}
-	}
-	resp := map[string]any{"errors": errs, "patterns": pats, "native": set.NativeSuffixes(), "inspector": set.NeedsInspector()}
-	if req.Name != "" {
-		resp["result"] = set.MatchAny(match.Normalize(req.Name))
-	}
-	writeJSON(w, resp)
 }
 
 func (s *Server) importDVR(w http.ResponseWriter, r *http.Request) {

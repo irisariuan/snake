@@ -51,7 +51,7 @@ func TestParseAndMatch(t *testing.T) {
 }
 
 func TestParseErrors(t *testing.T) {
-	for _, r := range []string{"", "bad domain.com", "/unterminated", "/a(b/", "~", "=", "a***.com", "-bad-.com", ".", "!"} {
+	for _, r := range []string{"", "bad domain.com", "/unterminated", "/a(b/", "~", "=", "a***.com", "-bad-.com", ".", "!", "com", ".net"} {
 		if _, err := Parse(r); err == nil {
 			t.Errorf("%q: expected error", r)
 		}

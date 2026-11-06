@@ -260,8 +260,10 @@ func TestIntegrationDNSInspector(t *testing.T) {
 	dir := t.TempDir()
 	c := config.Default()
 	c.Policies = []config.Policy{{Name: "nf", Enabled: true, Tunnels: []string{"wgc1"}, KillSwitch: true,
-		Domains: []string{"netflix.com", "**.nflxvideo.net", `/^ipv4-c\d+-.*\.oca\.nflxvideo\.net$/`, "~nflxso", "!=customerevents.netflix.com"},
+		Domains: []string{"netflix.com", "**.nflxvideo.net", `/^ipv4-c\d+-.*\.oca\.nflxvideo\.net$/`, "!=customerevents.netflix.com"},
+		Lists:   []string{"extra"}, // "~nflxso" comes from a rule list
 		Leak:    config.Leak{IPv6: "off", WebRTC: "off"}}}
+	c.RuleLists = []config.RuleList{{Name: "extra", Domains: []string{"~nflxso"}}}
 	c.Settings.PreResolve = false
 	c.Normalize()
 	if err := config.Save(filepath.Join(dir, "config.json"), c); err != nil {

@@ -74,7 +74,18 @@ type Policy struct {
 	ASNs            []int    `json:"asns"`
 	CIDRs           []string `json:"cidrs"`
 	Devices         []string `json:"devices"` // MAC addresses or "group:<name>"
+	Lists           []string `json:"lists"`   // names of rule lists merged into this policy
 	Leak            Leak     `json:"leak"`
+}
+
+// RuleList is a reusable, importable/exportable set of rules (a .rules file).
+type RuleList struct {
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Source      string   `json:"source"` // URL it was imported from (for refresh)
+	Domains     []string `json:"domains"`
+	ASNs        []int    `json:"asns"`
+	CIDRs       []string `json:"cidrs"`
 }
 
 // Group is a named set of devices.
@@ -120,11 +131,68 @@ type Settings struct {
 
 // Config is the root document.
 type Config struct {
-	Version  int      `json:"version"`
-	Settings Settings `json:"settings"`
-	Devices  []Device `json:"devices"`
-	Groups   []Group  `json:"groups"`
-	Policies []Policy `json:"policies"`
+	Version   int        `json:"version"`
+	Settings  Settings   `json:"settings"`
+	Devices   []Device   `json:"devices"`
+	Groups    []Group    `json:"groups"`
+	RuleLists []RuleList `json:"rule_lists"`
+	Policies  []Policy   `json:"policies"`
+}
+
+// List returns a rule list by name.
+func (c *Config) List(name string) (RuleList, bool) {
+	for _, l := range c.RuleLists {
+		if l.Name == name {
+			return l, true
+		}
+	}
+	return RuleList{}, false
+}
+
+// Expand returns the policy with the content of its rule lists merged in.
+// Exclusions from any list apply to the whole policy.
+func (c *Config) Expand(p Policy) Policy {
+	q := p
+	q.Domains = append([]string(nil), p.Domains...)
+	q.ASNs = append([]int(nil), p.ASNs...)
+	q.CIDRs = append([]string(nil), p.CIDRs...)
+	for _, n := range p.Lists {
+		l, ok := c.List(n)
+		if !ok {
+			continue
+		}
+		q.Domains = append(q.Domains, l.Domains...)
+		q.ASNs = append(q.ASNs, l.ASNs...)
+		q.CIDRs = append(q.CIDRs, l.CIDRs...)
+	}
+	q.Domains = dedupKeepComments(q.Domains)
+	sort.Ints(q.ASNs)
+	q.ASNs = dedupInt(q.ASNs)
+	q.CIDRs = dedup(q.CIDRs)
+	q.Lists = nil
+	return q
+}
+
+// Runtime returns a copy with every policy expanded; the engine works on it.
+func (c *Config) Runtime() *Config {
+	cp := *c
+	cp.Policies = make([]Policy, len(c.Policies))
+	for i, p := range c.Policies {
+		cp.Policies[i] = c.Expand(p)
+	}
+	return &cp
+}
+
+func dedupKeepComments(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if strings.HasPrefix(s, "#") || !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // DefaultSettings returns sane defaults.
@@ -322,12 +390,7 @@ func (c *Config) Normalize() {
 			used[next] = true
 		}
 		p.Name = strings.TrimSpace(p.Name)
-		p.Domains = dedup(mapStr(p.Domains, func(s string) string {
-			if t := strings.TrimSpace(s); strings.HasPrefix(t, "#") {
-				return t // keep comment lines
-			}
-			return match.Normalize(s)
-		}))
+		p.Domains = dedupKeepComments(mapStr(p.Domains, normalizeRule))
 		p.CIDRs = dedup(mapStr(p.CIDRs, strings.TrimSpace))
 		p.Devices = dedup(mapStr(p.Devices, func(s string) string {
 			s = strings.TrimSpace(s)
@@ -347,6 +410,21 @@ func (c *Config) Normalize() {
 		if p.ASNs == nil {
 			p.ASNs = []int{}
 		}
+		p.Lists = dedup(mapStr(p.Lists, strings.TrimSpace))
+	}
+	for i := range c.RuleLists {
+		l := &c.RuleLists[i]
+		l.Name = strings.TrimSpace(l.Name)
+		l.Domains = dedupKeepComments(mapStr(l.Domains, normalizeRule))
+		l.CIDRs = dedup(mapStr(l.CIDRs, strings.TrimSpace))
+		sort.Ints(l.ASNs)
+		l.ASNs = dedupInt(l.ASNs)
+		if l.ASNs == nil {
+			l.ASNs = []int{}
+		}
+	}
+	if c.RuleLists == nil {
+		c.RuleLists = []RuleList{}
 	}
 	// Empty lists serialise as [] rather than null for API clients.
 	if c.Policies == nil {
@@ -422,6 +500,24 @@ func (c *Config) Validate() error {
 			add("device %s: %v", d.Name, err)
 		}
 	}
+	lists := map[string]bool{}
+	for _, l := range c.RuleLists {
+		if !nameRe.MatchString(l.Name) {
+			add("rule list name %q invalid (1-40 chars: letters, digits, space, _.-+)", l.Name)
+		}
+		if lists[l.Name] {
+			add("duplicate rule list %q", l.Name)
+		}
+		lists[l.Name] = true
+		for _, le := range compileErrs(l.Domains) {
+			add("rule list %s: rule %q: %s", l.Name, le.Rule, le.Error)
+		}
+		for _, cidr := range l.CIDRs {
+			if _, _, err := net.ParseCIDR(cidr); err != nil && net.ParseIP(cidr) == nil {
+				add("rule list %s: invalid CIDR %q", l.Name, cidr)
+			}
+		}
+	}
 	names := map[string]bool{}
 	ids := map[int]bool{}
 	for _, p := range c.Policies {
@@ -451,9 +547,12 @@ func (c *Config) Validate() error {
 		if p.ExpectedCountry != "" && !ccRe.MatchString(p.ExpectedCountry) {
 			add(pre+"expected_country %q must be a 2-letter code", p.ExpectedCountry)
 		}
-		if _, lerrs := match.Compile(p.Domains); len(lerrs) > 0 {
-			for _, le := range lerrs {
-				add(pre+"rule %q: %s", le.Rule, le.Error)
+		for _, le := range compileErrs(p.Domains) {
+			add(pre+"rule %q: %s", le.Rule, le.Error)
+		}
+		for _, n := range p.Lists {
+			if !lists[n] {
+				add(pre+"unknown rule list %q", n)
 			}
 		}
 		for _, cidr := range p.CIDRs {
@@ -470,7 +569,7 @@ func (c *Config) Validate() error {
 				add(pre+"%v", err)
 			}
 		}
-		if !p.HasDomains() && len(p.ASNs)+len(p.CIDRs)+len(p.Devices) == 0 {
+		if ep := c.Expand(p); !ep.HasDomains() && len(ep.ASNs)+len(ep.CIDRs)+len(p.Devices) == 0 {
 			add(pre + "needs at least one domain, ASN, CIDR or device")
 		}
 		switch p.Leak.IPv6 {
@@ -495,6 +594,11 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+func compileErrs(rules []string) []match.LineError {
+	_, errs := match.Compile(rules)
+	return errs
+}
+
 // ResolveDevices expands groups into MAC addresses.
 func (c *Config) ResolveDevices(p Policy) []string {
 	var out []string
@@ -511,6 +615,13 @@ func (c *Config) ResolveDevices(p Policy) []string {
 		out = append(out, d)
 	}
 	return dedup(out)
+}
+
+func normalizeRule(s string) string {
+	if t := strings.TrimSpace(s); strings.HasPrefix(t, "#") {
+		return t // keep comment lines
+	}
+	return match.Normalize(s)
 }
 
 // HasDomains reports whether the policy has at least one domain rule

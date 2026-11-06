@@ -54,6 +54,8 @@ Usage: snake <command> [args]
   reload                  reload config.json from disk and apply
   policy list             list policies
   test <domain>           show how a domain is routed
+  rules list|check|import|export
+                          manage rule lists / .rules files (snake rules for help)
   import-dvr [--dir D] [--yes]
                           import Domain VPN Routing policies
   token [--rotate]        print the API token for the standalone UI
@@ -100,6 +102,8 @@ func main() {
 			break
 		}
 		err = printCall("GET", "/api/test?domain="+args[0])
+	case "rules":
+		err = rulesCmd(args)
 	case "import-dvr":
 		err = importCmd(args)
 	case "token":
@@ -460,7 +464,7 @@ func dryRun() error {
 	_ = e.Apply("dry run")
 	fmt.Println(rec.Joined())
 	fmt.Println("\n# dnsmasq fragment")
-	fmt.Print(dnsmasq.Generate(e.Config(), e.Caps().NFQueue))
+	fmt.Print(dnsmasq.Generate(e.Config().Runtime(), e.Caps().NFQueue))
 	return nil
 }
 

@@ -39,3 +39,20 @@
 #snake .mono{font-family:Menlo,Consolas,monospace;font-size:11px}
 #snake .scroll{overflow-x:auto}
 @media (max-width:640px){#snake{padding:8px}#snake th,#snake td{padding:4px}}
+#snake .redit{position:relative;border:1px solid var(--line);border-radius:3px;background:#1d2629;overflow:hidden;resize:vertical;min-height:120px}
+#snake .redit-gut,#snake .redit-hl,#snake .redit-ta{font:12px/18px Menlo,Consolas,"DejaVu Sans Mono",monospace;margin:0;padding:6px 0;box-sizing:border-box;tab-size:2}
+#snake .redit-gut{position:absolute;left:0;top:0;bottom:0;width:44px;overflow:hidden;text-align:right;color:#6f858b;background:#182023;border-right:1px solid var(--line);user-select:none}
+#snake .redit-gut div{padding-right:6px;height:18px}
+#snake .redit-gut .g-err{background:#6d2323;color:#fff}#snake .redit-gut .g-warn{background:#6b4a12;color:#fff}
+#snake .redit-hl{position:absolute;left:44px;right:0;top:0;bottom:0;overflow:hidden;white-space:pre;padding-left:8px;padding-right:8px;color:var(--fg);pointer-events:none;background:none;border:0;max-height:none}
+#snake .redit-hl div{height:18px}
+#snake .redit-hl .l-err{background:rgba(255,107,107,.18);text-decoration:underline wavy #ff6b6b;text-decoration-skip-ink:none}
+#snake .redit-hl .l-warn{background:rgba(255,183,77,.14)}
+#snake textarea.redit-ta{position:absolute;left:44px;right:0;top:0;bottom:0;width:calc(100% - 44px);height:100%;min-height:0;resize:none;border:0;border-radius:0;background:transparent;color:transparent;caret-color:var(--fg);padding-left:8px;padding-right:8px;white-space:pre;overflow:auto;outline:none}
+#snake textarea.redit-ta::selection{background:rgba(100,181,246,.35);color:transparent}
+#snake textarea.redit-ta::placeholder{color:#5d7177}
+#snake .redit-status{margin-top:4px}
+#snake .redit-issue{cursor:pointer}#snake .redit-issue:hover{text-decoration:underline}
+#snake .t-com{color:#7f9499;font-style:italic}#snake .t-dir{color:#c792ea}#snake .t-str{color:#c3e88d}
+#snake .t-kw{color:#82aaff}#snake .t-num{color:#f78c6c}#snake .t-neg{color:#ff6b6b;font-weight:bold}
+#snake .t-re{color:#ffcb6b}#snake .t-op{color:#89ddff;font-weight:bold}#snake .t-wild{color:#ff9cac;font-weight:bold}#snake .t-dom{color:var(--fg)}

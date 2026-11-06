@@ -1,0 +1,10 @@
+10:31:19 [INFO] capabilities: ipv6=false ipv6nat=false nfqueue=true conntrack=false
+10:31:19 [INFO] [failover] Netflix US active tunnel wgc1
+10:31:19 [INFO] [failover] Disney UK TV active tunnel wgc2
+10:31:31 [INFO] [config]  configuration saved
+10:31:31 [INFO] applied (config change): 3 policies
+10:31:33 [INFO] [config]  configuration saved
+10:31:33 [INFO] applied (config change): 3 policies
+signal: terminated
+FAIL	github.com/irisariuan/snake/internal/api	53.424s
+FAIL

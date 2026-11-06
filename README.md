@@ -26,6 +26,7 @@ Inspired by and able to import from Ranger802004's
 | DNS leaks | – | policy domains resolved **through the tunnel**, port-53 hijack, DoH/DoT/QUIC blocking, DoH canaries |
 | IPv6 | separate ipsets | routed via tunnel if it has IPv6, otherwise **blocked** for policy traffic |
 | WebRTC | – | **session-affinity tracking** (see below) |
+| Rule files | – | `.rules` files: import (file/URL, AdGuard/hosts/dnsmasq converted), export, reusable **rule lists**, built-in highlighting editor |
 | UI | SSH menu | Merlin Addons page + CLI |
 
 ## Requirements
@@ -62,7 +63,8 @@ A policy is:
 
 * **Tunnels**, in priority order. The first healthy one is used. Later ones are
   failover backups.
-* **Match**: [domain rules](#domain-rules), ASNs, CIDRs and/or devices (MACs or groups).
+* **Match**: [rules](#domain-rules) (domain rules, `asn:`, `cidr:`), [rule lists](#rule-files-and-rule-lists)
+  it includes, and/or devices (MACs or groups).
   * destinations only → those destinations, for every device
   * devices only → the **whole device** (most reliable for TV apps)
   * both → those destinations, only for those devices
@@ -89,6 +91,7 @@ One rule per line:
 | `~nflx` | any name containing `nflx` |
 | `/^ipv4-c\d+-.*\.oca\.nflxvideo\.net$/` | RE2 regular expression, case-insensitive (`re:...` also works) |
 | `!=ads.example.com` | exclusion: any rule prefixed with `!` |
+| `com` | rejected: a bare top-level domain would route everything (`**.com` if you really mean it) |
 | `# comment` | ignored; a trailing ` # comment` is allowed too (except in regexes) |
 
 * **Exclusions** veto a policy for that answer. A later policy can still match it.
@@ -103,6 +106,71 @@ One rule per line:
 The policy editor has a live checker that flags bad lines and tests a name
 against the rules. *Diagnostics → Test a domain* shows the real CNAME chain and
 which rule matched.
+
+## Rule files and rule lists
+
+Rules can live in **rule lists**: named, reusable `.rules` files that any
+number of policies include. A policy's own rules and those of all its lists
+are merged. An exclusion anywhere applies to the whole policy.
+
+```
+# snake rules v1
+@name Netflix
+@description Netflix streaming
+@source https://example.com/netflix.rules
+
+# domains
+netflix.com
+**.nflxvideo.net
+/^ipv4-c\d+-.*\.oca\.nflxvideo\.net$/
+!=ads.netflix.com
+
+asn:2906
+cidr:23.246.0.0/18
+ip:198.38.96.1
+```
+
+| Line | Meaning |
+|---|---|
+| domain rule | anything from the table above |
+| `asn:2906` / `asn:AS2906` | all prefixes announced by that AS |
+| `cidr:1.2.3.0/24`, `ip:1.2.3.4` | address range or single address |
+| `@name`, `@description`, `@source` | list metadata; `@source` enables *Refresh* |
+| `# ...` | comment (kept) |
+
+**Import** from a file or a URL, in the web UI (*Rule lists* tab, or *Import
+file* in a policy's rules editor) or with `snake rules import`. Lines from
+other list formats are converted:
+
+| Format | Example | Becomes |
+|---|---|---|
+| AdGuard / AdBlock | `\|\|example.com^` | `example.com` |
+| hosts | `0.0.0.0 example.com` | `=example.com` |
+| dnsmasq | `server=/a.com/b.com/1.1.1.1`, `ipset=/a.com/SET` | `a.com`, `b.com` |
+
+Invalid lines are skipped and reported.
+
+**Export** a list or a policy (with or without its lists inlined) as a
+`.rules` file.
+
+**Editor.** Both the *Rule lists* tab and the policy editor use a built-in
+editor for the format:
+* syntax highlighting (wildcards, regexes, exclusions, ASNs/CIDRs, directives, comments)
+* line numbers, with errors and warnings marked in the gutter and listed below (click to jump)
+* live validation as you type, with a summary of rule kinds and counts
+* a *test a name* box showing which rule matches or which exclusion vetoes
+* *Tidy* (canonical formatting and de-duplication), import/append file, export
+* Ctrl/Cmd+S to save, Tab inserts spaces
+
+CLI:
+
+```
+snake rules list
+snake rules check netflix.rules                  # file:line: error ... (exit 1 on errors)
+snake rules import netflix.rules [--name NAME]   # or a URL; --no-convert to disable conversion
+snake rules export Netflix -o netflix.rules
+snake rules export --policy "Netflix US" --expand
+```
 
 ### How matching works
 
@@ -229,6 +297,7 @@ snake test www.netflix.com   which policy, which tunnel, are the IPs in the sets
 snake apply [--dry-run]      re-apply (dry run prints every command, touches nothing)
 snake reload                 re-read config.json
 snake policy list
+snake rules list|check|import|export
 snake import-dvr [--dir /jffs/configs/domain_vpn_routing] [--yes]
 snake token [--rotate]       API token for the standalone UI at http://router:8444/
 snake start | stop [--flush] | restart

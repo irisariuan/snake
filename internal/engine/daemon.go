@@ -44,7 +44,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	go e.refreshASNs(false)
 	go e.PreResolve()
 
-	cfg := e.Config()
+	cfg := e.runtime()
 	healthT := time.NewTicker(time.Duration(cfg.Settings.HealthInterval) * time.Second)
 	hookT := time.NewTicker(30 * time.Second)
 	asnT := time.NewTicker(time.Hour)
@@ -86,7 +86,7 @@ func (e *Engine) Run(ctx context.Context) error {
 // checkHealth probes all used tunnels in parallel, runs failover and applies
 // when needed.
 func (e *Engine) checkHealth(geo bool) {
-	cfg := e.Config()
+	cfg := e.runtime()
 	tunnels := usedTunnels(cfg)
 	e.mon.Prune(tunnels)
 	var wg sync.WaitGroup
@@ -179,7 +179,7 @@ type Status struct {
 
 // Status builds the status document.
 func (e *Engine) Status() Status {
-	cfg := e.Config()
+	cfg := e.runtime()
 	e.mu.Lock()
 	caps := e.caps
 	st := Status{
@@ -328,7 +328,7 @@ func MatchDomain(cfg *config.Config, name string, chain ...string) (config.Polic
 // TestDomain resolves a domain through dnsmasq (which also fills the sets)
 // and reports how its traffic would be routed.
 func (e *Engine) TestDomain(name string) DomainTest {
-	cfg := e.Config()
+	cfg := e.runtime()
 	name = match.Normalize(name)
 	res := DomainTest{Domain: name}
 	ans, err := dnsinspect.Query("127.0.0.1:53", name, 4*time.Second)
@@ -478,7 +478,7 @@ type LeakCheck struct {
 
 // LeakChecks audits each policy's protections against the live state.
 func (e *Engine) LeakChecks() []LeakCheck {
-	cfg := e.Config()
+	cfg := e.runtime()
 	st := e.Status()
 	byID := map[int]PolicyStatus{}
 	for _, p := range st.Policies {

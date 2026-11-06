@@ -73,9 +73,10 @@
 
   // ---------- data ----------
   function fixCfg(c) {
-    c.policies = c.policies || []; c.groups = c.groups || []; c.devices = c.devices || [];
+    c.policies = c.policies || []; c.groups = c.groups || []; c.devices = c.devices || []; c.rule_lists = c.rule_lists || [];
+    c.rule_lists.forEach(function (l) { ['domains', 'asns', 'cidrs'].forEach(function (k) { l[k] = l[k] || []; }); });
     c.policies.forEach(function (p) {
-      ['tunnels', 'domains', 'asns', 'cidrs', 'devices'].forEach(function (k) { p[k] = p[k] || []; });
+      ['tunnels', 'domains', 'asns', 'cidrs', 'devices', 'lists'].forEach(function (k) { p[k] = p[k] || []; });
       p.leak = p.leak || {};
     });
     c.groups.forEach(function (g) { g.macs = g.macs || []; });
@@ -103,14 +104,17 @@
   function markDirty() { state.dirty = true; renderBanner(); }
 
   // ---------- layout ----------
-  var TABS = [['status', 'Status'], ['policies', 'Policies'], ['devices', 'Devices & groups'], ['diag', 'Diagnostics'], ['settings', 'Settings'], ['import', 'Import']];
+  var TABS = [['status', 'Status'], ['policies', 'Policies'], ['lists', 'Rule lists'], ['devices', 'Devices & groups'], ['diag', 'Diagnostics'], ['settings', 'Settings'], ['import', 'Import']];
   var bannerBox;
   function render() {
     var scrollY = window.scrollY;
     root.innerHTML = '';
     root.appendChild(el('h2', null, 'snake: split tunnelling ', el('span', { class: 'muted small' }, state.status ? state.status.version : '')));
     root.appendChild(el('div', { class: 'tabs' }, TABS.map(function (t) {
-      return el('button', { type: 'button', class: 'tab' + (state.tab === t[0] ? ' on' : ''), onclick: function () { state.tab = t[0]; state.edit = null; render(); } }, t[1]);
+      return el('button', { type: 'button', class: 'tab' + (state.tab === t[0] ? ' on' : ''), onclick: function () {
+        if (state.listEdit && state.listEdit.changed && !confirm('Discard unsaved changes to the rule list?')) return;
+        state.tab = t[0]; state.edit = null; state.listEdit = null; render();
+      } }, t[1]);
     })));
     bannerBox = el('div');
     root.appendChild(bannerBox);
@@ -119,7 +123,7 @@
     if (!state.cfg) { root.appendChild(el('p', { class: 'muted' }, 'Loading...')); return; }
     var body = el('div');
     root.appendChild(body);
-    ({ status: viewStatus, policies: viewPolicies, devices: viewDevices, diag: viewDiag, settings: viewSettings, import: viewImport })[state.tab](body);
+    ({ status: viewStatus, policies: viewPolicies, lists: viewLists, devices: viewDevices, diag: viewDiag, settings: viewSettings, import: viewImport })[state.tab](body);
     window.scrollTo(0, scrollY);
   }
   function renderBanner() {
@@ -187,9 +191,296 @@
     })) : el('p', { class: 'muted' }, 'No events yet.'));
   }
 
+  // ---------- rule file editor ----------
+  var SYNTAX = [
+    ['example.com', 'domain and all subdomains'],
+    ['.example.com', 'subdomains only'],
+    ['=example.com', 'exactly this name'],
+    ['*.example.com', '* = any text within one label'],
+    ['**.example.com', '** = any text across labels'],
+    ['cdn-?.example.com', '? = one character'],
+    ['~keyword', 'name contains keyword'],
+    ['/regex/  or  re:regex', 'RE2 regular expression, case-insensitive'],
+    ['!rule', 'exclusion: vetoes matches of the rules'],
+    ['asn:2906', 'autonomous system (all its announced prefixes)'],
+    ['cidr:23.246.0.0/18', 'address range or single IP (ip: also works)'],
+    ['@name / @description / @source', 'list metadata (rule lists)'],
+    ['# text', 'comment']
+  ];
+  function syntaxHelp() {
+    return el('details', { class: 'small', style: 'margin:4px 0' }, el('summary', { class: 'muted', style: 'cursor:pointer' }, 'Rule file syntax'),
+      el('table', null, SYNTAX.map(function (r) { return el('tr', null, el('td', { class: 'mono' }, r[0]), el('td', null, r[1])); })),
+      el('div', { class: 'muted' }, 'Importing also converts AdGuard (||example.com^), hosts (0.0.0.0 example.com) and dnsmasq (server=/a/b/...) lines. With CNAME matching on, a rule also matches any name in the answer\'s CNAME chain.'));
+  }
+  function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function span(cls, text) { return text ? '<span class="t-' + cls + '">' + esc(text) + '</span>' : ''; }
+  // Highlight one line of the rule-file format.
+  function hlLine(line) {
+    var m, lead = (/^\s*/.exec(line) || [''])[0], t = line.slice(lead.length);
+    if (!t) return esc(line);
+    if (t[0] === '#') return esc(lead) + span('com', t);
+    if (t[0] === '@') { m = /^(@\S*)(.*)$/.exec(t); return esc(lead) + span('dir', m[1]) + span('str', m[2]); }
+    if ((m = /^(asn:|cidr:|ip:)(.*)$/i.exec(t))) {
+      var c = splitComment(m[2]);
+      return esc(lead) + span('kw', m[1]) + span('num', c[0]) + span('com', c[1]);
+    }
+    var out = esc(lead);
+    if (t[0] === '!') { out += span('neg', '!'); t = t.slice(1); }
+    if (t[0] === '/' || /^re:/i.test(t)) return out + span('re', t);
+    var cm = splitComment(t); t = cm[0];
+    if (t[0] === '~') out += span('kw', '~') + span('str', t.slice(1));
+    else {
+      if (t[0] === '=' || t[0] === '.') { out += span('op', t[0]); t = t.slice(1); }
+      out += t.split(/(\*\*|\*|\?)/).map(function (part) { return /^(\*\*|\*|\?)$/.test(part) ? span('wild', part) : span('dom', part); }).join('');
+    }
+    return out + span('com', cm[1]);
+  }
+  function splitComment(t) { var i = t.indexOf(' #'); return i < 0 ? [t, ''] : [t.slice(0, i), t.slice(i)]; }
+
+  // ruleEditor builds a highlighted editor for the rule-file format with
+  // line numbers, live validation via the API, a name tester and Ctrl+S.
+  function ruleEditor(opt) {
+    var wrap = el('div', { class: 'redit', style: 'height:' + (opt.height || 280) + 'px' });
+    var gutter = el('div', { class: 'redit-gut' });
+    var hl = el('pre', { class: 'redit-hl', 'aria-hidden': 'true' });
+    var ta = el('textarea', { class: 'redit-ta', spellcheck: 'false', wrap: 'off', autocapitalize: 'off', autocomplete: 'off', placeholder: opt.placeholder || '' });
+    ta.value = opt.value || '';
+    wrap.appendChild(gutter); wrap.appendChild(hl); wrap.appendChild(ta);
+    var status = el('div', { class: 'small redit-status' });
+    var issues = el('div', { class: 'small' });
+    var testIn = el('input', { type: 'text', placeholder: 'test a name against these rules', style: 'flex:1;min-width:180px' });
+    var testOut = el('span', { class: 'small' });
+    var errLines = {}, warnLines = {}, last = null, timer = null, seq = 0;
+    function paint() {
+      var ls = ta.value.split('\n');
+      hl.innerHTML = ls.map(function (l, i) {
+        var cls = errLines[i + 1] ? ' class="l-err"' : warnLines[i + 1] ? ' class="l-warn"' : '';
+        return '<div' + cls + '>' + (hlLine(l) || ' ') + '</div>';
+      }).join('') + '<div> </div>';
+      gutter.innerHTML = ls.map(function (l, i) {
+        var n = i + 1, cls = errLines[n] ? 'g-err' : warnLines[n] ? 'g-warn' : '';
+        return '<div class="' + cls + '" title="' + esc(errLines[n] || warnLines[n] || '') + '">' + n + '</div>';
+      }).join('') + '<div> </div>';
+      sync();
+    }
+    function sync() { hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft; gutter.scrollTop = ta.scrollTop; }
+    function jump(line) {
+      var ls = ta.value.split('\n'), pos = 0;
+      for (var i = 0; i < line - 1 && i < ls.length; i++) pos += ls[i].length + 1;
+      ta.focus(); ta.setSelectionRange(pos, pos + (ls[line - 1] || '').length);
+      ta.scrollTop = Math.max(0, (line - 4) * 18);
+      sync();
+    }
+    function check() {
+      var my = ++seq;
+      return api('POST', '/api/rulefile/parse', { text: ta.value, name: testIn.value.trim(), convert: false }).then(function (r) {
+        if (my !== seq) return r;
+        last = r; errLines = {}; warnLines = {};
+        (r.errors || []).forEach(function (e) { errLines[e.line] = e.message; });
+        (r.warnings || []).forEach(function (w) { warnLines[w.line] = w.message; });
+        paint();
+        var f = r.file || {}, k = r.kinds || {};
+        var kinds = Object.keys(k).sort().map(function (x) { return k[x] + ' ' + x; }).join(', ');
+        status.innerHTML = '';
+        status.appendChild(el('span', null,
+          (r.errors || []).length ? badge((r.errors.length) + ' error' + (r.errors.length > 1 ? 's' : ''), 'bad') : badge('valid', 'ok'), ' ',
+          el('span', { class: 'muted' }, [kinds || 'no domain rules', (f.asns || []).length + ' ASNs', (f.cidrs || []).length + ' CIDRs'].join(' · ') +
+            (r.inspector ? ' · needs DNS inspection' : ''))));
+        issues.innerHTML = '';
+        (r.errors || []).concat(r.warnings || []).slice(0, 30).forEach(function (e) {
+          var isErr = !!errLines[e.line] && errLines[e.line] === e.message;
+          issues.appendChild(el('div', { class: 'redit-issue', style: 'color:var(--' + (isErr ? 'bad' : 'warn') + ')', onclick: function () { jump(e.line); } },
+            'line ' + e.line + ': ' + e.message));
+        });
+        testOut.innerHTML = '';
+        if (r.result) {
+          var x = r.result;
+          testOut.appendChild(x.matched ? badge('match: ' + x.rule, 'ok') : x.excluded ? badge('excluded by ' + x.excluded, 'warn') : badge('no match'));
+        }
+        if (opt.onCheck) opt.onCheck(r);
+        return r;
+      }).catch(function (e) { status.textContent = e.message; });
+    }
+    function schedule() { clearTimeout(timer); timer = setTimeout(check, 300); }
+    ta.addEventListener('input', function () { paint(); schedule(); if (opt.onChange) opt.onChange(ta.value); });
+    ta.addEventListener('scroll', sync);
+    ta.addEventListener('keydown', function (e) {
+      if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); if (opt.onSave) opt.onSave(); }
+      if (e.key === 'Tab' && !e.shiftKey) {
+        e.preventDefault();
+        var a = ta.selectionStart; ta.setRangeText('  ', a, ta.selectionEnd, 'end'); paint(); schedule();
+      }
+    });
+    testIn.addEventListener('input', schedule);
+    paint();
+    setTimeout(check, 0);
+    var root = el('div', null, wrap, status, issues, el('div', { class: 'row', style: 'margin-top:4px' }, testIn, testOut));
+    return {
+      el: root,
+      get: function () { return ta.value; },
+      set: function (v) { ta.value = v; paint(); check(); if (opt.onChange) opt.onChange(v); },
+      check: check,
+      last: function () { return last; },
+      tidy: function () {
+        return check().then(function (r) {
+          if (r && r.formatted != null) { ta.value = r.formatted; paint(); check(); if (opt.onChange) opt.onChange(ta.value); }
+          else toast('Fix the errors first');
+        });
+      }
+    };
+  }
+  function download(name, text) {
+    var a = el('a', { href: URL.createObjectURL(new Blob([text], { type: 'text/plain' })), download: name });
+    document.body.appendChild(a); a.click(); setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  }
+  function fileName(n) { return (n || 'rules').replace(/[^A-Za-z0-9._-]/g, '_') + '.rules'; }
+  function pickFile(cb) {
+    var inp = el('input', { type: 'file', accept: '.rules,.txt,.list,.conf,text/plain', style: 'display:none' });
+    inp.addEventListener('change', function () {
+      var f = inp.files[0];
+      if (!f) return;
+      if (f.size > 4 * 1024 * 1024) { toast('File larger than 4 MB'); return; }
+      var rd = new FileReader();
+      rd.onload = function () { cb(String(rd.result), f.name); inp.remove(); };
+      rd.readAsText(f);
+    });
+    document.body.appendChild(inp); inp.click();
+  }
+  // importText converts foreign formats and returns canonical rule-file text.
+  function importText(text) {
+    return api('POST', '/api/rulefile/parse', { text: text, convert: true }).then(function (r) {
+      var f = r.file;
+      var msg = [];
+      if (r.converted) msg.push('converted ' + r.converted + ' line(s) from other formats');
+      if ((r.errors || []).length) msg.push('skipped ' + r.errors.length + ' invalid line(s)');
+      if (msg.length) toast(msg.join(', '));
+      return { file: f, text: formatFile(f) };
+    });
+  }
+  // formatFile mirrors rulefile.Format for client-side export.
+  function formatFile(f) {
+    var out = ['# snake rules v1'];
+    if (f.name) out.push('@name ' + f.name);
+    if (f.description) out.push('@description ' + f.description);
+    if (f.source) out.push('@source ' + f.source);
+    if ((f.domains || []).length) { out.push(''); out = out.concat(f.domains); }
+    if ((f.asns || []).length) { out.push(''); out = out.concat(f.asns.slice().sort(function (a, b) { return a - b; }).map(function (a) { return 'asn:' + a; })); }
+    if ((f.cidrs || []).length) { out.push(''); out = out.concat(f.cidrs.map(function (c) { return 'cidr:' + c; })); }
+    return out.join('\n') + '\n';
+  }
+  // policyRulesText renders a policy's own rules (no header) for its editor.
+  function policyRulesText(p) {
+    var out = (p.domains || []).slice();
+    if ((p.asns || []).length) { if (out.length) out.push(''); out = out.concat(p.asns.map(function (a) { return 'asn:' + a; })); }
+    if ((p.cidrs || []).length) { if (out.length) out.push(''); out = out.concat(p.cidrs.map(function (c) { return 'cidr:' + c; })); }
+    return out.join('\n');
+  }
+
+  // ---------- rule lists ----------
+  function listUsers(name) {
+    return (state.cfg.policies || []).filter(function (p) { return (p.lists || []).indexOf(name) >= 0; }).map(function (p) { return p.name; });
+  }
+  function ruleCount(l) { return (l.domains || []).filter(function (d) { return d[0] !== '#'; }).length; }
+  function adoptConfig(c) {
+    // Take the server's rule lists (and list references) without dropping
+    // unsaved edits elsewhere.
+    var lists = fixCfg(c).rule_lists;
+    if (state.dirty) {
+      state.cfg.rule_lists = lists;
+      var byId = {};
+      c.policies.forEach(function (p) { byId[p.id] = p; });
+      state.cfg.policies.forEach(function (p) { if (byId[p.id]) p.lists = byId[p.id].lists; });
+    } else state.cfg = c;
+  }
+  function viewLists(b) {
+    var lists = state.cfg.rule_lists;
+    if (state.listEdit) return viewListEditor(b);
+    b.appendChild(el('p', { class: 'muted small' }, 'Rule lists are reusable .rules files (domain rules, ASNs, CIDRs) that policies include by name. Import them from a file or URL, edit them here, and export them to share.'));
+    var urlIn = el('input', { type: 'text', placeholder: 'https://example.com/streaming.rules', size: 40 });
+    b.appendChild(el('div', { class: 'row', style: 'margin-bottom:10px' },
+      btn('+ New list', function () { state.listEdit = { orig: '', text: '# snake rules v1\n@name New list\n@description \n\n' }; render(); }, 'pri'),
+      btn('Import file…', function () {
+        pickFile(function (text, fname) {
+          importText(text).then(function (r) {
+            var t = r.text;
+            if (!r.file.name) t = t.replace('# snake rules v1\n', '# snake rules v1\n@name ' + fname.replace(/\.[^.]+$/, '') + '\n');
+            state.listEdit = { orig: '', text: t }; render();
+          }).catch(function (e) { toast(e.message); });
+        });
+      }),
+      urlIn, btn('Import URL', function () {
+        var u = urlIn.value.trim();
+        if (!u) return;
+        api('POST', '/api/rulefile/fetch', { url: u }).then(function (r) { return importText(r.text); }).then(function (r) {
+          var f = r.file;
+          if (!f.source) f.source = u;
+          if (!f.name) f.name = u.replace(/^.*\//, '').replace(/\.[^.]+$/, '') || 'imported';
+          state.listEdit = { orig: '', text: formatFile(f) }; render();
+        }).catch(function (e) { toast(e.message); });
+      })));
+    if (!lists.length) { b.appendChild(el('p', { class: 'muted' }, 'No rule lists yet.')); return; }
+    b.appendChild(el('div', { class: 'scroll' }, el('table', null,
+      el('tr', null, ['List', 'Contents', 'Used by', 'Source', ''].map(function (h) { return el('th', null, h); })),
+      lists.map(function (l) {
+        return el('tr', null,
+          el('td', null, el('b', null, l.name), l.description ? el('div', { class: 'small muted' }, l.description) : null),
+          el('td', { class: 'small' }, ruleCount(l) + ' rules · ' + l.asns.length + ' ASNs · ' + l.cidrs.length + ' CIDRs'),
+          el('td', { class: 'small' }, listUsers(l.name).join(', ') || el('span', { class: 'muted' }, 'unused')),
+          el('td', { class: 'small mono' }, l.source || ''),
+          el('td', { class: 'row' },
+            btn('Edit', function () { state.listEdit = { orig: l.name, text: formatFile(l) }; render(); }),
+            btn('Export', function () { download(fileName(l.name), formatFile(l)); }),
+            l.source ? btn('Refresh', function () {
+              api('POST', '/api/lists/' + encodeURIComponent(l.name) + '/refresh').then(function (r) { adoptConfig(r.config); toast('Refreshed ' + l.name); render(); }).catch(function (e) { toast(e.message); });
+            }) : null,
+            btn('Delete', function () {
+              if (!confirm('Delete rule list ' + l.name + '?')) return;
+              api('DELETE', '/api/lists/' + encodeURIComponent(l.name)).then(function (r) { adoptConfig(r.config); render(); }).catch(function (e) { toast(e.message); });
+            }, 'danger')));
+      }))));
+  }
+  function viewListEditor(b) {
+    var le = state.listEdit;
+    var saving = false;
+    var ed = ruleEditor({ value: le.text, height: 420, onChange: function (v) { le.text = v; le.changed = true; }, onSave: save });
+    function save() {
+      if (saving) return;
+      saving = true;
+      var name = encodeURIComponent(le.orig || 'new');
+      api('PUT', '/api/lists/' + name + (le.orig ? '' : '?new=1'), { text: ed.get() }).then(function (r) {
+        adoptConfig(r.config);
+        var parsed = ed.last() && ed.last().file;
+        le.orig = (parsed && parsed.name) || le.orig;
+        le.changed = false;
+        toast('Saved rule list ' + le.orig + ' and applied');
+        saving = false;
+      }).catch(function (e) { saving = false; toast(e.message); });
+    }
+    b.appendChild(el('h3', null, le.orig ? 'Edit rule list ' + le.orig : 'New rule list'));
+    b.appendChild(syntaxHelp());
+    b.appendChild(el('div', { class: 'row', style: 'margin-bottom:6px' },
+      btn('Import file…', function () { pickFile(function (text) { importText(text).then(function (r) { ed.set(mergeMeta(ed.last(), r.text)); }); }); }),
+      btn('Append file…', function () { pickFile(function (text) { importText(text).then(function (r) { ed.set(ed.get().replace(/\n*$/, '\n\n') + stripMeta(r.text)); }); }); }),
+      btn('Tidy', function () { ed.tidy(); }),
+      btn('Export', function () { var f = ed.last() && ed.last().file; download(fileName((f && f.name) || le.orig), ed.get()); }),
+      el('span', { class: 'muted small' }, 'Ctrl+S saves')));
+    b.appendChild(ed.el);
+    b.appendChild(el('div', { class: 'row', style: 'margin-top:10px' },
+      btn('Back', function () { if (le.changed && !confirm('Discard unsaved changes to this list?')) return; state.listEdit = null; render(); }),
+      btn('Save & apply', save, 'pri'),
+      le.orig && listUsers(le.orig).length ? el('span', { class: 'muted small' }, 'Used by: ' + listUsers(le.orig).join(', ')) : null));
+  }
+  // Keep the current list's name when importing over it.
+  function mergeMeta(last, text) {
+    var f = last && last.file;
+    if (f && f.name && !/^@name /m.test(text)) return text.replace('# snake rules v1\n', '# snake rules v1\n@name ' + f.name + '\n');
+    return text;
+  }
+  function stripMeta(text) { return text.split('\n').filter(function (l) { return !/^(# snake rules v1|@)/.test(l); }).join('\n').replace(/^\n+/, ''); }
+
   // ---------- policies ----------
   function defaultPolicy() {
-    return { id: 0, name: '', enabled: true, tunnels: [], kill_switch: true, expected_country: '', domains: [], ignore_cname: false, asns: [], cidrs: [], devices: [],
+    return { id: 0, name: '', enabled: true, tunnels: [], kill_switch: true, expected_country: '', domains: [], lists: [], ignore_cname: false, asns: [], cidrs: [], devices: [],
       leak: { dns_via_tunnel: true, dns_server: '9.9.9.9', hijack_dns: true, block_dot: true, block_doh: true, block_quic: false, ipv6: 'tunnel', webrtc: 'track' } };
   }
   function viewPolicies(b) {
@@ -208,6 +499,7 @@
         if (p.asns.length) m.push(p.asns.length + ' ASNs');
         if (p.cidrs.length) m.push(p.cidrs.length + ' CIDRs');
         if (p.devices.length) m.push(p.devices.length + ' devices/groups');
+        if (p.lists.length) m.push('lists: ' + p.lists.join(', '));
         var prot = [];
         if (p.kill_switch) prot.push('kill');
         if (p.leak.hijack_dns) prot.push('dns53');
@@ -258,45 +550,22 @@
       knownDevices().map(function (d) { return el('option', { value: d.mac, selected: p.devices.indexOf(d.mac) >= 0 }, (d.name || '?') + ' (' + d.mac + (d.ip ? ', ' + d.ip : '') + ')'); }));
     var extraMacs = p.devices.filter(function (d) { return d.indexOf('group:') !== 0 && !knownDevices().some(function (k) { return k.mac === d; }); });
     var macTA = el('textarea', { style: 'min-height:40px', placeholder: 'aa:bb:cc:dd:ee:ff' }, extraMacs.join('\n'));
-    var domTA = el('textarea', { style: 'min-height:160px', placeholder: 'netflix.com\n**.nflxvideo.net\n/^ipv4-c\\d+-.*\\.oca\\.nflxvideo\\.net$/\n!=ads.netflix.com' }, p.domains.join('\n'));
-    var ruleOut = el('div', { class: 'small' });
-    var ruleName = el('input', { type: 'text', placeholder: 'test a name, e.g. ipv4-c1-lhr.oca.nflxvideo.net', style: 'flex:1;min-width:180px' });
-    var ruleTimer = null;
-    function checkRules() {
-      api('POST', '/api/rules/check', { rules: domTA.value.split('\n'), name: ruleName.value.trim() }).then(function (r) {
-        ruleOut.innerHTML = '';
-        (r.errors || []).forEach(function (e) { ruleOut.appendChild(el('div', { style: 'color:var(--bad)' }, 'line ' + (e.index + 1) + ': ' + e.rule + ': ' + e.error)); });
-        var kinds = {};
-        (r.patterns || []).forEach(function (pt) { var k = (pt.negate ? '!' : '') + pt.kind; kinds[k] = (kinds[k] || 0) + 1; });
-        var summary = Object.keys(kinds).map(function (k) { return kinds[k] + ' ' + k; }).join(', ');
-        if (summary) ruleOut.appendChild(el('div', { class: 'muted' }, summary + (r.inspector ? ' · matched by DNS inspection' : ' · all handled by dnsmasq')));
-        if (r.result) {
-          var res = r.result;
-          ruleOut.appendChild(el('div', null, res.matched ? badge('match', 'ok') : res.excluded ? badge('excluded', 'warn') : badge('no match'),
-            ' ', res.matched ? 'by rule ' + res.rule : res.excluded ? 'by ' + res.excluded : ''));
-        }
-      }).catch(function (e) { ruleOut.textContent = e.message; });
-    }
-    function scheduleCheck() { clearTimeout(ruleTimer); ruleTimer = setTimeout(checkRules, 350); }
-    domTA.addEventListener('input', scheduleCheck);
-    ruleName.addEventListener('input', scheduleCheck);
-    setTimeout(checkRules, 0);
-    var syntax = el('details', { class: 'small', style: 'margin:4px 0' }, el('summary', { class: 'muted', style: 'cursor:pointer' }, 'Rule syntax'),
-      el('table', null, [
-        ['example.com', 'domain and all subdomains'],
-        ['.example.com', 'subdomains only'],
-        ['=example.com', 'exactly this name'],
-        ['*.example.com', '* = any text within one label'],
-        ['**.example.com', '** = any text across labels'],
-        ['cdn-?.example.com', '? = one character'],
-        ['~keyword', 'name contains keyword'],
-        ['/regex/  or  re:regex', 'RE2 regular expression, case-insensitive'],
-        ['!rule', 'exclusion: any rule above prefixed with !'],
-        ['# text', 'comment']
-      ].map(function (r) { return el('tr', null, el('td', { class: 'mono' }, r[0]), el('td', null, r[1])); })),
-      el('div', { class: 'muted' }, 'With CNAME matching on, a rule also matches when any name in the answer\'s CNAME chain matches (e.g. **.akamaized.net).'));
-    var asnTA = el('textarea', { style: 'min-height:50px', placeholder: 'AS2906' }, p.asns.map(function (a) { return 'AS' + a; }).join('\n'));
-    var cidrTA = el('textarea', { style: 'min-height:50px', placeholder: '23.246.0.0/18' }, p.cidrs.join('\n'));
+    var rulesEd = ruleEditor({ value: policyRulesText(p), height: 240,
+      placeholder: 'netflix.com\n**.nflxvideo.net\n/^ipv4-c\\d+-.*\\.oca\\.nflxvideo\\.net$/\n!=ads.netflix.com\nasn:2906\ncidr:23.246.0.0/18' });
+    var listSel = el('select', { multiple: true, size: Math.min(6, Math.max(2, state.cfg.rule_lists.length)), style: 'width:100%' },
+      state.cfg.rule_lists.map(function (l) { return el('option', { value: l.name, selected: p.lists.indexOf(l.name) >= 0 }, l.name + ' (' + ruleCount(l) + ' rules, ' + l.asns.length + ' ASNs, ' + l.cidrs.length + ' CIDRs)'); }));
+    var rulesCard = el('div', { class: 'card', style: 'grid-column:1/-1' },
+      el('div', { class: 'row', style: 'justify-content:space-between' }, el('b', null, 'Rules'),
+        el('span', { class: 'row' },
+          btn('Import file…', function () { pickFile(function (text) { importText(text).then(function (r) { rulesEd.set(stripMeta(r.text)); }); }); }),
+          btn('Append file…', function () { pickFile(function (text) { importText(text).then(function (r) { rulesEd.set(rulesEd.get().replace(/\n*$/, '\n\n') + stripMeta(r.text)); }); }); }),
+          btn('Tidy', function () { rulesEd.tidy().then(function () { rulesEd.set(stripMeta(rulesEd.get())); }); }),
+          btn('Export', function () { download(fileName(p.name || 'policy'), '# snake rules v1\n' + (p.name ? '@name ' + p.name + '\n' : '') + '\n' + rulesEd.get().replace(/\n*$/, '\n')); }))),
+      syntaxHelp(), rulesEd.el,
+      el('label', { class: 'chk' }, el('input', { type: 'checkbox', checked: !p.ignore_cname, onchange: function (e) { p.ignore_cname = !e.target.checked; } }),
+        el('span', null, 'Match CNAME chains', el('div', { class: 'small muted' }, 'Also match when the queried name is an alias (CNAME) of a matching name.'))),
+      el('label', { class: 'f' }, 'Include rule lists (Ctrl/Cmd-click for several)'),
+      state.cfg.rule_lists.length ? listSel : el('div', { class: 'small muted' }, 'No rule lists yet: create or import them in the Rule lists tab.'));
     var L = p.leak;
 
     b.appendChild(el('div', { class: 'cols' },
@@ -309,13 +578,6 @@
         el('label', { class: 'f' }, 'Expected exit country (ISO code, optional)'),
         el('input', { type: 'text', value: p.expected_country, maxlength: 2, size: 4, placeholder: 'US', oninput: function (e) { p.expected_country = e.target.value.toUpperCase(); } }),
         el('div', { class: 'small muted' }, 'A tunnel whose exit country differs is treated as failed for this policy.')),
-      el('div', { class: 'card' },
-        el('label', { class: 'f' }, 'Domain rules (one per line)'), syntax, domTA,
-        el('div', { class: 'row', style: 'margin-top:4px' }, ruleName), ruleOut,
-        el('label', { class: 'chk' }, el('input', { type: 'checkbox', checked: !p.ignore_cname, onchange: function (e) { p.ignore_cname = !e.target.checked; } }),
-          el('span', null, 'Match CNAME chains', el('div', { class: 'small muted' }, 'Also match when the queried name is an alias (CNAME) of a matching name.'))),
-        el('label', { class: 'f' }, 'ASNs'), asnTA,
-        el('label', { class: 'f' }, 'CIDRs / IPs'), cidrTA),
       el('div', { class: 'card' },
         el('label', { class: 'f' }, 'Devices (none = whole LAN). Ctrl/Cmd-click to select several.'), devSel,
         el('label', { class: 'f' }, 'Other MAC addresses'), macTA,
@@ -334,20 +596,23 @@
         el('label', { class: 'f' }, 'WebRTC'),
         el('select', { onchange: function (e) { L.webrtc = e.target.value; } },
           [['track', 'Track: route this service\'s WebRTC peers via the tunnel'], ['off', 'Off']].map(function (o) { return el('option', { value: o[0], selected: L.webrtc === o[0] }, o[1]); })),
-        el('div', { class: 'small muted' }, 'While a device talks to this policy\'s destinations, STUN it sends reveals the peers/relays of its calls; those are routed through the tunnel too. Other apps\' WebRTC stays on WAN.'))));
+        el('div', { class: 'small muted' }, 'While a device talks to this policy\'s destinations, STUN it sends reveals the peers/relays of its calls; those are routed through the tunnel too. Other apps\' WebRTC stays on WAN.')),
+      rulesCard));
 
     b.appendChild(el('div', { class: 'row', style: 'margin-top:10px' },
       btn('Cancel', function () { state.edit = null; render(); }),
       btn(ed.idx < 0 ? 'Add policy' : 'Update policy', function () {
-        p.domains = domTA.value.split('\n').map(function (x) { return x.trim(); }).filter(Boolean);
-        p.asns = lines(asnTA.value).map(function (a) { return parseInt(a.replace(/^as/i, ''), 10); }).filter(function (n) { return n > 0; });
-        p.cidrs = lines(cidrTA.value);
-        var sel = Array.prototype.filter.call(devSel.options, function (o) { return o.selected; }).map(function (o) { return o.value; });
-        p.devices = sel.concat(lines(macTA.value));
         if (!p.name) { toast('Name required'); return; }
         if (!p.tunnels.length) { toast('Add at least one tunnel'); return; }
-        if (ed.idx < 0) state.cfg.policies.push(p); else state.cfg.policies[ed.idx] = p;
-        state.edit = null; markDirty(); render();
+        rulesEd.check().then(function (r) {
+          if (!r || (r.errors || []).length) { toast('Fix the rule errors first'); return; }
+          p.domains = r.file.domains; p.asns = r.file.asns; p.cidrs = r.file.cidrs;
+          var sel = Array.prototype.filter.call(devSel.options, function (o) { return o.selected; }).map(function (o) { return o.value; });
+          p.devices = sel.concat(lines(macTA.value));
+          p.lists = Array.prototype.filter.call(listSel.options, function (o) { return o.selected; }).map(function (o) { return o.value; });
+          if (ed.idx < 0) state.cfg.policies.push(p); else state.cfg.policies[ed.idx] = p;
+          state.edit = null; markDirty(); render();
+        });
       }, 'pri'),
       el('span', { class: 'muted small' }, 'Changes are applied when you press "Save & apply".')));
   }
