@@ -180,3 +180,40 @@ func TestBuildDrop(t *testing.T) {
 		t.Error("drop rejects after accepts")
 	}
 }
+
+func TestBuildDoTDoHOverrides(t *testing.T) {
+	const dotLAN = "-A SNAKE_FWD -i br+ -p tcp --dport 853 -j REJECT"
+	const dohLAN = "-A SNAKE_FWD -i br+ -p tcp --dport 443 -m set --match-set SNK_DOH4"
+	build := func(dot, doh string) string {
+		c, st := states(t)
+		for i := range st {
+			st[i].Policy.Leak.BlockDoT, st[i].Policy.Leak.BlockDoH = false, false
+		}
+		c.Settings.BlockDoT, c.Settings.BlockDoH = dot, doh
+		return Build(c.Settings, st, Options{}).Restore["4/filter"]
+	}
+	// policy mode with every toggle off: nothing blocked
+	f := build(config.BlockPolicy, config.BlockPolicy)
+	if strings.Contains(f, "--dport 853") || strings.Contains(f, "SNK_DOH4") {
+		t.Errorf("blocked with every policy toggle off:\n%s", f)
+	}
+	// always: whole LAN, independently
+	f = build(config.BlockAlways, config.BlockPolicy)
+	mustContain(t, f, dotLAN)
+	if strings.Contains(f, "SNK_DOH4") {
+		t.Error("DoH blocked when only DoT is forced")
+	}
+	f = build(config.BlockPolicy, config.BlockAlways)
+	mustContain(t, f, dohLAN)
+	if strings.Contains(f, "--dport 853") {
+		t.Error("DoT blocked when only DoH is forced")
+	}
+	// never overrides policies that block
+	c, st := states(t)
+	c.Settings.BlockDoT, c.Settings.BlockDoH = config.BlockNever, config.BlockPolicy
+	f = Build(c.Settings, st, Options{}).Restore["4/filter"]
+	if strings.Contains(f, "--dport 853") {
+		t.Error("never did not override policy DoT blocking")
+	}
+	mustContain(t, f, "SNK_DOH4")
+}

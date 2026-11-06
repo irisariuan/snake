@@ -163,3 +163,31 @@ func TestDropRulesDoNotChangeScope(t *testing.T) {
 		t.Fatalf("!drop: accepted: %v", err)
 	}
 }
+
+func TestEncryptedDNSConfig(t *testing.T) {
+	c := Default()
+	c.Policies = []Policy{{Name: "p", Enabled: true, Tunnels: []string{"wgc1"}, Domains: []string{"example.com"},
+		Leak: Leak{DNSViaTunnel: true, DNSServer: "1.1.1.1", DNSProtocol: "DoH", IPv6: "off", WebRTC: "off"}}}
+	c.Normalize()
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	l := c.Policies[0].Leak
+	if l.DNSProtocol != DNSDoH || l.DNSTLSName != "cloudflare-dns.com" || l.DNSDoHPath != "/dns-query" || !l.Encrypted() {
+		t.Fatalf("defaults not filled: %+v", l)
+	}
+	c.Policies[0].Leak = Leak{DNSViaTunnel: true, DNSServer: "203.0.113.5", DNSProtocol: DNSDoT, IPv6: "off", WebRTC: "off"}
+	c.Normalize()
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "dns_tls_name") {
+		t.Fatalf("unknown resolver without a name should fail: %v", err)
+	}
+	c.Policies[0].Leak.DNSProtocol = "quic"
+	if err := c.Validate(); err == nil {
+		t.Fatal("bad protocol accepted")
+	}
+	c.Policies[0].Leak.DNSProtocol = DNSUDP
+	c.Settings.BlockDoT = "sometimes"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "block_dot") {
+		t.Fatalf("bad block_dot accepted: %v", err)
+	}
+}

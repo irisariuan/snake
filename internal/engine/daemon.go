@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/irisariuan/snake/internal/config"
+	"github.com/irisariuan/snake/internal/dnsfwd"
 	"github.com/irisariuan/snake/internal/dnsinspect"
 	"github.com/irisariuan/snake/internal/health"
 	"github.com/irisariuan/snake/internal/logx"
@@ -65,6 +66,7 @@ func (e *Engine) Run(ctx context.Context) error {
 			e.saveSets()
 			e.rtc.Stop()
 			e.dns.Stop()
+			e.fwd.Stop()
 			logx.Infof("daemon stopped")
 			return nil
 		case <-healthT.C:
@@ -172,6 +174,7 @@ type PolicyStatus struct {
 	WebRTC      *webrtc.Stats  `json:"webrtc,omitempty"`
 	ASNErrors   []string       `json:"asn_errors,omitempty"`
 	DomainMode  string         `json:"domain_mode,omitempty"`
+	DNSUpstream *dnsfwd.Stats  `json:"dns_upstream,omitempty"` // DoT/DoH forwarder
 	Country     string         `json:"country,omitempty"`
 }
 
@@ -241,6 +244,7 @@ func (e *Engine) Status() Status {
 		}
 	}
 	rtcStats := e.rtc.Stats()
+	fwdStats := e.fwd.Stats()
 	states := e.states(cfg, caps)
 	stByID := map[int]netfilter.PolicyState{}
 	for _, s := range states {
@@ -279,6 +283,10 @@ func (e *Engine) Status() Status {
 			}
 			if ps.Active != "" {
 				ps.Country = st.Tunnels[ps.Active].Country
+			}
+			if fs, ok := fwdStats[p.ID]; ok {
+				fs := fs
+				ps.DNSUpstream = &fs
 			}
 			if p.HasDomains() {
 				rules := p.DomainRules()
@@ -565,18 +573,38 @@ func (e *Engine) LeakChecks() []LeakCheck {
 			} else {
 				warn("DNS hijack off: devices with hardcoded DNS bypass the domain sets")
 			}
-			if p.Leak.BlockDoH {
-				ok("known DoH resolvers blocked")
-			} else {
-				warn("DoH not blocked: browsers/apps with DoH bypass the domain sets")
+			s := cfg.Settings
+			override := func(mode string) string {
+				switch mode {
+				case config.BlockAlways:
+					return " (Settings: always, whole LAN)"
+				case config.BlockNever:
+					return " (Settings: never)"
+				}
+				return ""
 			}
-			if p.Leak.BlockDoT {
-				ok("DoT/DoQ (853) blocked")
+			if s.DoHBlocked(p) {
+				ok("known DoH resolvers blocked%s", override(s.BlockDoH))
 			} else {
-				warn("DoT not blocked (Android Private DNS bypasses the domain sets)")
+				warn("DoH not blocked%s: browsers/apps with DoH bypass the domain sets", override(s.BlockDoH))
+			}
+			if s.DoTBlocked(p) {
+				ok("DoT/DoQ (853) blocked%s", override(s.BlockDoT))
+			} else {
+				warn("DoT not blocked%s (Android Private DNS bypasses the domain sets)", override(s.BlockDoT))
 			}
 			if p.Leak.DNSViaTunnel {
-				ok("policy domains resolved by %s through the tunnel (CDN picks servers near the exit)", p.Leak.DNSServer)
+				via := "plain DNS"
+				switch p.Leak.DNSProtocol {
+				case config.DNSDoT:
+					via = "DNS over TLS (" + p.Leak.DNSTLSName + ")"
+				case config.DNSDoH:
+					via = "DNS over HTTPS (" + p.Leak.DNSTLSName + ")"
+				}
+				ok("policy domains resolved by %s with %s through the tunnel (CDN picks servers near the exit)", p.Leak.DNSServer, via)
+				if u := ps.DNSUpstream; u != nil && u.LastError != "" && time.Since(u.LastErrAt) < 10*time.Minute {
+					warn("%s lookups failing (%d of %d): %s", via, u.Errors, u.Queries, u.LastError)
+				}
 			} else {
 				warn("policy domains resolved via WAN DNS: CDNs may pick servers near your real location")
 			}

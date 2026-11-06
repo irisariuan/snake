@@ -100,3 +100,25 @@ func TestGenerateDrop(t *testing.T) {
 		t.Errorf("degraded:\n%s", out)
 	}
 }
+
+func TestGenerateEncryptedUpstream(t *testing.T) {
+	c := config.Default()
+	c.Policies = []config.Policy{
+		{ID: 4, Name: "dot", Enabled: true, Domains: []string{"netflix.com"}, Leak: config.Leak{DNSViaTunnel: true, DNSServer: "9.9.9.9", DNSProtocol: config.DNSDoT, DNSTLSName: "dns.quad9.net"}},
+		{ID: 5, Name: "plain", Enabled: true, Domains: []string{"hulu.com"}, Leak: config.Leak{DNSViaTunnel: true, DNSServer: "1.1.1.1", DNSProtocol: config.DNSUDP}},
+	}
+	out := Generate(c, true)
+	for _, s := range []string{"server=/netflix.com/127.0.0.1#5354", "server=/hulu.com/1.1.1.1"} {
+		if !strings.Contains(out, s) {
+			t.Errorf("missing %q in\n%s", s, out)
+		}
+	}
+	if strings.Contains(out, "netflix.com/9.9.9.9") {
+		t.Error("DoT policy also sent to the resolver in plain DNS")
+	}
+	// DoH blocking from Settings alone fills the DoH set.
+	c.Settings.BlockDoH = config.BlockAlways
+	if !strings.Contains(Generate(c, true), "SNK_DOH4") {
+		t.Error("block_doh=always did not fill the DoH set")
+	}
+}

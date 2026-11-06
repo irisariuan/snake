@@ -327,10 +327,10 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		if l.HijackDNS {
 			addScope("dns", st)
 		}
-		if l.BlockDoT {
+		if s.DoTBlocked(p) {
 			addScope("dot", st)
 		}
-		if l.BlockDoH {
+		if s.DoHBlocked(p) {
 			addScope("doh", st)
 		}
 		if l.BlockQUIC {
@@ -357,6 +357,15 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		sort.Strings(macs)
 		for _, m := range macs {
 			t.add(chain, append([]string{"-i", lan, "-m mac --mac-source", m}, args...)...)
+		}
+	}
+	// Router-wide overrides from Settings (block_dot / block_doh).
+	for feature, mode := range map[string]string{"dot": s.BlockDoT, "doh": s.BlockDoH} {
+		switch mode {
+		case config.BlockAlways:
+			scopes[feature] = &scope{global: true, macs: map[string]bool{}}
+		case config.BlockNever:
+			delete(scopes, feature)
 		}
 	}
 	forScope(nat, ChainDNS, "dns", "-p udp --dport 53 -j REDIRECT --to-ports 53")

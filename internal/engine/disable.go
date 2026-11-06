@@ -62,6 +62,7 @@ func (e *Engine) Disable(reason string) error {
 	if !e.DryRun && e.isDaemon() {
 		e.dns.Stop()
 		e.rtc.Stop()
+		e.fwd.Stop()
 	}
 	ips := e.ipset()
 	for _, n := range ips.Names() {

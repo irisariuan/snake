@@ -220,7 +220,11 @@
         var cands = (p.candidates || []).map(function (c) { return el('div', { class: 'small ' + (c.ok ? '' : 'muted') }, (c.ok ? '✓ ' : '✗ ') + c.tunnel + (c.reason ? ' (' + c.reason + ')' : '')); });
         return el('tr', null,
           el('td', null, el('b', null, p.name), p.domain_mode ? el('div', { class: 'small ' + (p.domain_mode.indexOf('degraded') === 0 ? '' : 'muted'), style: p.domain_mode.indexOf('degraded') === 0 ? 'color:var(--warn)' : '' }, 'domains: ' + p.domain_mode) : null,
-            (p.asn_errors || []).map(function (e) { return el('div', { class: 'small', style: 'color:var(--warn)' }, e); })),
+            (p.asn_errors || []).map(function (e) { return el('div', { class: 'small', style: 'color:var(--warn)' }, e); }),
+            p.dns_upstream ? el('div', { class: 'small muted' }, 'DNS: ' + p.dns_upstream.upstream + ' · ' + p.dns_upstream.queries + ' queries' +
+              (p.dns_upstream.queries > p.dns_upstream.errors ? ', ' + p.dns_upstream.avg_ms.toFixed(0) + ' ms avg' : '') + (p.dns_upstream.errors ? ', ' + p.dns_upstream.errors + ' failed' : '')) : null,
+            p.dns_upstream && p.dns_upstream.last_error && (Date.now() - new Date(p.dns_upstream.last_error_at).getTime()) < 600000 ?
+              el('div', { class: 'small', style: 'color:var(--warn)' }, 'DNS error ' + ago(p.dns_upstream.last_error_at) + ': ' + p.dns_upstream.last_error) : null),
           el('td', null, p.scope),
           el('td', null, route, cands),
           el('td', null, p.ipv6_mode || ''),
@@ -532,7 +536,7 @@
   // ---------- policies ----------
   function defaultPolicy() {
     return { id: 0, name: '', enabled: true, tunnels: [], kill_switch: true, expected_country: '', domains: [], lists: [], ignore_cname: false, asns: [], cidrs: [], devices: [],
-      leak: { dns_via_tunnel: true, dns_server: '9.9.9.9', hijack_dns: true, block_dot: true, block_doh: true, block_quic: false, ipv6: 'tunnel', webrtc: 'track' } };
+      leak: { dns_via_tunnel: true, dns_server: '9.9.9.9', dns_protocol: 'udp', hijack_dns: true, block_dot: true, block_doh: true, block_quic: false, ipv6: 'tunnel', webrtc: 'track' } };
   }
   function viewPolicies(b) {
     if (state.edit) return viewEditor(b);
@@ -554,9 +558,10 @@
         var prot = [];
         if (p.kill_switch) prot.push('kill');
         if (p.leak.hijack_dns) prot.push('dns53');
-        if (p.leak.dns_via_tunnel) prot.push('dns→vpn');
-        if (p.leak.block_doh) prot.push('doh');
-        if (p.leak.block_dot) prot.push('dot');
+        if (p.leak.dns_via_tunnel) prot.push('dns→vpn' + (p.leak.dns_protocol && p.leak.dns_protocol !== 'udp' ? ' (' + p.leak.dns_protocol + ')' : ''));
+        var gs = state.cfg.settings;
+        if (gs.block_doh === 'always' || (gs.block_doh !== 'never' && p.leak.block_doh)) prot.push('doh');
+        if (gs.block_dot === 'always' || (gs.block_dot !== 'never' && p.leak.block_dot)) prot.push('dot');
         if (p.leak.block_quic) prot.push('quic');
         prot.push('v6:' + p.leak.ipv6);
         prot.push('rtc:' + p.leak.webrtc);
@@ -636,10 +641,10 @@
       el('div', { class: 'card' },
         el('b', null, 'Leak protection'),
         chk(L, 'dns_via_tunnel', 'Resolve policy domains through the tunnel', 'CDNs choose servers by resolver location; this makes them pick ones near the VPN exit.'),
-        el('div', { class: 'row' }, el('span', { class: 'small muted' }, 'Resolver'), el('input', { type: 'text', value: L.dns_server, size: 16, oninput: function (e) { L.dns_server = e.target.value.trim(); } })),
+        dnsUpstream(L),
         chk(L, 'hijack_dns', 'Redirect hardcoded DNS (port 53) to the router', 'Catches smart TVs / apps that ignore DHCP DNS (e.g. 8.8.8.8).'),
-        chk(L, 'block_doh', 'Block DNS-over-HTTPS resolvers', 'Forces browsers/apps back to router DNS so domains are detected.'),
-        chk(L, 'block_dot', 'Block DNS-over-TLS / QUIC (port 853)', 'Android "Private DNS" falls back to normal DNS.'),
+        overridden('block_doh', chk(L, 'block_doh', 'Block DNS-over-HTTPS resolvers', 'Forces browsers/apps back to router DNS so domains are detected.')),
+        overridden('block_dot', chk(L, 'block_dot', 'Block DNS-over-TLS / QUIC (port 853)', 'Android "Private DNS" falls back to normal DNS.')),
         chk(L, 'block_quic', 'Block QUIC (UDP 443)', 'Optional; forces HTTP/2 over TCP.'),
         el('label', { class: 'f' }, 'IPv6'),
         el('select', { onchange: function (e) { L.ipv6 = e.target.value; } },
@@ -845,7 +850,63 @@
         el('label', { class: 'f' }, 'Mark mask (hex)'),
         el('input', { type: 'text', value: '0x' + (s.mark_mask >>> 0).toString(16), onchange: function (e) { s.mark_mask = parseInt(e.target.value, 16) >>> 0; markDirty(); } }),
         el('div', { class: 'small muted' }, 'fwmark bits owned by snake. Default 0xff0000 avoids Merlin VPN Director (0xf000) and QoS bits.')),
+      viewDNSSettings(num),
       viewUpdates(bool, txt)));
+  }
+
+  // ---------- DNS ----------
+  var KNOWN_DNS = { '9.9.9.9': 'dns.quad9.net', '149.112.112.112': 'dns.quad9.net', '9.9.9.11': 'dns11.quad9.net', '1.1.1.1': 'cloudflare-dns.com', '1.0.0.1': 'cloudflare-dns.com',
+    '8.8.8.8': 'dns.google', '8.8.4.4': 'dns.google', '94.140.14.14': 'dns.adguard-dns.com', '94.140.15.15': 'dns.adguard-dns.com',
+    '208.67.222.222': 'dns.opendns.com', '208.67.220.220': 'dns.opendns.com', '194.242.2.2': 'dns.mullvad.net' };
+  // Resolver address, protocol and (for DoT/DoH) certificate name / path.
+  function dnsUpstream(L) {
+    L.dns_protocol = L.dns_protocol || 'udp';
+    var extra = el('div');
+    function draw() {
+      extra.innerHTML = '';
+      if (L.dns_protocol === 'udp') {
+        extra.appendChild(el('div', { class: 'small muted' }, 'Plain DNS, sent inside the encrypted tunnel. The resolver sees the queries; your ISP does not.'));
+        return;
+      }
+      var known = KNOWN_DNS[L.dns_server];
+      extra.appendChild(el('div', { class: 'row' }, el('span', { class: 'small muted' }, 'Certificate name'),
+        el('input', { type: 'text', value: L.dns_tls_name || '', size: 22, placeholder: known || 'e.g. dns.quad9.net', oninput: function (e) { L.dns_tls_name = e.target.value.trim(); } })));
+      if (L.dns_protocol === 'doh') extra.appendChild(el('div', { class: 'row', style: 'margin-top:4px' }, el('span', { class: 'small muted' }, 'Path'),
+        el('input', { type: 'text', value: L.dns_doh_path || '/dns-query', size: 16, oninput: function (e) { L.dns_doh_path = e.target.value.trim(); } })));
+      extra.appendChild(el('div', { class: 'small muted' }, (L.dns_protocol === 'dot' ? 'DNS over TLS (port 853)' : 'DNS over HTTPS (port 443)') +
+        ' from the router to the resolver, through the tunnel. Leave the name empty for well-known resolvers. If the resolver cannot be reached, lookups for this policy fail instead of falling back to plain DNS.'));
+    }
+    draw();
+    return el('div', { style: 'margin:4px 0 8px' },
+      el('div', { class: 'row' }, el('span', { class: 'small muted' }, 'Resolver'),
+        el('input', { type: 'text', value: L.dns_server, size: 16, oninput: function (e) { L.dns_server = e.target.value.trim(); if (L.dns_protocol !== 'udp') draw(); } }),
+        el('select', { onchange: function (e) { L.dns_protocol = e.target.value; draw(); } },
+          [['udp', 'Plain DNS'], ['dot', 'DNS over TLS'], ['doh', 'DNS over HTTPS']].map(function (o) { return el('option', { value: o[0], selected: L.dns_protocol === o[0] }, o[1]); }))),
+      extra);
+  }
+  // A per-policy toggle that Settings overrides: grey it out and say why.
+  function overridden(key, node) {
+    var mode = state.cfg.settings[key];
+    if (mode !== 'always' && mode !== 'never') return node;
+    node.style.opacity = '.55';
+    node.querySelector('input').disabled = true;
+    node.lastChild.appendChild(el('div', { class: 'small', style: 'color:var(--warn)' }, 'Overridden in Settings: ' + (mode === 'always' ? 'always blocked for the whole LAN' : 'never blocked')));
+    return node;
+  }
+  function viewDNSSettings(num) {
+    var s = state.cfg.settings;
+    function mode(key, label, what) {
+      return el('div', null, el('label', { class: 'f' }, label),
+        el('select', { onchange: function (e) { s[key] = e.target.value; markDirty(); } },
+          [['policy', 'Per policy'], ['always', 'Always (whole LAN)'], ['never', 'Never (allow ' + what + ')']].map(function (o) {
+            return el('option', { value: o[0], selected: (s[key] || 'policy') === o[0] }, o[1]);
+          })));
+    }
+    return el('div', { class: 'card' }, el('b', null, 'DNS'),
+      mode('block_dot', 'Block DNS over TLS (port 853)', 'DoT'),
+      mode('block_doh', 'Block DNS over HTTPS (known resolvers)', 'DoH'),
+      el('div', { class: 'small muted' }, '"Per policy" uses each policy\'s leak protection toggle. Blocking makes devices fall back to the router\'s DNS, which snake needs to see which domains they use. "Never" lets them keep encrypted DNS, but domain rules then miss those devices\' lookups.'),
+      num('dns_forward_port', 'Local port for DoT/DoH forwarders', 'Policy id is added (policy 1 uses this port + 1). Only reachable from the router itself.'));
   }
 
   // ---------- updates ----------

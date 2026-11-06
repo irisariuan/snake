@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/irisariuan/snake/internal/asn"
 	"github.com/irisariuan/snake/internal/config"
+	"github.com/irisariuan/snake/internal/dnsfwd"
 	"github.com/irisariuan/snake/internal/dnsinspect"
 	"github.com/irisariuan/snake/internal/dnsmasq"
 	"github.com/irisariuan/snake/internal/health"
@@ -104,6 +106,7 @@ type Engine struct {
 	learnRoute  atomic.Value // map[string]int: server -> policy (0 = WAN), as installed
 	dns         *dnsinspect.Inspector
 	dnsOn       bool
+	fwd         dnsfwd.Manager // DoT/DoH forwarders for resolve-via-tunnel
 	asnCache    *asn.Cache
 	active      map[int]string
 	cands       map[int][]Candidate
@@ -391,7 +394,7 @@ func setSpecs(cfg *config.Config, states []netfilter.PolicyState, v6 bool) []net
 	}
 	for _, st := range states {
 		p := st.Policy
-		if p.Leak.BlockDoH {
+		if cfg.Settings.DoHBlocked(p) {
 			anyDoH = true
 		}
 		for _, f := range fams {
@@ -558,6 +561,10 @@ func (e *Engine) Apply(reason string) error {
 		} else {
 			e.dns.Stop()
 		}
+		// Before dnsmasq is pointed at them.
+		if err := e.fwd.Configure(forwarders(cfg, states)); err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
 	e.mu.Lock()
 	e.dnsOn = dnsOn
@@ -616,6 +623,24 @@ func (e *Engine) Apply(reason string) error {
 	}
 	logx.Infof("applied (%s): %d policies", reason, len(states))
 	return nil
+}
+
+// forwarders lists the DoT/DoH forwarders of policies resolving through
+// the tunnel.
+func forwarders(cfg *config.Config, states []netfilter.PolicyState) []dnsfwd.Spec {
+	var out []dnsfwd.Spec
+	for _, st := range states {
+		p := st.Policy
+		if !p.Leak.Encrypted() || !p.HasDomains() {
+			continue
+		}
+		out = append(out, dnsfwd.Spec{
+			ID:     p.ID,
+			Listen: net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.Settings.DNSForwardPort+p.ID)),
+			Up:     dnsfwd.Upstream{Proto: p.Leak.DNSProtocol, IP: p.Leak.DNSServer, TLSName: p.Leak.DNSTLSName, Path: p.Leak.DNSDoHPath},
+		})
+	}
+	return out
 }
 
 // dnsRules compiles the domain rules of enabled policies in policy order.

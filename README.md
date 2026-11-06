@@ -256,7 +256,7 @@ snake rules export --policy "Netflix US" --expand
 
 | Toggle | What it does |
 |---|---|
-| Resolve via tunnel | `server=/domain/<resolver>` in dnsmasq, and an `ip rule` sends the router's queries to that resolver through the policy's tunnel. CDNs then pick servers near the VPN exit, not near you. |
+| Resolve via tunnel | `server=/domain/<resolver>` in dnsmasq, and an `ip rule` sends the router's queries to that resolver through the policy's tunnel. CDNs then pick servers near the VPN exit, not near you. The router can talk to the resolver in plain DNS, **DNS over TLS** or **DNS over HTTPS** (see below). |
 | Hijack DNS | Redirects port 53 from scoped clients to the router, so devices with hardcoded DNS (e.g. `8.8.8.8`) are still seen by dnsmasq. |
 | Block DoH | Rejects TCP/UDP 443 to known DoH resolvers (static list plus dnsmasq-learned addresses of DoH hostnames). Also answers the Firefox and iCloud Private Relay canary domains with NXDOMAIN (network-wide, Settings → *DoH canary*). |
 | Block DoT | Rejects port 853 (DoT/DoQ), so Android "Private DNS" falls back to normal DNS. |
@@ -264,8 +264,39 @@ snake rules export --policy "Netflix US" --expand
 | IPv6 | *tunnel*: route IPv6 through the tunnel if it has IPv6, else reject IPv6 policy traffic so clients fall back to IPv4. *block*: always reject. *off*: untouched. |
 | WebRTC | See below. |
 
+**Settings → DNS** can override *Block DoT* and *Block DoH* router-wide, each
+on its own: *Per policy* (the toggles above), *Always* (blocked for every
+device on the LAN, whatever the policies say) or *Never* (allowed everywhere;
+devices that use it bypass snake's domain rules).
+
 "Scoped clients" means the policy's devices. For destination-only policies it
 means the whole LAN, because any device might reach those destinations.
+
+### Encrypted DNS through the tunnel
+
+With *Resolve via tunnel* on, pick how the router talks to the policy's
+resolver:
+
+| Protocol | What goes through the tunnel |
+|---|---|
+| Plain DNS (default) | UDP/TCP 53. The tunnel encrypts it on your ISP link; the resolver's network sees it in clear. |
+| DNS over TLS | TLS to `<resolver>:853` (RFC 7858). |
+| DNS over HTTPS | HTTPS POST to `https://<name><path>` at `<resolver>:443` (RFC 8484). |
+
+For DoT and DoH the daemon runs a small forwarder per policy on
+`127.0.0.1:<dns_forward_port + policy id>` (default 5350 + id). dnsmasq sends
+the policy's domains there, and the forwarder dials the resolver **by IP**, so
+no bootstrap lookup is needed and the same `ip rule` routes it into the
+tunnel. The certificate is checked against *Certificate name*, which is filled
+in for well-known resolvers (Quad9, Cloudflare, Google, AdGuard, OpenDNS,
+Mullvad). Connections are reused, and the Status tab shows queries, latency
+and errors per policy.
+
+If the resolver can't be reached, lookups for those domains fail with
+SERVFAIL. They never fall back to plain DNS. While the daemon is stopped,
+those domains don't resolve (the watchdog restarts it within 5 minutes; *Emergency
+disable* removes the dnsmasq lines). Other domains keep using the router's
+normal DNS settings.
 
 ## WebRTC
 

@@ -53,12 +53,17 @@ const (
 type Leak struct {
 	DNSViaTunnel bool   `json:"dns_via_tunnel"` // resolve policy domains with DNSServer through the tunnel
 	DNSServer    string `json:"dns_server"`     // resolver reached through the tunnel
-	HijackDNS    bool   `json:"hijack_dns"`     // redirect port 53 from scoped clients to the router
-	BlockDoT     bool   `json:"block_dot"`      // block TCP/UDP 853 (DoT/DoQ) from scoped clients
-	BlockDoH     bool   `json:"block_doh"`      // block known DoH resolvers on 443 from scoped clients
-	BlockQUIC    bool   `json:"block_quic"`     // block UDP 443 from scoped clients
-	IPv6         string `json:"ipv6"`           // tunnel | block | off
-	WebRTC       string `json:"webrtc"`         // track | off
+	// DNSProtocol is how the router talks to DNSServer: udp (plain DNS),
+	// dot (DNS over TLS, port 853) or doh (DNS over HTTPS, port 443).
+	DNSProtocol string `json:"dns_protocol"`
+	DNSTLSName  string `json:"dns_tls_name"` // certificate name of DNSServer (dot/doh)
+	DNSDoHPath  string `json:"dns_doh_path"` // DoH URL path, default /dns-query
+	HijackDNS   bool   `json:"hijack_dns"`   // redirect port 53 from scoped clients to the router
+	BlockDoT    bool   `json:"block_dot"`    // block TCP/UDP 853 (DoT/DoQ) from scoped clients
+	BlockDoH    bool   `json:"block_doh"`    // block known DoH resolvers on 443 from scoped clients
+	BlockQUIC   bool   `json:"block_quic"`   // block UDP 443 from scoped clients
+	IPv6        string `json:"ipv6"`         // tunnel | block | off
+	WebRTC      string `json:"webrtc"`       // track | off
 }
 
 // Policy routes matched traffic through an ordered list of tunnels.
@@ -130,6 +135,88 @@ type Settings struct {
 	STUNTestServers  []string `json:"stun_test_servers"`
 	AutoUpdate       bool     `json:"auto_update"` // install new releases automatically
 	UpdateRepo       string   `json:"update_repo"` // GitHub owner/name releases come from
+	// Router-wide DoT / DoH blocking: policy (each policy's toggle), always
+	// (whole LAN) or never (overrides every policy).
+	BlockDoT string `json:"block_dot"`
+	BlockDoH string `json:"block_doh"`
+	// DNSForwardPort is the first local port of the encrypted-DNS
+	// forwarders (policy id is added); dnsmasq sends policy domains there.
+	DNSForwardPort int `json:"dns_forward_port"`
+}
+
+// Router-wide blocking modes for DoT and DoH.
+const (
+	BlockPolicy = "policy"
+	BlockAlways = "always"
+	BlockNever  = "never"
+)
+
+// Upstream DNS protocols for "resolve via tunnel".
+const (
+	DNSUDP = "udp"
+	DNSDoT = "dot"
+	DNSDoH = "doh"
+)
+
+// KnownResolverNames maps well-known resolver addresses to the name on
+// their certificate, so DoT/DoH work without typing it.
+var KnownResolverNames = map[string]string{
+	"9.9.9.9":         "dns.quad9.net",
+	"149.112.112.112": "dns.quad9.net",
+	"9.9.9.11":        "dns11.quad9.net",
+	"1.1.1.1":         "cloudflare-dns.com",
+	"1.0.0.1":         "cloudflare-dns.com",
+	"8.8.8.8":         "dns.google",
+	"8.8.4.4":         "dns.google",
+	"94.140.14.14":    "dns.adguard-dns.com",
+	"94.140.15.15":    "dns.adguard-dns.com",
+	"208.67.222.222":  "dns.opendns.com",
+	"208.67.220.220":  "dns.opendns.com",
+	"194.242.2.2":     "dns.mullvad.net",
+}
+
+// Encrypted reports whether policy domains go to the resolver over DoT/DoH
+// (through snake's local forwarder) rather than plain DNS.
+func (l Leak) Encrypted() bool {
+	return l.DNSViaTunnel && (l.DNSProtocol == DNSDoT || l.DNSProtocol == DNSDoH)
+}
+
+// DNSForwardAddr is the local address of a policy's encrypted-DNS forwarder.
+func (s Settings) DNSForwardAddr(id int) string {
+	return "127.0.0.1#" + strconv.Itoa(s.DNSForwardPort+id)
+}
+
+func blocked(mode string, policy bool) bool {
+	switch mode {
+	case BlockAlways:
+		return true
+	case BlockNever:
+		return false
+	}
+	return policy
+}
+
+// DoTBlocked is whether DoT is blocked for p's devices.
+func (s Settings) DoTBlocked(p Policy) bool { return blocked(s.BlockDoT, p.Leak.BlockDoT) }
+
+// DoHBlocked is whether DoH is blocked for p's devices.
+func (s Settings) DoHBlocked(p Policy) bool { return blocked(s.BlockDoH, p.Leak.BlockDoH) }
+
+// DoHBlockedAnywhere is whether any device has DoH blocked (the DoH address
+// set must be filled).
+func (c *Config) DoHBlockedAnywhere() bool {
+	switch c.Settings.BlockDoH {
+	case BlockAlways:
+		return true
+	case BlockNever:
+		return false
+	}
+	for _, p := range c.Policies {
+		if p.Enabled && p.Leak.BlockDoH {
+			return true
+		}
+	}
+	return false
 }
 
 // Config is the root document.
@@ -227,6 +314,9 @@ func DefaultSettings() Settings {
 		LANInterfaces:    "br+",
 		STUNTestServers:  []string{"stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"},
 		UpdateRepo:       "irisariuan/snake",
+		BlockDoT:         BlockPolicy,
+		BlockDoH:         BlockPolicy,
+		DNSForwardPort:   5350,
 	}
 }
 
@@ -235,6 +325,7 @@ func DefaultLeak() Leak {
 	return Leak{
 		DNSViaTunnel: true,
 		DNSServer:    "9.9.9.9",
+		DNSProtocol:  DNSUDP,
 		HijackDNS:    true,
 		BlockDoT:     true,
 		BlockDoH:     true,
@@ -294,6 +385,13 @@ func (c *Config) ApplyDefaults() {
 	if s.UpdateRepo == "" {
 		s.UpdateRepo = d.UpdateRepo
 	}
+	if s.BlockDoT == "" {
+		s.BlockDoT = d.BlockDoT
+	}
+	if s.BlockDoH == "" {
+		s.BlockDoH = d.BlockDoH
+	}
+	setInt(&s.DNSForwardPort, d.DNSForwardPort)
 	for i := range c.Policies {
 		p := &c.Policies[i]
 		if p.Leak.IPv6 == "" {
@@ -416,6 +514,18 @@ func (c *Config) Normalize() {
 		sort.Ints(p.ASNs)
 		p.ASNs = dedupInt(p.ASNs)
 		p.Leak.DNSServer = strings.TrimSpace(p.Leak.DNSServer)
+		p.Leak.DNSProtocol = strings.ToLower(strings.TrimSpace(p.Leak.DNSProtocol))
+		if p.Leak.DNSProtocol == "" {
+			p.Leak.DNSProtocol = DNSUDP
+		}
+		p.Leak.DNSTLSName = strings.ToLower(strings.TrimSpace(p.Leak.DNSTLSName))
+		if p.Leak.DNSTLSName == "" && p.Leak.DNSProtocol != DNSUDP {
+			p.Leak.DNSTLSName = KnownResolverNames[p.Leak.DNSServer]
+		}
+		p.Leak.DNSDoHPath = strings.TrimSpace(p.Leak.DNSDoHPath)
+		if p.Leak.DNSProtocol == DNSDoH && p.Leak.DNSDoHPath == "" {
+			p.Leak.DNSDoHPath = "/dns-query"
+		}
 		if p.ASNs == nil {
 			p.ASNs = []int{}
 		}
@@ -492,6 +602,16 @@ func (c *Config) Validate() error {
 	}
 	if s.APIPort < 1 || s.APIPort > 65534 {
 		add("api_port out of range")
+	}
+	for name, v := range map[string]string{"block_dot": s.BlockDoT, "block_doh": s.BlockDoH} {
+		switch v {
+		case "", BlockPolicy, BlockAlways, BlockNever:
+		default:
+			add("%s must be policy, always or never", name)
+		}
+	}
+	if s.DNSForwardPort < 1024 || s.DNSForwardPort > 65000 {
+		add("dns_forward_port must be between 1024 and 65000")
 	}
 	for _, t := range s.ProbeTargets {
 		if _, _, err := net.SplitHostPort(t); err != nil {
@@ -604,6 +724,21 @@ func (c *Config) Validate() error {
 			if ip := net.ParseIP(p.Leak.DNSServer); ip == nil || ip.To4() == nil {
 				add("%sdns_server must be an IPv4 address when dns_via_tunnel is on", pre)
 			}
+		}
+		switch p.Leak.DNSProtocol {
+		case "", DNSUDP:
+		case DNSDoT, DNSDoH:
+			if p.Leak.DNSViaTunnel && p.Leak.DNSTLSName == "" {
+				add("%sdns_tls_name is required for %s (the name on %s's certificate, e.g. dns.quad9.net)", pre, p.Leak.DNSProtocol, p.Leak.DNSServer)
+			}
+			if p.Leak.DNSProtocol == DNSDoH && !strings.HasPrefix(p.Leak.DNSDoHPath, "/") {
+				add("%sdns_doh_path must start with /", pre)
+			}
+		default:
+			add("%sdns_protocol %q invalid (udp, dot or doh)", pre, p.Leak.DNSProtocol)
+		}
+		if p.Leak.Encrypted() && s.DNSForwardPort+p.ID > 65535 {
+			add("%sdns_forward_port + policy id exceeds 65535", pre)
 		}
 	}
 	if len(errs) > 0 {
