@@ -850,10 +850,7 @@
         num('queue_base', 'NFQUEUE base number'),
         el('label', { class: 'f' }, 'Mark mask (hex)'),
         el('input', { type: 'text', value: '0x' + (s.mark_mask >>> 0).toString(16), onchange: function (e) { s.mark_mask = parseInt(e.target.value, 16) >>> 0; markDirty(); } }),
-        el('div', { class: 'small muted' }, 'Packet mark bits owned by snake (routing). Default 0xff0000 avoids Merlin VPN Director (0xf000). Do not use bits 24-31: Broadcom routers use them for egress port, IPsec and policy routing.'),
-        el('label', { class: 'f' }, 'Connection mark mask (hex)'),
-        el('input', { type: 'text', value: '0x' + (s.conn_mark_mask >>> 0).toString(16), onchange: function (e) { s.conn_mark_mask = parseInt(e.target.value, 16) >>> 0; markDirty(); } }),
-        el('div', { class: 'small muted' }, 'Where snake keeps the policy of each connection in conntrack. Default 0x3fc00000 is clear of Adaptive QoS (0xc03fffff), which stores its categories in conntrack marks.')),
+        el('div', { class: 'small muted' }, 'fwmark bits owned by snake. Default 0xff0000 avoids Merlin VPN Director (0xf000). Do not use bits 24-31: Broadcom routers use them for egress port, IPsec and policy routing.')),
       viewDNSSettings(num),
       viewUpdates(bool, txt)));
   }

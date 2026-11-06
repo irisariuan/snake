@@ -147,11 +147,6 @@ func Build(s config.Settings, states []PolicyState, opt Options) Plan {
 func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) (mangle, nat, filter *table) {
 	mangle, nat, filter = &table{}, &table{}, &table{}
 	mask := hex(s.MarkMask)
-	// Packets snake marks get the Adaptive QoS direction bits cleared, so
-	// they match snake's ip rules (which require them clear) and a packet
-	// carrying a QoS mark never does.
-	rmask := hex(s.RouteMask())
-	cmask := hex(s.ConnMarkMask)
 	lan := s.LANInterfaces
 	for _, c := range []string{ChainMain, ChainSave, ChainRTC, ChainMSS, ChainDNSOut} {
 		mangle.chain(c)
@@ -174,21 +169,9 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 
 	// Connection affinity: restore the policy mark of an existing connection,
 	// and stop processing anything that already carries a policy mark.
-	// The policy id is kept in its own conntrack mark bits and translated
-	// explicitly: restoring the packet-mark bits from conntrack would turn
-	// an Adaptive QoS category stored there into a policy mark.
-	for _, st := range states {
-		if !st.Policy.Enabled {
-			continue
-		}
-		id := st.Policy.ID
-		mangle.add(ChainSave, "-m mark --mark", hex(s.PolicyMark(id))+"/"+mask, "-j CONNMARK --set-xmark", hex(s.ConnMark(id))+"/"+cmask)
-		mangle.add(ChainMain, "-m mark --mark 0/"+mask, "-m connmark --mark", hex(s.ConnMark(id))+"/"+cmask, "-j MARK --set-xmark", hex(s.PolicyMark(id))+"/"+rmask)
-	}
-	// A policy mark already on the packet (WebRTC verdicts re-queue
-	// packets with it) is saved, unless it carries QoS direction bits: then
-	// the bits are QoS's, not snake's.
-	mangle.add(ChainMain, "-m mark ! --mark 0/"+mask, "-m mark --mark 0/"+hex(config.QoSDirMask), "-g", ChainSave)
+	mangle.add(ChainSave, "-j CONNMARK --save-mark --nfmask", mask, "--ctmask", mask)
+	mangle.add(ChainMain, "-m mark --mark 0/"+mask, "-j CONNMARK --restore-mark --nfmask", mask, "--ctmask", mask)
+	mangle.add(ChainMain, "-m mark ! --mark 0/"+mask, "-g", ChainSave)
 	mangle.add(ChainMain, "-d", strings.Join(private, ","), "-j RETURN")
 	// A connection keeps the route it started with. One that began on WAN
 	// (no policy mark) must not move into a tunnel when its destination
@@ -253,7 +236,7 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		pc, mc := PolicyChain(id), MarkChain(id)
 		mangle.chain(pc)
 		mangle.chain(mc)
-		mangle.add(mc, "-j MARK --set-xmark", mark+"/"+rmask)
+		mangle.add(mc, "-j MARK --set-xmark", mark+"/"+mask)
 		mangle.add(mc, "-g", ChainSave)
 
 		dsets := []string{}

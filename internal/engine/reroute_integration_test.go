@@ -79,23 +79,18 @@ while True:
 
 	// Client: one connection; line 1 before, line 2 after the address
 	// joins the policy set (signalled through a file).
-	flag, qosFlag := filepath.Join(dir, "go"), filepath.Join(dir, "qos")
+	flag := filepath.Join(dir, "go")
 	time.Sleep(300 * time.Millisecond)
 	cli := exec.Command("ip", "netns", "exec", "snakelan", "python3", "-c", `
 import socket, os, time, sys
 c = socket.create_connection(("203.0.113.80", 80), timeout=3); f = c.makefile("rwb")
 f.write(b"one\n"); f.flush(); print("1:" + f.readline().decode().strip(), flush=True)
-while not os.path.exists(sys.argv[2]): time.sleep(0.05)
-try:
-    f.write(b"qos\n"); f.flush(); print("Q:" + f.readline().decode().strip(), flush=True)
-except Exception as e:
-    print("Q:stalled " + type(e).__name__, flush=True)
 while not os.path.exists(sys.argv[1]): time.sleep(0.05)
 try:
     f.write(b"two\n"); f.flush(); print("2:" + f.readline().decode().strip(), flush=True)
 except Exception as e:
     print("2:stalled " + type(e).__name__, flush=True)
-`, flag, qosFlag)
+`, flag)
 	out := &strings.Builder{}
 	cli.Stdout, cli.Stderr = out, out
 	if err := cli.Start(); err != nil {
@@ -109,21 +104,6 @@ except Exception as e:
 		_ = cli.Process.Kill()
 		t.Fatalf("connection over WAN did not work: %q", out.String())
 	}
-	// Adaptive QoS classifies the WAN connection: its category (1, the same
-	// number as the policy id) lands in the conntrack mark and on the
-	// packets. Neither may route the connection into the tunnel.
-	sh(t, "conntrack -U -d 203.0.113.80 -m 0x80010000 >/dev/null")
-	sh(t, "iptables -t mangle -I PREROUTING 1 -i br0 -d 203.0.113.80 -j MARK --set-xmark 0x80010000/0xc03fffff")
-	defer exec.Command("iptables", "-t", "mangle", "-D", "PREROUTING", "-i", "br0", "-d", "203.0.113.80", "-j", "MARK", "--set-xmark", "0x80010000/0xc03fffff").Run()
-	_ = os.WriteFile(qosFlag, nil, 0o600)
-	deadline = time.Now().Add(5 * time.Second)
-	for !strings.Contains(out.String(), "Q:") && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !strings.Contains(out.String(), "Q:qos") {
-		t.Errorf("WAN connection stalled once Adaptive QoS marked it with a category equal to a policy id: %q", out.String())
-	}
-	sh(t, "iptables -t mangle -D PREROUTING -i br0 -d 203.0.113.80 -j MARK --set-xmark 0x80010000/0xc03fffff")
 	sh(t, "ipset add SNK_1_d4 203.0.113.80") // e.g. a shared CDN address answered for a policy domain
 	_ = os.WriteFile(flag, nil, 0o600)
 	_ = cli.Wait()

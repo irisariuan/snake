@@ -79,8 +79,6 @@ type Scan struct {
 type Tracker struct {
 	IPSet    netfilter.IPSet
 	MarkMask uint32
-	// ConnMask is where the policy id is in conntrack marks (0: MarkMask).
-	ConnMask uint32
 
 	// ServerRoute reports how a known STUN/TURN server is routed: the
 	// policy id, or 0 for WAN. known=false means the server is not learned
@@ -247,21 +245,9 @@ func (t *Tracker) openQueue(ctx context.Context, tr PolicyTrack) error {
 // saves it to the conntrack entry and stops, so the whole flow (and its NAT
 // binding) follows the tunnel from the first packet.
 func (t *Tracker) repeat(nf *nfqueue.Nfqueue, id, orig, mark uint32, st *Stats) {
-	// Clear the Adaptive QoS direction bits too: SNAKE only saves a policy
-	// mark from a packet without them.
-	if err := nf.SetVerdictWithOption(id, nfqueue.NfRepeat, nfqueue.WithMark(orig&^(t.MarkMask|qosDirMask)|mark)); err != nil {
+	if err := nf.SetVerdictWithOption(id, nfqueue.NfRepeat, nfqueue.WithMark(orig&^t.MarkMask|mark)); err != nil {
 		atomic.AddUint64(&st.Errors, 1)
 	}
-}
-
-// qosDirMask is config.QoSDirMask.
-const qosDirMask = 0xc0000000
-
-func (t *Tracker) connMask() uint32 {
-	if t.ConnMask != 0 {
-		return t.ConnMask
-	}
-	return t.MarkMask
 }
 
 func (t *Tracker) policyMark(id int) uint32 {
@@ -368,8 +354,7 @@ func (t *Tracker) refresher(ctx context.Context) {
 
 func (t *Tracker) refreshOnce() {
 	t.mu.Lock()
-	cmask := t.connMask()
-	shift := markShift(cmask)
+	shift := markShift(t.MarkMask)
 	tracked := map[int]bool{}
 	for id := range t.tracks {
 		tracked[id] = true
@@ -389,7 +374,7 @@ func (t *Tracker) refreshFrom(f io.Reader, tracked map[int]bool, shift uint) {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), 64*1024)
 	for sc.Scan() {
-		c, marked, live := parseConn(sc.Text(), t.connMask(), shift)
+		c, marked, live := parseConn(sc.Text(), t.MarkMask, shift)
 		if !live {
 			continue
 		}

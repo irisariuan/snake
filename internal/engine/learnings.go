@@ -259,7 +259,7 @@ func destinationsOf(f *os.File, s config.Settings, client, server string, nameOf
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), 64*1024)
 	for sc.Scan() {
-		c, ok := webrtc.ParseConntrack(sc.Text(), s.ConnMarkMask, s.ConnMarkShift())
+		c, ok := webrtc.ParseConntrack(sc.Text(), s.MarkMask, s.MarkShift())
 		if !ok || c.Src != client || c.Dst == server {
 			continue
 		}

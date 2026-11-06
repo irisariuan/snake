@@ -54,7 +54,7 @@ func (m Manager) Sync(s config.Settings, routes []PolicyRoute, probes []ProbeRou
 	if ipv6 {
 		fams = append(fams, true)
 	}
-	mask := fmt.Sprintf("0x%x", s.RouteMask())
+	mask := fmt.Sprintf("0x%x", s.MarkMask)
 	want := map[bool][]rule{}
 	used := map[int]bool{}
 	for _, r := range routes {

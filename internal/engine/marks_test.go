@@ -10,7 +10,7 @@ import (
 	"github.com/irisariuan/snake/internal/system"
 )
 
-func TestMarkMigrationAndQoSWarning(t *testing.T) {
+func TestBadMarkMaskMigratedBack(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(cfgPath, []byte(`{"version":2,"settings":{"mark_mask":1069547520}}`), 0o644); err != nil {
@@ -33,16 +33,7 @@ func TestMarkMigrationAndQoSWarning(t *testing.T) {
 		t.Fatalf("migration not saved: version %d mask %#x", saved.Version, saved.Settings.MarkMask)
 	}
 
-	// The default connection mask is clear of Adaptive QoS.
-	if w := e.Warnings(); len(w) != 0 {
-		t.Fatalf("warnings %v", w)
-	}
-	// Putting connection marks back on QoS's bits is pointed out.
-	c := e.Config()
-	c.Settings.ConnMarkMask = config.DefaultMarkMask
-	if err := e.SetConfig(c); err != nil {
-		t.Fatal(err)
-	}
+	// Adaptive QoS shares bits with the default mask: it is pointed out.
 	if w := e.Warnings(); len(w) != 1 || !strings.Contains(w[0], "Adaptive QoS") {
 		t.Fatalf("warnings %v", w)
 	}

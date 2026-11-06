@@ -44,14 +44,10 @@ func TestBuild(t *testing.T) {
 	plan := Build(c.Settings, st, Options{IPv6: true, IPv6NAT: true, Existing: map[string][]string{"4/mangle": {"SNAKE", "SNAKE_P9", "SNAKE_M9"}}})
 	m4 := plan.Restore["4/mangle"]
 	mustContain(t, m4,
-		// policy id kept in its own conntrack bits, translated both ways
-		"-A SNAKE -m mark --mark 0/0xff0000 -m connmark --mark 0x400000/0x3fc00000 -j MARK --set-xmark 0x10000/0xc0ff0000",
-		"-A SNAKE_SAVE -m mark --mark 0x10000/0xff0000 -j CONNMARK --set-xmark 0x400000/0x3fc00000",
-		"-A SNAKE_SAVE -m mark --mark 0x20000/0xff0000 -j CONNMARK --set-xmark 0x800000/0x3fc00000",
-		// a mark with Adaptive QoS direction bits is never saved as a policy
-		"-A SNAKE -m mark ! --mark 0/0xff0000 -m mark --mark 0/0xc0000000 -g SNAKE_SAVE",
+		"-A SNAKE -m mark --mark 0/0xff0000 -j CONNMARK --restore-mark --nfmask 0xff0000 --ctmask 0xff0000",
+		"-A SNAKE -m mark ! --mark 0/0xff0000 -g SNAKE_SAVE",
 		"-A SNAKE -m mark --mark 0/0xff0000 -m conntrack ! --ctstate NEW -j RETURN",
-		"-A SNAKE_M1 -j MARK --set-xmark 0x10000/0xc0ff0000",
+		"-A SNAKE_M1 -j MARK --set-xmark 0x10000/0xff0000",
 		"-A SNAKE_P1 -m set --match-set SNK_1_d4 dst -g SNAKE_M1",
 		"-A SNAKE_P1 -m set --match-set SNK_1_n4 dst -g SNAKE_M1",
 		// session refresh + learned peers + nfqueue
@@ -220,14 +216,4 @@ func TestBuildDoTDoHOverrides(t *testing.T) {
 		t.Error("never did not override policy DoT blocking")
 	}
 	mustContain(t, f, "SNK_DOH4")
-}
-
-func TestBuildNoConnmarkRestore(t *testing.T) {
-	// Restoring the packet-mark bits from conntrack would turn an Adaptive
-	// QoS category stored there into a policy mark.
-	c, st := states(t)
-	m4 := Build(c.Settings, st, Options{}).Restore["4/mangle"]
-	if strings.Contains(m4, "--restore-mark") || strings.Contains(m4, "--save-mark") {
-		t.Errorf("generic connmark copy:\n%s", m4)
-	}
 }

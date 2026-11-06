@@ -441,7 +441,7 @@ LAN client ──► mangle PREROUTING -i br+ ─► SNAKE
                  SNAKE_P<id> (in policy order):
                    mac / ipset(dnsmasq-learned, ASN+CIDR, WebRTC peers/servers)  ─► SNAKE_M<id>: MARK id<<16, save connmark
                  SNAKE_RTC: NFQUEUE for session clients' new UDP flows
-            ─► ip rule  pref 5200+id  fwmark id<<16/0xc0ff0000 → table 1000+id
+            ─► ip rule  pref 5200+id  fwmark id<<16/0xff0000 → table 1000+id
                table 1000+id: default dev <active tunnel> | unreachable (kill switch) | empty (→ main/WAN)
             ─► nat POSTROUTING SNAKE_NAT: MASQUERADE marked traffic out of tunnels
 filter FORWARD SNAKE_FWD: DoT/DoH/QUIC/IPv6 rejects, then accept LAN⇄tunnel
@@ -450,22 +450,14 @@ dnsmasq: ipset=/netflix.com/.../SNK_1_d4,SNK_1_d6   server=/netflix.com/9.9.9.9
 mangle OUTPUT SNAKE_DNSO: dnsmasq's UDP answers → NFQUEUE → DNS inspector → SNK_<id>_d4/d6
 ```
 
-* Packet marks (fwmark) use bits `0x00ff0000` (Settings → Advanced). Policy
-  ids use bits 16-18, the Broadcom flow-id field that Merlin's VPN Director
-  (`0xf000`) also uses. On Broadcom routers every packet-mark bit has a
-  vendor meaning: bits 24-31 (egress port, WAN flag, IPsec, policy routing)
-  break routed traffic and are rejected.
-* Connection marks (conntrack) use their own bits, `0x3fc00000`, translated
-  to and from the packet mark per policy. Adaptive QoS stores its traffic
-  category in conntrack marks (`0x003f0000`), so copying those bits back
-  turned a WAN connection whose category equalled a policy id into policy
-  traffic, and it stalled partway. Conntrack marks never reach Broadcom's
-  packet path, so the high bits are safe there.
-* snake's ip rules match `fwmark <id>/0xc0ff0000`: Adaptive QoS marks always
-  set bit 30 or 31, so a QoS-marked packet never matches a policy. snake
-  clears those two bits on packets it routes.
-* Configs from before these changes are migrated at startup and
-  connections carrying old marks are cleared once.
+* fwmark bits `0x00ff0000` (configurable, Settings → Advanced). Policy ids
+  use bits 16-18, the Broadcom flow-id field that Merlin's VPN Director
+  (`0xf000`) also uses. On Broadcom routers every mark bit has a vendor
+  meaning: bits 24-31 (egress port, WAN flag, IPsec, policy routing) break
+  routed traffic and are rejected. A short-lived version used `0x3fc00000`;
+  configs with it are moved back automatically.
+* Adaptive QoS also marks packets (`0xc03fffff`) and shares bits with snake.
+  The Status tab points this out when Adaptive QoS is on.
 * ip rule priorities 4980–5499, routing tables 1000–1310.
 * All chains are loaded with `iptables-restore --noflush`, so each table is
   updated atomically. Chains of removed policies are deleted in the same
