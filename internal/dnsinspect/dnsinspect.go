@@ -34,6 +34,8 @@ type Rules struct {
 	Set         *match.Set
 	FollowCNAME bool
 	Set4, Set6  string // target ipsets ("" to skip a family)
+	// DropSet4/6 receive the addresses of answers matching drop: rules.
+	DropSet4, DropSet6 string
 }
 
 // Answer is the relevant content of a DNS response.
@@ -117,6 +119,7 @@ func Decide(rules []Rules, a Answer) (Rules, match.Result, bool) {
 type Stats struct {
 	Answers uint64 `json:"answers"`
 	Matched uint64 `json:"matched"`
+	Dropped uint64 `json:"dropped"` // matched a drop: rule
 	Added   uint64 `json:"added"`
 	Errors  uint64 `json:"errors"`
 }
@@ -144,7 +147,8 @@ type Inspector struct {
 
 // Stats returns a copy of the counters.
 func (i *Inspector) Stats() Stats {
-	return Stats{atomic.LoadUint64(&i.stats.Answers), atomic.LoadUint64(&i.stats.Matched), atomic.LoadUint64(&i.stats.Added), atomic.LoadUint64(&i.stats.Errors)}
+	return Stats{Answers: atomic.LoadUint64(&i.stats.Answers), Matched: atomic.LoadUint64(&i.stats.Matched), Dropped: atomic.LoadUint64(&i.stats.Dropped),
+		Added: atomic.LoadUint64(&i.stats.Added), Errors: atomic.LoadUint64(&i.stats.Errors)}
 }
 
 // Record describes how an address got into a policy's domain set.
@@ -380,6 +384,11 @@ func (i *Inspector) handle(raw []byte) func() {
 	r, res, ok := Decide(rules, ans)
 	if !ok {
 		return nil
+	}
+	if res.Drop {
+		// Blocked: the addresses go to the drop sets instead.
+		r.Set4, r.Set6 = r.DropSet4, r.DropSet6
+		atomic.AddUint64(&i.stats.Dropped, 1)
 	}
 	atomic.AddUint64(&i.stats.Matched, 1)
 	logx.Debugf("dns: %s matched %q (%s) -> policy %s", ans.Question, res.Rule, res.Name, r.Name)

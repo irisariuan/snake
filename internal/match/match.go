@@ -12,6 +12,11 @@
 //	/^ipv4-c\d+-.*\.oca\.nflxvideo\.net$/   regular expression (RE2, case-insensitive)
 //	re:^ipv4-c\d+\.example\.com$            same, alternative syntax
 //	!ads.example.com     exclusion: any rule above prefixed with ! removes matches
+//	drop:ads.example.com drop: block connections to what the rule matches (any
+//	                     domain rule after drop:); beats include rules, but !
+//	                     still exempts a name
+//	drop:asn:1234        drop: block an autonomous system's prefixes
+//	drop:cidr:1.2.3.0/24 drop: block an address range or single IP (drop:ip: too)
 //
 // Names are compared lowercase without the trailing dot. With CNAME following
 // (the default) a rule also matches when any name in the answer's CNAME chain
@@ -20,8 +25,10 @@ package match
 
 import (
 	"fmt"
+	"net"
 	"regexp"
 	"regexp/syntax"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -36,13 +43,19 @@ const (
 	Glob       Kind = "glob"       // *.example.com
 	Keyword    Kind = "keyword"    // ~word
 	Regex      Kind = "regex"      // /re/ or re:re
+	ASN        Kind = "asn"        // drop:asn:1234 (addresses, not names)
+	CIDR       Kind = "cidr"       // drop:cidr:1.2.3.0/24
 )
+
+// DropPrefix marks a rule whose matches are blocked instead of routed.
+const DropPrefix = "drop:"
 
 // Pattern is one parsed rule.
 type Pattern struct {
 	Raw    string `json:"raw"`
 	Kind   Kind   `json:"kind"`
 	Negate bool   `json:"negate"`
+	Drop   bool   `json:"drop,omitempty"`
 	Value  string `json:"value"`
 	// Base is a literal domain suffix every match must end with ("" if none
 	// can be derived). It steers DNS resolution through the tunnel and is
@@ -91,6 +104,20 @@ func Normalize(s string) string {
 	if strings.HasPrefix(s, "!") {
 		neg, s = "!", strings.TrimSpace(s[1:])
 	}
+	if len(s) >= len(DropPrefix) && strings.EqualFold(s[:len(DropPrefix)], DropPrefix) {
+		inner := strings.TrimSpace(s[len(DropPrefix):])
+		lo := strings.ToLower(inner)
+		for _, k := range []string{"asn:", "cidr:", "ip:"} {
+			if strings.HasPrefix(lo, k) {
+				v := strings.ToLower(strings.TrimSpace(inner[len(k):]))
+				if k == "asn:" {
+					v = strings.TrimPrefix(v, "as")
+				}
+				return neg + DropPrefix + k + v
+			}
+		}
+		return neg + DropPrefix + Normalize(inner)
+	}
 	if strings.HasPrefix(s, "/") || strings.HasPrefix(s, "re:") {
 		return neg + s
 	}
@@ -121,6 +148,12 @@ func Parse(raw string) (Pattern, error) {
 	if strings.HasPrefix(s, "!") {
 		p.Negate = true
 		s = s[1:]
+	}
+	if strings.HasPrefix(s, DropPrefix) {
+		if p.Negate {
+			return p, fmt.Errorf("! and drop: cannot be combined; write !name to exempt a name from drop rules")
+		}
+		return parseDrop(s)
 	}
 	switch {
 	case strings.HasPrefix(s, "re:") || strings.HasPrefix(s, "/"):
@@ -182,6 +215,45 @@ func Parse(raw string) (Pattern, error) {
 	}
 	if p.Base != "" && !strings.Contains(p.Base, ".") {
 		p.Base = "" // a bare TLD is too broad to steer DNS for
+	}
+	return p, nil
+}
+
+// parseDrop parses "drop:<rule>", "drop:asn:N" or "drop:cidr:X".
+func parseDrop(s string) (Pattern, error) {
+	inner := s[len(DropPrefix):]
+	p := Pattern{Raw: s, Drop: true}
+	switch {
+	case strings.HasPrefix(inner, "asn:"):
+		v := strings.TrimPrefix(strings.TrimSpace(inner[4:]), "as")
+		n, err := strconv.ParseUint(v, 10, 32)
+		if err != nil || n == 0 {
+			return p, fmt.Errorf("invalid ASN %q", inner[4:])
+		}
+		p.Kind, p.Value = ASN, strconv.FormatUint(n, 10)
+	case strings.HasPrefix(inner, "cidr:") || strings.HasPrefix(inner, "ip:"):
+		_, v, _ := strings.Cut(inner, ":")
+		v = strings.TrimSpace(v)
+		if _, n, err := net.ParseCIDR(v); err == nil {
+			v = n.String()
+		} else if ip := net.ParseIP(v); ip != nil {
+			v = ip.String()
+		} else {
+			return p, fmt.Errorf("invalid CIDR/IP %q", v)
+		}
+		p.Kind, p.Value = CIDR, v
+	case inner == "":
+		return p, fmt.Errorf("drop: needs a rule, e.g. drop:ads.example.com")
+	default:
+		q, err := Parse(inner)
+		if err != nil {
+			return p, err
+		}
+		if q.Negate || q.Drop {
+			return p, fmt.Errorf("drop: must be followed by a domain rule, asn: or cidr:")
+		}
+		q.Raw, q.Drop = s, true
+		return q, nil
 	}
 	return p, nil
 }
@@ -270,7 +342,7 @@ func (p Pattern) Match(name string) bool {
 	case Glob, Regex:
 		return p.re != nil && p.re.MatchString(name)
 	}
-	return false
+	return false // ASN, CIDR: addresses, not names
 }
 
 // Native reports whether dnsmasq's ipset= can implement the rule exactly.
@@ -279,10 +351,13 @@ func (p Pattern) Native() bool { return p.Kind == Suffix && !p.Negate }
 // Set is a compiled rule list. Do not modify Include/Exclude after the
 // first MatchAny: the lookup index is built once.
 type Set struct {
-	once     sync.Once
-	inc, exc index
-	Include  []Pattern
-	Exclude  []Pattern
+	once          sync.Once
+	inc, exc, drp index
+	Include       []Pattern
+	Exclude       []Pattern
+	Drop          []Pattern // drop: domain rules
+	DropASNs      []int     // drop:asn:
+	DropCIDRs     []string  // drop:cidr:
 }
 
 // LineError is a parse error for one rule.
@@ -305,9 +380,17 @@ func Compile(rules []string) (*Set, []LineError) {
 			errs = append(errs, LineError{Index: i, Rule: r, Error: err.Error()})
 			continue
 		}
-		if p.Negate {
+		switch {
+		case p.Negate:
 			s.Exclude = append(s.Exclude, p)
-		} else {
+		case p.Kind == ASN:
+			n, _ := strconv.Atoi(p.Value)
+			s.DropASNs = append(s.DropASNs, n)
+		case p.Kind == CIDR:
+			s.DropCIDRs = append(s.DropCIDRs, p.Value)
+		case p.Drop:
+			s.Drop = append(s.Drop, p)
+		default:
 			s.Include = append(s.Include, p)
 		}
 	}
@@ -324,18 +407,26 @@ func MustCompile(rules []string) *Set {
 type Result struct {
 	Matched  bool   `json:"matched"`
 	Name     string `json:"name,omitempty"`     // the name in the chain that matched
-	Rule     string `json:"rule,omitempty"`     // the include rule that matched
+	Rule     string `json:"rule,omitempty"`     // the include (or drop) rule that matched
+	Drop     bool   `json:"drop,omitempty"`     // a drop: rule matched: block, do not route
 	Excluded string `json:"excluded,omitempty"` // the exclusion that vetoed it
 }
 
 // MatchAny tests every name (query name first, then the CNAME chain).
-// A name matching an exclusion vetoes the whole answer. Among the rules
-// matching the first matching name, the earliest rule is reported.
+// A name matching an exclusion vetoes the whole answer; otherwise a name
+// matching a drop rule blocks it, before include rules are considered.
+// Among the rules matching the first matching name, the earliest is
+// reported.
 func (s *Set) MatchAny(names ...string) Result {
 	s.once.Do(s.build)
 	for _, n := range names {
 		if i := s.exc.first(n); i >= 0 {
 			return Result{Excluded: s.Exclude[i].Raw, Name: n}
+		}
+	}
+	for _, n := range names {
+		if i := s.drp.first(n); i >= 0 {
+			return Result{Matched: true, Drop: true, Name: n, Rule: s.Drop[i].Raw}
 		}
 	}
 	for _, n := range names {
@@ -413,11 +504,33 @@ func (x *index) first(name string) int {
 }
 
 func (s *Set) build() {
-	s.inc, s.exc = newIndex(s.Include), newIndex(s.Exclude)
+	s.inc, s.exc, s.drp = newIndex(s.Include), newIndex(s.Exclude), newIndex(s.Drop)
 }
 
 // Empty reports whether the set has no include rules.
 func (s *Set) Empty() bool { return s == nil || len(s.Include) == 0 }
+
+// HasDrops reports whether the set has any drop: rule.
+func (s *Set) HasDrops() bool {
+	return s != nil && len(s.Drop)+len(s.DropASNs)+len(s.DropCIDRs) > 0
+}
+
+// DropSuffixes returns the plain drop: suffix rules dnsmasq can add to the
+// drop set by itself. With exclusions there are none unless degraded (no
+// DNS inspector), since dnsmasq cannot honour them. Extra drop entries are
+// safe otherwise: a drop beats include rules anyway.
+func (s *Set) DropSuffixes(degraded bool) []string {
+	if len(s.Exclude) > 0 && !degraded {
+		return nil
+	}
+	var out []string
+	for _, p := range s.Drop {
+		if p.Kind == Suffix {
+			out = append(out, p.Value)
+		}
+	}
+	return out
+}
 
 // NativeSuffixes returns rules dnsmasq can handle by itself. When the set has
 // exclusions none are native, since dnsmasq cannot honour them.
@@ -449,10 +562,15 @@ func (s *Set) PlainSuffixes() []string {
 // NeedsInspector reports whether some rules need DNS answer inspection.
 func (s *Set) NeedsInspector() bool {
 	if len(s.Exclude) > 0 {
-		return len(s.Include) > 0
+		return len(s.Include)+len(s.Drop) > 0
 	}
 	for _, p := range s.Include {
 		if !p.Native() {
+			return true
+		}
+	}
+	for _, p := range s.Drop {
+		if p.Kind != Suffix {
 			return true
 		}
 	}

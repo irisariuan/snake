@@ -164,7 +164,7 @@
       btn('Re-check tunnels', function () { api('POST', '/api/recheck').then(function () { toast('Health check scheduled'); setTimeout(refreshStatus, 4000); }); }),
       btn('Re-apply rules', function () { api('POST', '/api/apply').then(function () { toast('Applied'); refreshStatus(); }).catch(function (e) { toast(e.message); }); }),
       el('span', { class: 'muted small' }, 'WAN ' + (s.wan_ip || '?') + ' · uptime ' + s.uptime + ' · applied ' + ago(s.last_apply) + ' · IPv6 ' + (s.caps.ipv6 ? 'yes' : 'no') + ' · NFQUEUE ' + (s.caps.nfqueue ? 'yes' : 'no') + ' · ipset netlink ' + (s.caps.ipset_netlink ? 'yes' : 'no') +
-        (s.dns_inspector ? ' · DNS inspector: ' + s.dns_inspector.answers + ' answers, ' + s.dns_inspector.matched + ' matched, ' + s.dns_inspector.added + ' IPs added' : ''))));
+        (s.dns_inspector ? ' · DNS inspector: ' + s.dns_inspector.answers + ' answers, ' + s.dns_inspector.matched + ' matched' + (s.dns_inspector.dropped ? ' (' + s.dns_inspector.dropped + ' blocked)' : '') + ', ' + s.dns_inspector.added + ' IPs added' : ''))));
 
     var tn = Object.keys(s.tunnels || {}).sort();
     b.appendChild(el('h3', null, 'Tunnels'));
@@ -217,7 +217,9 @@
     ['cdn-?.example.com', '? = one character'],
     ['~keyword', 'name contains keyword'],
     ['/regex/  or  re:regex', 'RE2 regular expression, case-insensitive'],
-    ['!rule', 'exclusion: vetoes matches of the rules'],
+    ['!rule', 'exclusion: vetoes matches of the rules (drop: rules too)'],
+    ['drop:rule', 'block: connections to what any domain rule after drop: matches are rejected; beats include rules'],
+    ['drop:asn:1234 / drop:cidr:1.2.3.0/24', 'block an autonomous system or address range'],
     ['asn:2906', 'autonomous system (all its announced prefixes)'],
     ['cidr:23.246.0.0/18', 'address range or single IP (ip: also works)'],
     ['@name / @description / @source', 'list metadata (rule lists)'],
@@ -242,6 +244,10 @@
     }
     var out = esc(lead);
     if (t[0] === '!') { out += span('neg', '!'); t = t.slice(1); }
+    if ((m = /^(drop:)(.*)$/i.exec(t))) {
+      out += span('drop', m[1]); t = m[2];
+      if ((m = /^(asn:|cidr:|ip:)(.*)$/i.exec(t))) { var dc = splitComment(m[2]); return out + span('kw', m[1]) + span('num', dc[0]) + span('com', dc[1]); }
+    }
     if (t[0] === '/' || /^re:/i.test(t)) return out + span('re', t);
     var cm = splitComment(t); t = cm[0];
     if (t[0] === '~') out += span('kw', '~') + span('str', t.slice(1));
@@ -688,10 +694,11 @@
         out.appendChild(el('div', { class: 'kv' },
           el('span', null, 'Domain'), el('span', null, r.domain),
           el('span', null, 'CNAME chain'), el('span', { class: 'mono' }, (r.chain || []).length ? r.domain + ' → ' + r.chain.join(' → ') : 'none'),
-          el('span', null, 'Policy'), el('span', null, r.policy ? r.policy + ' (rule ' + r.matched + (r.matched_via && r.matched_via !== r.domain ? ' via ' + r.matched_via : '') + ')' : 'none'),
+          el('span', null, 'Policy'), el('span', null, r.policy ? r.policy + ' (rule ' + r.matched + (r.matched_via && r.matched_via !== r.domain ? ' via ' + r.matched_via : '') + ')' : 'none',
+            r.blocked ? [' ', badge('blocked', 'bad')] : null),
           (r.excluded || []).length ? [el('span', null, 'Excluded by'), el('span', null, r.excluded.join(', '))] : null,
           el('span', null, 'Tunnel'), el('span', null, r.tunnel ? r.tunnel + ' ' + (r.country || '') : '-'),
-          el('span', null, 'Addresses'), el('span', null, (r.addrs || []).map(function (a) { return el('div', { class: 'mono' }, a.ip + (a.in_set ? '  ✓ ' + a.in_set : '  ✗ not in a set')); })),
+          el('span', null, 'Addresses'), el('span', null, (r.addrs || []).map(function (a) { return el('div', { class: 'mono' }, a.ip + (a.blocked_by ? '  ⛔ ' + a.blocked_by : '') + (a.in_set ? '  ✓ ' + a.in_set : (a.blocked_by ? '' : '  ✗ not in a set'))); })),
           r.error ? [el('span', null, 'Error'), el('span', null, r.error)] : null));
         (r.notes || []).forEach(function (n) { out.appendChild(el('div', { class: 'small', style: 'color:var(--warn)' }, n)); });
       }).catch(function (e) { out.textContent = e.message; });
@@ -848,6 +855,7 @@
       pols.map(function (p) { return el('option', { value: p.id, selected: p.id === la.policy ? 'selected' : null }, p.name); }));
     var kindSel = el('select', { onchange: function (e) { la.kind = e.target.value; la.data = null; loadLA(); } },
       el('option', { value: 'dns', selected: la.kind === 'dns' ? 'selected' : null }, 'DNS answers'),
+      el('option', { value: 'drop', selected: la.kind === 'drop' ? 'selected' : null }, 'Blocked (drop: rules)'),
       el('option', { value: 'peer', selected: la.kind === 'peer' ? 'selected' : null }, 'WebRTC peers'));
     var qIn = el('input', { type: 'text', placeholder: 'filter: address, name, rule, device', size: 30, value: la.q,
       onkeydown: function (e) { if (e.key === 'Enter') { la.q = qIn.value; loadLA(); } } });
@@ -868,13 +876,14 @@
     var v = la.data;
     if (!v || v.policy_id !== la.policy || v.kind !== la.kind) { out.appendChild(el('p', { class: 'muted' }, 'Loading...')); if (!la.loading) { la.loading = true; setTimeout(function () { la.loading = false; loadLA(); }, 0); } return; }
     var info = v.total + ' in the kernel set' + (v.matching !== v.total ? ' · ' + v.matching + ' match the filter' : '');
-    if (v.kind === 'dns') {
+    var dnsKind = v.kind === 'dns' || v.kind === 'drop';
+    if (dnsKind) {
       if (v.unknown) info += ' · ' + v.unknown + ' without DNS details (added by dnsmasq, or before details were recorded)';
       if (!v.inspector) info += ' · DNS inspector off: new answers are added by dnsmasq without details';
     }
     out.appendChild(el('div', { class: 'row', style: 'margin-bottom:8px' }, el('span', { class: 'small muted' }, info),
-      v.total ? btn('Remove all', function () { if (confirm('Remove all ' + v.total + ' learned ' + (v.kind === 'dns' ? 'DNS' : 'peer') + ' addresses of ' + v.policy + '?')) forget({ all: true }, 'Removed'); }, 'danger') : null));
-    if (v.kind === 'dns' && (v.rules || []).length) {
+      v.total ? btn('Remove all', function () { if (confirm('Remove all ' + v.total + ' learned ' + ({ dns: 'DNS', drop: 'blocked', peer: 'peer' }[v.kind]) + ' addresses of ' + v.policy + '?')) forget({ all: true }, 'Removed'); }, 'danger') : null));
+    if (dnsKind && (v.rules || []).length) {
       out.appendChild(el('details', { class: 'card', open: la.rulesOpen ? true : null, ontoggle: function (e) { la.rulesOpen = e.target.open; } },
         el('summary', { style: 'cursor:pointer' }, el('b', null, 'By rule'), el('span', { class: 'small muted' }, ' (' + v.rules.length + ')')),
         el('table', null, el('tr', null, ['Rule', 'From', 'Addresses', ''].map(function (h) { return el('th', null, h); })),
@@ -887,13 +896,13 @@
           }))));
     }
     if (!v.addrs.length) { out.appendChild(el('p', { class: 'muted' }, v.total ? 'Nothing matches the filter.' : 'Nothing learned yet.')); return; }
-    var head = v.kind === 'dns' ? ['Address', 'Name', 'Rule', 'Device', 'Last answer', 'Expires', ''] : ['Address', 'Expires', ''];
+    var head = dnsKind ? ['Address', 'Name', 'Rule', 'Device', 'Last answer', 'Expires', ''] : ['Address', 'Expires', ''];
     out.appendChild(el('div', { class: 'scroll' }, el('table', null,
       el('tr', null, head.map(function (h) { return el('th', null, h); })),
       v.addrs.map(function (a) {
         var exp = a.expires ? fmtDur(a.expires) : 'never';
         var rm = btn('Remove', function () { forget({ addrs: [a.addr] }, 'Removed'); }, 'danger');
-        if (v.kind !== 'dns') return el('tr', null, el('td', { class: 'mono' }, a.addr), el('td', { class: 'small' }, exp), el('td', null, rm));
+        if (!dnsKind) return el('tr', null, el('td', { class: 'mono' }, a.addr), el('td', { class: 'small' }, exp), el('td', null, rm));
         return el('tr', null,
           el('td', { class: 'mono' }, a.addr),
           el('td', { class: 'small' }, a.name || el('span', { class: 'muted' }, 'unknown'), a.matched ? el('div', { class: 'muted' }, 'via ' + a.matched) : null),

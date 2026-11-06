@@ -50,6 +50,9 @@ func (s *Server) parseRuleFile(w http.ResponseWriter, r *http.Request) {
 			if p.Negate {
 				k = "!" + k
 			}
+			if p.Drop {
+				k = "drop " + k
+			}
 			kinds[k]++
 		}
 	}

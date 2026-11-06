@@ -143,3 +143,23 @@ func TestSTUNServerTTL(t *testing.T) {
 		t.Fatalf("over ipset max accepted: %v", err)
 	}
 }
+
+func TestDropRulesDoNotChangeScope(t *testing.T) {
+	p := Policy{Devices: []string{"aa:bb:cc:00:00:01"}, Domains: []string{"# c", "drop:ads.example.com", "drop:asn:1234"}}
+	if p.HasDomains() || !p.HasDrops() || p.HasDestinations() || p.Scope() != "whole-device" {
+		t.Fatalf("domains=%v drops=%v dest=%v scope=%s", p.HasDomains(), p.HasDrops(), p.HasDestinations(), p.Scope())
+	}
+	c := Default()
+	c.Policies = []Policy{{Name: "blocklist", Enabled: true, Tunnels: []string{"wgc1"}, Domains: []string{"DROP:Ads.Example.com", "drop:cidr:10.1.2.3"}, Leak: Leak{IPv6: "off", WebRTC: "off"}}}
+	c.Normalize()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("drop-only policy rejected: %v", err)
+	}
+	if c.Policies[0].Domains[0] != "drop:ads.example.com" {
+		t.Fatalf("normalized %v", c.Policies[0].Domains)
+	}
+	c.Policies[0].Domains = append(c.Policies[0].Domains, "!drop:x.example")
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+		t.Fatalf("!drop: accepted: %v", err)
+	}
+}

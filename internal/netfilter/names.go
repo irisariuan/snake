@@ -10,6 +10,8 @@ const (
 	KindSession = "s" // WebRTC session window: client IPs with a live policy session
 	KindPeer    = "r" // WebRTC peers learned from STUN (ICE connectivity checks)
 	KindServer  = "t" // STUN/TURN servers of learning groups routed via the policy; routed outside sessions too
+	KindDrop    = "x" // addresses answered for drop: domain rules (connections rejected)
+	KindDropNet = "z" // drop:asn: and drop:cidr: ranges (connections rejected)
 )
 
 // SetPrefix is shared by every ipset snake owns.

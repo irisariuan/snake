@@ -28,7 +28,7 @@ func Generate(c *config.Config, inspector bool) string {
 		if p.Leak.BlockDoH {
 			anyDoH = true
 		}
-		if !p.HasDomains() {
+		if !p.HasDomains() && !p.HasDrops() {
 			continue
 		}
 		rules := p.DomainRules()
@@ -42,8 +42,16 @@ func Generate(c *config.Config, inspector bool) string {
 		if !inspector {
 			native = rules.PlainSuffixes()
 		}
-		for _, part := range chunks(native) {
-			fmt.Fprintf(&b, "ipset=/%s/%s\n", strings.Join(part, "/"), sets)
+		if p.HasDomains() {
+			for _, part := range chunks(native) {
+				fmt.Fprintf(&b, "ipset=/%s/%s\n", strings.Join(part, "/"), sets)
+			}
+		}
+		// Plain drop: rules fill the drop sets the same way (a drop beats
+		// include rules, so extra drop entries are always correct).
+		drops := netfilter.SetName(p.ID, netfilter.KindDrop, false) + "," + netfilter.SetName(p.ID, netfilter.KindDrop, true)
+		for _, part := range chunks(rules.DropSuffixes(!inspector)) {
+			fmt.Fprintf(&b, "ipset=/%s/%s\n", strings.Join(part, "/"), drops)
 		}
 		if p.Leak.DNSViaTunnel && p.Leak.DNSServer != "" {
 			for _, part := range chunks(rules.Bases()) {

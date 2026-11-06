@@ -22,6 +22,7 @@ import (
 const (
 	LearnedDNS  = "dns"  // answers to policy domain rules (SNK_<id>_d)
 	LearnedPeer = "peer" // WebRTC peers (SNK_<id>_r)
+	LearnedDrop = "drop" // answers to drop: domain rules (SNK_<id>_x)
 )
 
 func learnedKind(kind string) (string, error) {
@@ -30,8 +31,10 @@ func learnedKind(kind string) (string, error) {
 		return netfilter.KindDomain, nil
 	case LearnedPeer:
 		return netfilter.KindPeer, nil
+	case LearnedDrop:
+		return netfilter.KindDrop, nil
 	}
-	return "", fmt.Errorf("kind must be %q or %q", LearnedDNS, LearnedPeer)
+	return "", fmt.Errorf("kind must be %q, %q or %q", LearnedDNS, LearnedDrop, LearnedPeer)
 }
 
 // LearnedAddr is one address a policy learned, with what is known about it.
@@ -128,12 +131,12 @@ func (e *Engine) LearnedAddrs(ref, kind, q string, limit int) (LearnedView, erro
 	if v.Kind == "" {
 		v.Kind = LearnedDNS
 	}
-	v.Inspector = k == netfilter.KindDomain && e.dns.Running()
+	v.Inspector = isDNSKind(k) && e.dns.Running()
 	ips := e.ipset()
 	sets := []string{netfilter.SetName(p.ID, k, false), netfilter.SetName(p.ID, k, true)}
 	var recs map[string]*dnsinspect.Record
 	var sources map[string]string
-	if k == netfilter.KindDomain {
+	if isDNSKind(k) {
 		recs = e.dns.Records(sets...)
 		sources = e.ruleSources(p.ID)
 	}
@@ -178,7 +181,7 @@ func (e *Engine) LearnedAddrs(ref, kind, q string, limit int) (LearnedView, erro
 				if source == "" {
 					source = "removed rule"
 				}
-			} else if k == netfilter.KindDomain {
+			} else if isDNSKind(k) {
 				v.Unknown++
 			}
 			if rules[rule] == nil {
@@ -221,7 +224,7 @@ func (e *Engine) LearnedAddrs(ref, kind, q string, limit int) (LearnedView, erro
 		}
 		v.Addrs = append(v.Addrs, a)
 	}
-	if k == netfilter.KindDomain {
+	if isDNSKind(k) {
 		for _, r := range rules {
 			v.Rules = append(v.Rules, *r)
 		}
@@ -260,7 +263,7 @@ func (e *Engine) ForgetLearned(ref string, req ForgetRequest) (int, error) {
 		n := max(ips.Count(s4), 0) + max(ips.Count(s6), 0)
 		_ = ips.Flush(s4)
 		_ = ips.Flush(s6)
-		if k == netfilter.KindDomain {
+		if isDNSKind(k) {
 			e.dns.Forget(s4, nil)
 			e.dns.Forget(s6, nil)
 		}
@@ -268,10 +271,10 @@ func (e *Engine) ForgetLearned(ref string, req ForgetRequest) (int, error) {
 	}
 	addrs := req.Addrs
 	if req.Rule != nil {
-		if k != netfilter.KindDomain {
+		if !isDNSKind(k) {
 			return 0, errors.New("rule selection only applies to DNS addresses")
 		}
-		v, err := e.LearnedAddrs(strconv.Itoa(p.ID), LearnedDNS, "", 1<<30)
+		v, err := e.LearnedAddrs(strconv.Itoa(p.ID), req.Kind, "", 1<<30)
 		if err != nil {
 			return 0, err
 		}
@@ -292,7 +295,7 @@ func (e *Engine) ForgetLearned(ref string, req ForgetRequest) (int, error) {
 	if len(v6) > 0 {
 		_ = ips.Del(s6, v6)
 	}
-	if k == netfilter.KindDomain {
+	if isDNSKind(k) {
 		e.dns.Forget(s4, v4)
 		e.dns.Forget(s6, v6)
 	}
@@ -328,3 +331,7 @@ func (e *Engine) saveDNSRecords() {
 		logx.Warnf("save dns records: %v", err)
 	}
 }
+
+// isDNSKind reports whether a set kind is filled from DNS answers (and so
+// has inspector records).
+func isDNSKind(k string) bool { return k == netfilter.KindDomain || k == netfilter.KindDrop }

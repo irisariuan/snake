@@ -87,3 +87,24 @@ func TestConvert(t *testing.T) {
 		t.Fatalf("expected error without convert: %+v", r)
 	}
 }
+
+func TestDropRulesInFiles(t *testing.T) {
+	r := Parse("@name Block\nnetflix.com\nDROP:ads.netflix.com\ndrop:asn:AS1234 # isp ads\ndrop:cidr:198.51.100.0/24\nasn:2906\n", false)
+	if len(r.Errors) != 0 {
+		t.Fatalf("errors: %+v", r.Errors)
+	}
+	want := "netflix.com\ndrop:ads.netflix.com\ndrop:asn:1234\ndrop:cidr:198.51.100.0/24"
+	if got := strings.Join(r.File.Domains, "\n"); got != want {
+		t.Fatalf("domains:\n%s", got)
+	}
+	if len(r.File.ASNs) != 1 || r.File.ASNs[0] != 2906 {
+		t.Fatalf("include ASNs must stay separate: %v", r.File.ASNs)
+	}
+	out := Format(r.File)
+	if r2 := Parse(out, false); Format(r2.File) != out || len(r2.Errors) != 0 {
+		t.Fatalf("round trip:\n%s", out)
+	}
+	if r := Parse("drop:asn:nope\n", false); len(r.Errors) != 1 || r.Errors[0].Line != 1 {
+		t.Fatalf("bad drop asn: %+v", r.Errors)
+	}
+}

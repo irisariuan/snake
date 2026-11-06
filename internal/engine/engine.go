@@ -358,6 +358,7 @@ func (e *Engine) states(cfg *config.Config, caps Caps) []netfilter.PolicyState {
 		default:
 			st.IPv6Mode = netfilter.V6Block
 		}
+		st.Drops = p.HasDrops()
 		st.WebRTCMode = netfilter.RTCOff
 		if p.Leak.WebRTC == config.WebRTCTrack && p.HasDestinations() {
 			if caps.NFQueue {
@@ -396,6 +397,11 @@ func setSpecs(cfg *config.Config, states []netfilter.PolicyState, v6 bool) []net
 					netfilter.SetSpec{Name: netfilter.SetName(p.ID, netfilter.KindSession, f), Type: "hash:ip", V6: f, Timeout: s.SessionTimeout},
 					netfilter.SetSpec{Name: netfilter.SetName(p.ID, netfilter.KindPeer, f), Type: "hash:ip", V6: f, Timeout: s.PeerTimeout, MaxElem: 65536},
 				)
+			}
+			if st.Drops {
+				specs = append(specs,
+					netfilter.SetSpec{Name: netfilter.SetName(p.ID, netfilter.KindDrop, f), Type: "hash:net", V6: f, Timeout: s.DomainSetTimeout, MaxElem: 131072},
+					netfilter.SetSpec{Name: netfilter.SetName(p.ID, netfilter.KindDropNet, f), Type: "hash:net", V6: f, MaxElem: 262144})
 			}
 			if st.WebRTCMode != netfilter.RTCOff {
 				// Filled from the learning groups routed via this policy;
@@ -448,6 +454,14 @@ func (e *Engine) Apply(reason string) error {
 	}
 	for _, st := range states {
 		p := st.Policy
+		if st.Drops {
+			rs := e.domainSet(p)
+			d4, d6 := netfilter.SplitFamilies(e.netEntriesOf(rs.DropASNs, rs.DropCIDRs))
+			e.replaceIfChanged(ips, netfilter.SetSpec{Name: netfilter.SetName(p.ID, netfilter.KindDropNet, false), Type: "hash:net", MaxElem: 262144}, d4, &errs)
+			if caps.IPv6 {
+				e.replaceIfChanged(ips, netfilter.SetSpec{Name: netfilter.SetName(p.ID, netfilter.KindDropNet, true), Type: "hash:net", V6: true, MaxElem: 262144}, d6, &errs)
+			}
+		}
 		if len(p.ASNs)+len(p.CIDRs) == 0 {
 			continue
 		}
@@ -596,13 +610,21 @@ func (e *Engine) dnsRules(states []netfilter.PolicyState, caps Caps) []dnsinspec
 	var out []dnsinspect.Rules
 	for _, st := range states {
 		p := st.Policy
-		if !p.HasDomains() {
+		if !p.HasDomains() && !st.Drops {
 			continue
 		}
-		r := dnsinspect.Rules{ID: p.ID, Name: p.Name, Set: e.domainSet(p), FollowCNAME: !p.IgnoreCNAME,
-			Set4: netfilter.SetName(p.ID, netfilter.KindDomain, false)}
-		if caps.IPv6 {
-			r.Set6 = netfilter.SetName(p.ID, netfilter.KindDomain, true)
+		r := dnsinspect.Rules{ID: p.ID, Name: p.Name, Set: e.domainSet(p), FollowCNAME: !p.IgnoreCNAME}
+		if p.HasDomains() {
+			r.Set4 = netfilter.SetName(p.ID, netfilter.KindDomain, false)
+			if caps.IPv6 {
+				r.Set6 = netfilter.SetName(p.ID, netfilter.KindDomain, true)
+			}
+		}
+		if st.Drops {
+			r.DropSet4 = netfilter.SetName(p.ID, netfilter.KindDrop, false)
+			if caps.IPv6 {
+				r.DropSet6 = netfilter.SetName(p.ID, netfilter.KindDrop, true)
+			}
 		}
 		out = append(out, r)
 	}
@@ -634,12 +656,15 @@ func (e *Engine) replaceIfChanged(ips netfilter.IPSet, spec netfilter.SetSpec, e
 }
 
 // netEntries returns static CIDRs plus cached ASN prefixes for a policy.
-func (e *Engine) netEntries(p config.Policy) []string {
-	out := append([]string(nil), p.CIDRs...)
+func (e *Engine) netEntries(p config.Policy) []string { return e.netEntriesOf(p.ASNs, p.CIDRs) }
+
+// netEntriesOf returns CIDRs plus the cached prefixes of ASNs.
+func (e *Engine) netEntriesOf(asns []int, cidrs []string) []string {
+	out := append([]string(nil), cidrs...)
 	e.mu.Lock()
 	cache := e.asnCache
 	e.mu.Unlock()
-	for _, n := range p.ASNs {
+	for _, n := range asns {
 		if cache == nil {
 			break
 		}
@@ -663,7 +688,8 @@ func (e *Engine) refreshASNs(force bool) {
 		if !p.Enabled {
 			continue
 		}
-		for _, n := range p.ASNs {
+		asns := append(append([]int(nil), p.ASNs...), e.domainSet(p).DropASNs...)
+		for _, n := range asns {
 			if !force && !cache.Stale(n) {
 				continue
 			}

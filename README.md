@@ -18,7 +18,7 @@ Inspired by and able to import from Ranger802004's
 | | Domain VPN Routing | snake |
 |---|---|---|
 | Domain → IP | `nslookup` polling on cron / AdGuardHome log | **in real time**: every DNS answer is matched before the client receives it |
-| Domain rules | domain list | suffix, exact, subdomains-only, `*`/`**`/`?` wildcards, `~keyword`, `/regex/`, `!exclusions`, CNAME-chain matching |
+| Domain rules | domain list | suffix, exact, subdomains-only, `*`/`**`/`?` wildcards, `~keyword`, `/regex/`, `!exclusions`, `drop:` blocking, CNAME-chain matching |
 | Tunnels per policy | one | **ordered list with failover / fail-back** |
 | Health | – | interface + WireGuard handshake / OpenVPN state, TCP probes *through* the tunnel, **exit-country check** |
 | Tunnel down | traffic goes via WAN | **kill switch** (per policy) or WAN, your choice |
@@ -91,10 +91,29 @@ One rule per line:
 | `~nflx` | any name containing `nflx` |
 | `/^ipv4-c\d+-.*\.oca\.nflxvideo\.net$/` | RE2 regular expression, case-insensitive (`re:...` also works) |
 | `!=ads.example.com` | exclusion: any rule prefixed with `!` |
+| `drop:ads.example.com` | **block**: any domain rule after `drop:` (`drop:**.tracker.net`, `drop:~adserver`, `drop:/re/`) |
+| `drop:asn:1234`, `drop:cidr:198.51.100.0/24` | **block** an autonomous system or an address range / single IP (`drop:ip:` also works) |
 | `com` | rejected: a bare top-level domain would route everything (`**.com` if you really mean it) |
 | `# comment` | ignored; a trailing ` # comment` is allowed too (except in regexes) |
 
 * **Exclusions** veto a policy for that answer. A later policy can still match it.
+* **Drop rules** block instead of route. DNS still answers, but the answered
+  addresses go into the policy's drop set (`SNK_<id>_x4/6`; `drop:asn:` and
+  `drop:cidr:` ranges go into `SNK_<id>_z4/6`), and the router rejects
+  connections to them from the policy's devices, or from the whole LAN for a
+  destination-only policy. TCP gets a reset and other traffic an ICMP error,
+  so apps fail at once instead of timing out. This applies on IPv6 too, even
+  when the policy leaves IPv6 alone.
+  * Within a policy, `!` exclusions come first, then drop rules, then include
+    rules: `drop:ads.example.com` blocks `ads.example.com` even if
+    `example.com` routes the rest, and `!=ok.ads.example.com` still exempts
+    that one name. `!drop:...` is an error; write the plain `!` rule.
+  * Drop rules do not change what a policy routes: a whole-device policy with
+    only `drop:` lines still routes the whole device.
+  * Blocking is by address. A CDN address shared by a dropped name and an
+    allowed one is blocked for both.
+  * Plain `drop:` domains are also handled by dnsmasq; wildcards, keywords,
+    regexes and CNAME matches need the DNS inspector.
 * **CNAME chains**: when on (the default, per-policy toggle), a rule also
   matches when any name in the answer's CNAME chain matches. For example,
   `play.partner.tv → x1.cdn.nflxvideo.net` is caught by `**.nflxvideo.net`, and

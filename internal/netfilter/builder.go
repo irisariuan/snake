@@ -29,6 +29,7 @@ type PolicyState struct {
 	ActiveTunnel string   // "" when no tunnel is usable
 	IPv6Mode     string   // V6Route / V6Block / V6Off
 	WebRTCMode   string   // RTCQueue / RTCPorts / RTCOff
+	Drops        bool     // the policy has drop: rules
 }
 
 // Options describe router capabilities and existing state.
@@ -198,6 +199,24 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		p := st.Policy
 		if !p.Enabled {
 			continue
+		}
+		// drop: rules reject connections from the policy's devices (the
+		// whole LAN for destination-only policies) to the drop sets. They
+		// apply on IPv6 too, whatever the policy does with IPv6 traffic.
+		if st.Drops {
+			who := [][]string{{"-i", lan}}
+			if len(st.MACs) > 0 {
+				who = nil
+				for _, m := range st.MACs {
+					who = append(who, []string{"-i", lan, "-m mac --mac-source", m})
+				}
+			}
+			for _, set := range []string{SetName(p.ID, KindDrop, v6), SetName(p.ID, KindDropNet, v6)} {
+				for _, w := range who {
+					filter.add(ChainFwd, append(w, "-p tcp -m set --match-set", set, "dst -j REJECT --reject-with tcp-reset")...)
+					filter.add(ChainFwd, append(w, "-m set --match-set", set, "dst -j REJECT --reject-with", reject)...)
+				}
+			}
 		}
 		if v6 && st.IPv6Mode == V6Off {
 			continue

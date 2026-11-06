@@ -581,8 +581,8 @@ func (c *Config) Validate() error {
 				add(pre+"%v", err)
 			}
 		}
-		if ep := c.Expand(p); !ep.HasDomains() && len(ep.ASNs)+len(ep.CIDRs)+len(p.Devices) == 0 {
-			add(pre + "needs at least one domain, ASN, CIDR or device")
+		if ep := c.Expand(p); !ep.HasDomains() && !ep.HasDrops() && len(ep.ASNs)+len(ep.CIDRs)+len(p.Devices) == 0 {
+			add(pre + "needs at least one domain, ASN, CIDR, device or drop: rule")
 		}
 		switch p.Leak.IPv6 {
 		case IPv6Tunnel, IPv6Block, IPv6Off:
@@ -638,13 +638,29 @@ func normalizeRule(s string) string {
 
 // HasDomains reports whether the policy has at least one domain rule
 // (comment lines do not count).
+// HasDomains reports whether the policy routes by domain (drop: rules do
+// not count: they block, they do not decide what the policy routes).
 func (p Policy) HasDomains() bool {
 	for _, d := range p.Domains {
-		if match.StripComment(d) != "" {
+		if r := match.StripComment(d); r != "" && !isDrop(r) {
 			return true
 		}
 	}
 	return false
+}
+
+// HasDrops reports whether the policy has drop: rules.
+func (p Policy) HasDrops() bool {
+	for _, d := range p.Domains {
+		if isDrop(match.StripComment(d)) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDrop(rule string) bool {
+	return len(rule) >= len(match.DropPrefix) && strings.EqualFold(rule[:len(match.DropPrefix)], match.DropPrefix)
 }
 
 // DomainRules compiles the policy's domain rules.

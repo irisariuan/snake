@@ -55,4 +55,4 @@
 #snake .redit-issue{cursor:pointer}#snake .redit-issue:hover{text-decoration:underline}
 #snake .t-com{color:#7f9499;font-style:italic}#snake .t-dir{color:#c792ea}#snake .t-str{color:#c3e88d}
 #snake .t-kw{color:#82aaff}#snake .t-num{color:#f78c6c}#snake .t-neg{color:#ff6b6b;font-weight:bold}
-#snake .t-re{color:#ffcb6b}#snake .t-op{color:#89ddff;font-weight:bold}#snake .t-wild{color:#ff9cac;font-weight:bold}#snake .t-dom{color:var(--fg)}
+#snake .t-drop{color:#ff6b6b;font-weight:bold}#snake .t-re{color:#ffcb6b}#snake .t-op{color:#89ddff;font-weight:bold}#snake .t-wild{color:#ff9cac;font-weight:bold}#snake .t-dom{color:var(--fg)}

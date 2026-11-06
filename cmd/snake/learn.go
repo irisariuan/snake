@@ -29,10 +29,10 @@ const learnUsage = `usage:
   snake learn merge <id> <into-id>           merge a group into another
   snake learn delete <id>
 
-  snake learn addrs <policy> [--kind dns|peer] [--filter Q] [--limit N] [--json]
+  snake learn addrs <policy> [--kind dns|drop|peer] [--filter Q] [--limit N] [--json]
                                              addresses a policy learned (DNS answers,
-                                             WebRTC peers)
-  snake learn forget <policy> [--kind dns|peer] (ADDR... | --rule RULE | --all)
+                                             drop: rule answers, WebRTC peers)
+  snake learn forget <policy> [--kind dns|drop|peer] (ADDR... | --rule RULE | --all)
                                              remove learned addresses
 
 P and <policy> are a policy name or id.`
@@ -458,7 +458,7 @@ func learnAddrs(w io.Writer, policy string, args []string) error {
 	if v.Matching != v.Total {
 		fmt.Fprintf(w, ", %d matching", v.Matching)
 	}
-	if v.Kind == engine.LearnedDNS {
+	if v.Kind == engine.LearnedDNS || v.Kind == engine.LearnedDrop {
 		if v.Unknown > 0 {
 			fmt.Fprintf(w, ", %d without DNS details", v.Unknown)
 		}
@@ -468,7 +468,7 @@ func learnAddrs(w io.Writer, policy string, args []string) error {
 	}
 	fmt.Fprintln(w)
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	if v.Kind == engine.LearnedDNS {
+	if v.Kind == engine.LearnedDNS || v.Kind == engine.LearnedDrop {
 		fmt.Fprintln(tw, "ADDRESS\tNAME\tRULE\tSOURCE\tDEVICE\tLAST SEEN\tEXPIRES")
 	} else {
 		fmt.Fprintln(tw, "ADDRESS\tEXPIRES")

@@ -157,3 +157,25 @@ func TestBuildServerSetPerDevice(t *testing.T) {
 		t.Error("device policy's server set applied LAN-wide")
 	}
 }
+
+func TestBuildDrop(t *testing.T) {
+	c, st := states(t)
+	st[0].Drops = true // destination-only policy: the whole LAN
+	st[1].Drops = true // device policy: its devices
+	st[2].Drops = true // IPv6 off: drops still apply on IPv6
+	plan := Build(c.Settings, st, Options{IPv6: true, IPv6NAT: true})
+	f4, f6 := plan.Restore["4/filter"], plan.Restore["6/filter"]
+	mustContain(t, f4,
+		"-A SNAKE_FWD -i br+ -p tcp -m set --match-set SNK_1_x4 dst -j REJECT --reject-with tcp-reset",
+		"-A SNAKE_FWD -i br+ -m set --match-set SNK_1_x4 dst -j REJECT --reject-with icmp-port-unreachable",
+		"-A SNAKE_FWD -i br+ -p tcp -m set --match-set SNK_1_z4 dst -j REJECT --reject-with tcp-reset",
+		"-A SNAKE_FWD -i br+ -m mac --mac-source aa:bb:cc:00:00:01 -m set --match-set SNK_2_x4 dst -j REJECT --reject-with icmp-port-unreachable",
+	)
+	mustContain(t, f6, "-A SNAKE_FWD -i br+ -m mac --mac-source aa:bb:cc:00:00:09 -m set --match-set SNK_3_z6 dst -j REJECT --reject-with icmp6-port-unreachable")
+	if strings.Contains(f4, "-i br+ -m set --match-set SNK_2_x4") {
+		t.Error("device policy drop applied LAN-wide")
+	}
+	if strings.Index(f4, "SNK_1_x4") > strings.Index(f4, "-j ACCEPT") {
+		t.Error("drop rejects after accepts")
+	}
+}

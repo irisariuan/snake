@@ -239,7 +239,7 @@ func (e *Engine) Status() Status {
 			ps.Candidates = cands[p.ID]
 			s := stByID[p.ID]
 			ps.IPv6Mode, ps.WebRTCMode = s.IPv6Mode, s.WebRTCMode
-			for _, kind := range []string{netfilter.KindDomain, netfilter.KindNet, netfilter.KindSession, netfilter.KindPeer, netfilter.KindServer} {
+			for _, kind := range []string{netfilter.KindDomain, netfilter.KindNet, netfilter.KindSession, netfilter.KindPeer, netfilter.KindServer, netfilter.KindDrop, netfilter.KindDropNet} {
 				for _, v6 := range []bool{false, true} {
 					if v6 && !caps.IPv6 {
 						continue
@@ -290,6 +290,7 @@ type DomainTest struct {
 	Policy   string           `json:"policy,omitempty"`
 	PolicyID int              `json:"policy_id,omitempty"`
 	Matched  string           `json:"matched,omitempty"`     // rule that matched
+	Blocked  bool             `json:"blocked,omitempty"`     // a drop: rule matched, or an address is in a drop set
 	Via      string           `json:"matched_via,omitempty"` // name in the chain that matched
 	Excluded []string         `json:"excluded,omitempty"`    // policies vetoed by an exclusion
 	Tunnel   string           `json:"tunnel,omitempty"`
@@ -302,8 +303,9 @@ type DomainTest struct {
 
 // AddrResult tells whether a resolved address is in the policy sets.
 type AddrResult struct {
-	IP    string `json:"ip"`
-	InSet string `json:"in_set,omitempty"`
+	IP      string `json:"ip"`
+	InSet   string `json:"in_set,omitempty"`
+	Blocked string `json:"blocked_by,omitempty"` // drop set holding the address
 }
 
 // MatchDomain finds the first enabled policy whose rules match name or (with
@@ -316,7 +318,7 @@ func matchDomain(cfg *config.Config, rules func(config.Policy) *match.Set, name 
 	names := append([]string{match.Normalize(name)}, chain...)
 	var excluded []string
 	for _, p := range cfg.Policies {
-		if !p.Enabled || !p.HasDomains() {
+		if !p.Enabled || (!p.HasDomains() && !p.HasDrops()) {
 			continue
 		}
 		ns := names
@@ -355,6 +357,14 @@ func (e *Engine) TestDomain(name string) DomainTest {
 			if !pol.Enabled {
 				continue
 			}
+			if pol.HasDrops() {
+				for _, k := range []string{netfilter.KindDrop, netfilter.KindDropNet} {
+					if n := netfilter.SetName(pol.ID, k, v6); ar.Blocked == "" && ips.Test(n, ar.IP) {
+						ar.Blocked = n
+						res.Blocked = true
+					}
+				}
+			}
 			for _, k := range []string{netfilter.KindDomain, netfilter.KindNet} {
 				n := netfilter.SetName(pol.ID, k, v6)
 				if ips.Test(n, ar.IP) {
@@ -368,6 +378,21 @@ func (e *Engine) TestDomain(name string) DomainTest {
 			}
 		}
 		res.Addrs = append(res.Addrs, ar)
+	}
+	if ok && mr.Drop {
+		res.Policy, res.PolicyID, res.Matched, res.Via, res.Blocked = p.Name, p.ID, mr.Rule, mr.Name, true
+		res.Notes = append(res.Notes, "blocked by a drop: rule: connections to these addresses are rejected for the policy's devices")
+		for _, a := range res.Addrs {
+			if a.Blocked == "" {
+				res.Notes = append(res.Notes, a.IP+" is not in the drop set yet: is the router's dnsmasq the resolver? (check DNS hijack / DoH blocking)")
+			}
+		}
+		return res
+	}
+	for _, a := range res.Addrs {
+		if a.Blocked != "" {
+			res.Notes = append(res.Notes, a.IP+" is in "+a.Blocked+": connections to it are rejected (drop rule)")
+		}
 	}
 	if ok {
 		res.Policy, res.PolicyID, res.Matched, res.Via = p.Name, p.ID, mr.Rule, mr.Name
@@ -413,7 +438,7 @@ func (e *Engine) SetMembers(name string, limit int) ([]string, error) {
 // groups are managed separately (Learnings tab).
 func (e *Engine) FlushLearned(id int) {
 	ips := e.ipset()
-	for _, k := range []string{netfilter.KindDomain, netfilter.KindPeer, netfilter.KindSession} {
+	for _, k := range []string{netfilter.KindDomain, netfilter.KindDrop, netfilter.KindPeer, netfilter.KindSession} {
 		for _, v6 := range []bool{false, true} {
 			_ = ips.Flush(netfilter.SetName(id, k, v6))
 		}
