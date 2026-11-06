@@ -31,7 +31,7 @@ func TestNormalizeAndValidate(t *testing.T) {
 	if p.ID != 1 || c.Policies[1].ID != 2 || c.Policies[2].ID != 3 {
 		t.Fatalf("ids not assigned: %d %d %d", p.ID, c.Policies[1].ID, c.Policies[2].ID)
 	}
-	want := []string{"netflix.com", "nflxvideo.net", "nflximg.net"}
+	want := []string{"# Netflix", "netflix.com", "**.nflxvideo.net", "nflximg.net", `/^ipv4-c\d+-.*\.oca\.nflxvideo\.net$/`, "~nflxso", "!=customerevents.netflix.com"}
 	if strings.Join(p.Domains, ",") != strings.Join(want, ",") {
 		t.Fatalf("domains = %v", p.Domains)
 	}
@@ -51,12 +51,13 @@ func TestValidateErrors(t *testing.T) {
 	c.Policies[0].Tunnels = []string{"wgc9"}
 	c.Policies[1].Devices = []string{"group:nope"}
 	c.Policies[2].Leak.IPv6 = "maybe"
+	c.Policies[1].Domains = append(c.Policies[1].Domains, "/bad(regex/")
 	c.Policies = append(c.Policies, Policy{Name: "empty", ID: 4, Tunnels: []string{"wgc1"}, Leak: Leak{IPv6: "off", WebRTC: "off"}})
 	err := c.Validate()
 	if err == nil {
 		t.Fatal("expected errors")
 	}
-	for _, s := range []string{"unknown tunnel", "unknown group", "ipv6 mode", "needs at least one"} {
+	for _, s := range []string{"unknown tunnel", "unknown group", "ipv6 mode", "needs at least one", "bad regex"} {
 		if !strings.Contains(err.Error(), s) {
 			t.Errorf("missing %q in %v", s, err)
 		}

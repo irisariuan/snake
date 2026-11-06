@@ -4,7 +4,7 @@
   'use strict';
   var CTX = window.SNAKE_CTX || {};
   var TUNNELS = ['wgc1', 'wgc2', 'wgc3', 'wgc4', 'wgc5', 'ovpnc1', 'ovpnc2', 'ovpnc3', 'ovpnc4', 'ovpnc5'];
-  var state = { tab: 'status', cfg: null, dirty: false, status: null, clients: [], presets: [], edit: null, error: '' };
+  var state = { tab: 'status', cfg: null, dirty: false, status: null, clients: [], edit: null, error: '' };
   var root;
 
   // ---------- helpers ----------
@@ -83,10 +83,10 @@
   }
   function load() {
     state.error = '';
-    return Promise.all([api('GET', '/api/config'), api('GET', '/api/status'), api('GET', '/api/presets'), api('GET', '/api/clients')])
+    return Promise.all([api('GET', '/api/config'), api('GET', '/api/status'), api('GET', '/api/clients')])
       .then(function (r) {
         if (!state.dirty) state.cfg = fixCfg(r[0]);
-        state.status = r[1]; state.presets = r[2] || []; state.clients = r[3] || [];
+        state.status = r[1]; state.clients = r[2] || [];
         render();
       }).catch(function (e) { state.error = e.message; render(); });
   }
@@ -143,7 +143,8 @@
     b.appendChild(el('div', { class: 'row', style: 'margin-bottom:10px' },
       btn('Re-check tunnels', function () { api('POST', '/api/recheck').then(function () { toast('Health check scheduled'); setTimeout(refreshStatus, 4000); }); }),
       btn('Re-apply rules', function () { api('POST', '/api/apply').then(function () { toast('Applied'); refreshStatus(); }).catch(function (e) { toast(e.message); }); }),
-      el('span', { class: 'muted small' }, 'WAN ' + (s.wan_ip || '?') + ' · uptime ' + s.uptime + ' · applied ' + ago(s.last_apply) + ' · IPv6 ' + (s.caps.ipv6 ? 'yes' : 'no') + ' · NFQUEUE ' + (s.caps.nfqueue ? 'yes' : 'no'))));
+      el('span', { class: 'muted small' }, 'WAN ' + (s.wan_ip || '?') + ' · uptime ' + s.uptime + ' · applied ' + ago(s.last_apply) + ' · IPv6 ' + (s.caps.ipv6 ? 'yes' : 'no') + ' · NFQUEUE ' + (s.caps.nfqueue ? 'yes' : 'no') +
+        (s.dns_inspector ? ' · DNS inspector: ' + s.dns_inspector.answers + ' answers, ' + s.dns_inspector.matched + ' matched, ' + s.dns_inspector.added + ' IPs added' : ''))));
 
     var tn = Object.keys(s.tunnels || {}).sort();
     b.appendChild(el('h3', null, 'Tunnels'));
@@ -169,7 +170,8 @@
         var sets = Object.keys(p.sets || {}).map(function (k) { return k.replace(/^SNK_\d+_/, '') + ':' + p.sets[k]; }).join(' ');
         var cands = (p.candidates || []).map(function (c) { return el('div', { class: 'small ' + (c.ok ? '' : 'muted') }, (c.ok ? '✓ ' : '✗ ') + c.tunnel + (c.reason ? ' (' + c.reason + ')' : '')); });
         return el('tr', null,
-          el('td', null, el('b', null, p.name), (p.asn_errors || []).map(function (e) { return el('div', { class: 'small', style: 'color:var(--warn)' }, e); })),
+          el('td', null, el('b', null, p.name), p.domain_mode ? el('div', { class: 'small ' + (p.domain_mode.indexOf('degraded') === 0 ? '' : 'muted'), style: p.domain_mode.indexOf('degraded') === 0 ? 'color:var(--warn)' : '' }, 'domains: ' + p.domain_mode) : null,
+            (p.asn_errors || []).map(function (e) { return el('div', { class: 'small', style: 'color:var(--warn)' }, e); })),
           el('td', null, p.scope),
           el('td', null, route, cands),
           el('td', null, p.ipv6_mode || ''),
@@ -187,28 +189,22 @@
 
   // ---------- policies ----------
   function defaultPolicy() {
-    return { id: 0, name: '', enabled: true, tunnels: [], kill_switch: true, expected_country: '', domains: [], asns: [], cidrs: [], devices: [],
+    return { id: 0, name: '', enabled: true, tunnels: [], kill_switch: true, expected_country: '', domains: [], ignore_cname: false, asns: [], cidrs: [], devices: [],
       leak: { dns_via_tunnel: true, dns_server: '9.9.9.9', hijack_dns: true, block_dot: true, block_doh: true, block_quic: false, ipv6: 'tunnel', webrtc: 'track' } };
   }
   function viewPolicies(b) {
     if (state.edit) return viewEditor(b);
     var pols = state.cfg.policies || [];
     b.appendChild(el('div', { class: 'row', style: 'margin-bottom:10px' },
-      btn('+ New policy', function () { state.edit = { idx: -1, p: defaultPolicy() }; render(); }, 'pri'),
-      el('span', { class: 'muted' }, 'or start from a template:'),
-      state.presets.map(function (pr) {
-        return btn(pr.name, function () {
-          var p = defaultPolicy(); p.name = pr.name; p.domains = pr.domains.slice(); p.asns = (pr.asns || []).slice();
-          state.edit = { idx: -1, p: p, note: pr.notes }; render();
-        });
-      })));
+      btn('+ New policy', function () { state.edit = { idx: -1, p: defaultPolicy() }; render(); }, 'pri')));
     if (!pols.length) { b.appendChild(el('p', { class: 'muted' }, 'No policies yet.')); return; }
     b.appendChild(el('p', { class: 'muted small' }, 'Policies are evaluated top to bottom; the first match wins.'));
     b.appendChild(el('div', { class: 'scroll' }, el('table', null,
       el('tr', null, ['', 'Name', 'Tunnels (failover order)', 'Matches', 'Protection', ''].map(function (h) { return el('th', null, h); })),
       pols.map(function (p, i) {
         var m = [];
-        if (p.domains.length) m.push(p.domains.length + ' domains');
+        var nRules = p.domains.filter(function (d) { return d.trim() && d.trim()[0] !== '#'; }).length;
+        if (nRules) m.push(nRules + ' domain rules');
         if (p.asns.length) m.push(p.asns.length + ' ASNs');
         if (p.cidrs.length) m.push(p.cidrs.length + ' CIDRs');
         if (p.devices.length) m.push(p.devices.length + ' devices/groups');
@@ -243,7 +239,6 @@
   function viewEditor(b) {
     var ed = state.edit, p = ed.p;
     b.appendChild(el('h3', null, ed.idx < 0 ? 'New policy' : 'Edit policy ' + p.name));
-    if (ed.note) b.appendChild(el('p', { class: 'muted small' }, ed.note));
     var tunBox = el('ul', { class: 'tun-list' });
     function drawTunnels() {
       tunBox.innerHTML = '';
@@ -263,7 +258,43 @@
       knownDevices().map(function (d) { return el('option', { value: d.mac, selected: p.devices.indexOf(d.mac) >= 0 }, (d.name || '?') + ' (' + d.mac + (d.ip ? ', ' + d.ip : '') + ')'); }));
     var extraMacs = p.devices.filter(function (d) { return d.indexOf('group:') !== 0 && !knownDevices().some(function (k) { return k.mac === d; }); });
     var macTA = el('textarea', { style: 'min-height:40px', placeholder: 'aa:bb:cc:dd:ee:ff' }, extraMacs.join('\n'));
-    var domTA = el('textarea', { placeholder: 'netflix.com\nnflxvideo.net' }, p.domains.join('\n'));
+    var domTA = el('textarea', { style: 'min-height:160px', placeholder: 'netflix.com\n**.nflxvideo.net\n/^ipv4-c\\d+-.*\\.oca\\.nflxvideo\\.net$/\n!=ads.netflix.com' }, p.domains.join('\n'));
+    var ruleOut = el('div', { class: 'small' });
+    var ruleName = el('input', { type: 'text', placeholder: 'test a name, e.g. ipv4-c1-lhr.oca.nflxvideo.net', style: 'flex:1;min-width:180px' });
+    var ruleTimer = null;
+    function checkRules() {
+      api('POST', '/api/rules/check', { rules: domTA.value.split('\n'), name: ruleName.value.trim() }).then(function (r) {
+        ruleOut.innerHTML = '';
+        (r.errors || []).forEach(function (e) { ruleOut.appendChild(el('div', { style: 'color:var(--bad)' }, 'line ' + (e.index + 1) + ': ' + e.rule + ': ' + e.error)); });
+        var kinds = {};
+        (r.patterns || []).forEach(function (pt) { var k = (pt.negate ? '!' : '') + pt.kind; kinds[k] = (kinds[k] || 0) + 1; });
+        var summary = Object.keys(kinds).map(function (k) { return kinds[k] + ' ' + k; }).join(', ');
+        if (summary) ruleOut.appendChild(el('div', { class: 'muted' }, summary + (r.inspector ? ' · matched by DNS inspection' : ' · all handled by dnsmasq')));
+        if (r.result) {
+          var res = r.result;
+          ruleOut.appendChild(el('div', null, res.matched ? badge('match', 'ok') : res.excluded ? badge('excluded', 'warn') : badge('no match'),
+            ' ', res.matched ? 'by rule ' + res.rule : res.excluded ? 'by ' + res.excluded : ''));
+        }
+      }).catch(function (e) { ruleOut.textContent = e.message; });
+    }
+    function scheduleCheck() { clearTimeout(ruleTimer); ruleTimer = setTimeout(checkRules, 350); }
+    domTA.addEventListener('input', scheduleCheck);
+    ruleName.addEventListener('input', scheduleCheck);
+    setTimeout(checkRules, 0);
+    var syntax = el('details', { class: 'small', style: 'margin:4px 0' }, el('summary', { class: 'muted', style: 'cursor:pointer' }, 'Rule syntax'),
+      el('table', null, [
+        ['example.com', 'domain and all subdomains'],
+        ['.example.com', 'subdomains only'],
+        ['=example.com', 'exactly this name'],
+        ['*.example.com', '* = any text within one label'],
+        ['**.example.com', '** = any text across labels'],
+        ['cdn-?.example.com', '? = one character'],
+        ['~keyword', 'name contains keyword'],
+        ['/regex/  or  re:regex', 'RE2 regular expression, case-insensitive'],
+        ['!rule', 'exclusion: any rule above prefixed with !'],
+        ['# text', 'comment']
+      ].map(function (r) { return el('tr', null, el('td', { class: 'mono' }, r[0]), el('td', null, r[1])); })),
+      el('div', { class: 'muted' }, 'With CNAME matching on, a rule also matches when any name in the answer\'s CNAME chain matches (e.g. **.akamaized.net).'));
     var asnTA = el('textarea', { style: 'min-height:50px', placeholder: 'AS2906' }, p.asns.map(function (a) { return 'AS' + a; }).join('\n'));
     var cidrTA = el('textarea', { style: 'min-height:50px', placeholder: '23.246.0.0/18' }, p.cidrs.join('\n'));
     var L = p.leak;
@@ -279,7 +310,10 @@
         el('input', { type: 'text', value: p.expected_country, maxlength: 2, size: 4, placeholder: 'US', oninput: function (e) { p.expected_country = e.target.value.toUpperCase(); } }),
         el('div', { class: 'small muted' }, 'A tunnel whose exit country differs is treated as failed for this policy.')),
       el('div', { class: 'card' },
-        el('label', { class: 'f' }, 'Domains (one per line; subdomains included)'), domTA,
+        el('label', { class: 'f' }, 'Domain rules (one per line)'), syntax, domTA,
+        el('div', { class: 'row', style: 'margin-top:4px' }, ruleName), ruleOut,
+        el('label', { class: 'chk' }, el('input', { type: 'checkbox', checked: !p.ignore_cname, onchange: function (e) { p.ignore_cname = !e.target.checked; } }),
+          el('span', null, 'Match CNAME chains', el('div', { class: 'small muted' }, 'Also match when the queried name is an alias (CNAME) of a matching name.'))),
         el('label', { class: 'f' }, 'ASNs'), asnTA,
         el('label', { class: 'f' }, 'CIDRs / IPs'), cidrTA),
       el('div', { class: 'card' },
@@ -305,7 +339,7 @@
     b.appendChild(el('div', { class: 'row', style: 'margin-top:10px' },
       btn('Cancel', function () { state.edit = null; render(); }),
       btn(ed.idx < 0 ? 'Add policy' : 'Update policy', function () {
-        p.domains = lines(domTA.value);
+        p.domains = domTA.value.split('\n').map(function (x) { return x.trim(); }).filter(Boolean);
         p.asns = lines(asnTA.value).map(function (a) { return parseInt(a.replace(/^as/i, ''), 10); }).filter(function (n) { return n > 0; });
         p.cidrs = lines(cidrTA.value);
         var sel = Array.prototype.filter.call(devSel.options, function (o) { return o.selected; }).map(function (o) { return o.value; });
@@ -372,7 +406,9 @@
         out.innerHTML = '';
         out.appendChild(el('div', { class: 'kv' },
           el('span', null, 'Domain'), el('span', null, r.domain),
-          el('span', null, 'Policy'), el('span', null, r.policy ? r.policy + ' (matched ' + r.matched + ')' : 'none'),
+          el('span', null, 'CNAME chain'), el('span', { class: 'mono' }, (r.chain || []).length ? r.domain + ' → ' + r.chain.join(' → ') : 'none'),
+          el('span', null, 'Policy'), el('span', null, r.policy ? r.policy + ' (rule ' + r.matched + (r.matched_via && r.matched_via !== r.domain ? ' via ' + r.matched_via : '') + ')' : 'none'),
+          (r.excluded || []).length ? [el('span', null, 'Excluded by'), el('span', null, r.excluded.join(', '))] : null,
           el('span', null, 'Tunnel'), el('span', null, r.tunnel ? r.tunnel + ' ' + (r.country || '') : '-'),
           el('span', null, 'Addresses'), el('span', null, (r.addrs || []).map(function (a) { return el('div', { class: 'mono' }, a.ip + (a.in_set ? '  ✓ ' + a.in_set : '  ✗ not in a set')); })),
           r.error ? [el('span', null, 'Error'), el('span', null, r.error)] : null));

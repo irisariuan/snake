@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"github.com/irisariuan/snake/internal/config"
+	"github.com/irisariuan/snake/internal/dnsinspect"
 	"github.com/irisariuan/snake/internal/health"
 	"github.com/irisariuan/snake/internal/logx"
+	"github.com/irisariuan/snake/internal/match"
 	"github.com/irisariuan/snake/internal/netfilter"
 	"github.com/irisariuan/snake/internal/system"
 	"github.com/irisariuan/snake/internal/webrtc"
@@ -58,6 +60,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			e.saveSets()
 			e.rtc.Stop()
+			e.dns.Stop()
 			logx.Infof("daemon stopped")
 			return nil
 		case <-healthT.C:
@@ -155,6 +158,7 @@ type PolicyStatus struct {
 	Bytes       uint64         `json:"bytes"`
 	WebRTC      *webrtc.Stats  `json:"webrtc,omitempty"`
 	ASNErrors   []string       `json:"asn_errors,omitempty"`
+	DomainMode  string         `json:"domain_mode,omitempty"`
 	Country     string         `json:"country,omitempty"`
 }
 
@@ -170,6 +174,7 @@ type Status struct {
 	Tunnels    map[string]health.Status `json:"tunnels"`
 	Policies   []PolicyStatus           `json:"policies"`
 	Events     []Event                  `json:"events"`
+	DNS        *dnsinspect.Stats        `json:"dns_inspector,omitempty"`
 }
 
 // Status builds the status document.
@@ -198,7 +203,12 @@ func (e *Engine) Status() Status {
 	for k, v := range e.asnErrors {
 		asnErr[k] = v
 	}
+	dnsOn := e.dnsOn
 	e.mu.Unlock()
+	if dnsOn {
+		ds := e.dns.Stats()
+		st.DNS = &ds
+	}
 	st.WANIP = system.NVRAM{R: e.R}.Get("wan0_ipaddr")
 	st.Tunnels = e.mon.Snapshot()
 	ips := netfilter.IPSet{R: e.R}
@@ -249,6 +259,19 @@ func (e *Engine) Status() Status {
 			if ps.Active != "" {
 				ps.Country = st.Tunnels[ps.Active].Country
 			}
+			if p.HasDomains() {
+				rules := p.DomainRules()
+				switch {
+				case dnsOn && rules.NeedsInspector():
+					ps.DomainMode = "inspector"
+				case dnsOn:
+					ps.DomainMode = "dnsmasq + inspector (CNAME)"
+				case rules.NeedsInspector():
+					ps.DomainMode = "degraded: plain rules only"
+				default:
+					ps.DomainMode = "dnsmasq"
+				}
+			}
 		}
 		st.Policies = append(st.Policies, ps)
 	}
@@ -258,9 +281,12 @@ func (e *Engine) Status() Status {
 // DomainTest is the result of the "test domain" tool.
 type DomainTest struct {
 	Domain   string           `json:"domain"`
+	Chain    []string         `json:"chain,omitempty"` // CNAME chain
 	Policy   string           `json:"policy,omitempty"`
 	PolicyID int              `json:"policy_id,omitempty"`
-	Matched  string           `json:"matched,omitempty"` // configured domain that matched
+	Matched  string           `json:"matched,omitempty"`     // rule that matched
+	Via      string           `json:"matched_via,omitempty"` // name in the chain that matched
+	Excluded []string         `json:"excluded,omitempty"`    // policies vetoed by an exclusion
 	Tunnel   string           `json:"tunnel,omitempty"`
 	Country  string           `json:"country,omitempty"`
 	Addrs    []AddrResult     `json:"addrs"`
@@ -275,41 +301,47 @@ type AddrResult struct {
 	InSet string `json:"in_set,omitempty"`
 }
 
-// MatchDomain finds the most specific policy domain matching name.
-func MatchDomain(cfg *config.Config, name string) (config.Policy, string, bool) {
-	name = config.NormalizeDomain(name)
-	var best config.Policy
-	bestD := ""
+// MatchDomain finds the first enabled policy whose rules match name or (with
+// CNAME following) any name of its chain.
+func MatchDomain(cfg *config.Config, name string, chain ...string) (config.Policy, match.Result, []string, bool) {
+	names := append([]string{match.Normalize(name)}, chain...)
+	var excluded []string
 	for _, p := range cfg.Policies {
-		if !p.Enabled {
+		if !p.Enabled || !p.HasDomains() {
 			continue
 		}
-		for _, d := range p.Domains {
-			if (name == d || strings.HasSuffix(name, "."+d)) && len(d) > len(bestD) {
-				best, bestD = p, d
-			}
+		ns := names
+		if p.IgnoreCNAME {
+			ns = names[:1]
+		}
+		res := p.DomainRules().MatchAny(ns...)
+		if res.Matched {
+			return p, res, excluded, true
+		}
+		if res.Excluded != "" {
+			excluded = append(excluded, p.Name+" ("+res.Excluded+")")
 		}
 	}
-	return best, bestD, bestD != ""
+	return config.Policy{}, match.Result{}, excluded, false
 }
 
 // TestDomain resolves a domain through dnsmasq (which also fills the sets)
 // and reports how its traffic would be routed.
 func (e *Engine) TestDomain(name string) DomainTest {
 	cfg := e.Config()
-	name = config.NormalizeDomain(name)
+	name = match.Normalize(name)
 	res := DomainTest{Domain: name}
-	p, matched, ok := MatchDomain(cfg, name)
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
-	defer cancel()
-	addrs, err := LocalResolver().LookupIPAddr(ctx, name)
+	ans, err := dnsinspect.Query("127.0.0.1:53", name, 4*time.Second)
 	if err != nil {
 		res.Error = err.Error()
 	}
+	res.Chain = ans.Chain
+	p, mr, excl, ok := MatchDomain(cfg, name, ans.Chain...)
+	res.Excluded = excl
 	ips := netfilter.IPSet{R: e.R}
-	for _, a := range addrs {
-		ar := AddrResult{IP: a.IP.String()}
-		v6 := a.IP.To4() == nil
+	for _, ip := range ans.IPs {
+		ar := AddrResult{IP: ip.String()}
+		v6 := ip.To4() == nil
 		for _, pol := range cfg.Policies {
 			if !pol.Enabled {
 				continue
@@ -329,9 +361,10 @@ func (e *Engine) TestDomain(name string) DomainTest {
 		res.Addrs = append(res.Addrs, ar)
 	}
 	if ok {
-		res.Policy, res.PolicyID, res.Matched = p.Name, p.ID, matched
+		res.Policy, res.PolicyID, res.Matched, res.Via = p.Name, p.ID, mr.Rule, mr.Name
 		e.mu.Lock()
 		res.Tunnel = e.active[p.ID]
+		dnsOn := e.dnsOn
 		e.mu.Unlock()
 		if res.Tunnel != "" {
 			if st, ok := e.mon.Get(res.Tunnel); ok {
@@ -341,6 +374,9 @@ func (e *Engine) TestDomain(name string) DomainTest {
 			res.Notes = append(res.Notes, "no healthy tunnel: kill switch is blocking this traffic")
 		} else {
 			res.Notes = append(res.Notes, "no healthy tunnel: traffic currently goes via WAN")
+		}
+		if !dnsOn && (mr.Name != name || p.DomainRules().NeedsInspector()) {
+			res.Notes = append(res.Notes, "this match needs the DNS inspector, which is not running (kernel without NFQUEUE?)")
 		}
 		for _, a := range res.Addrs {
 			if a.InSet == "" {
@@ -472,7 +508,7 @@ func (e *Engine) LeakChecks() []LeakCheck {
 				warn("exit country unknown (geo lookup failed)")
 			}
 		}
-		if len(p.Domains) > 0 {
+		if p.HasDomains() {
 			if p.Leak.HijackDNS {
 				ok("hardcoded DNS (port 53) redirected to router")
 			} else {
@@ -518,7 +554,15 @@ func (e *Engine) LeakChecks() []LeakCheck {
 				warn("WebRTC tracking off: peer-to-peer media of this service uses WAN")
 			}
 		}
-		if ps.Sets[netfilter.SetName(p.ID, netfilter.KindDomain, false)] == 0 && len(p.Domains) > 0 {
+		if p.HasDomains() {
+			rules := p.DomainRules()
+			if rules.NeedsInspector() && !st.Caps.NFQueue {
+				warn("wildcard/regex/keyword rules and exclusions need NFQUEUE, which this kernel lacks: only plain domain rules are active")
+			} else if st.Caps.NFQueue {
+				ok("domain rules matched by DNS inspection (wildcards, regexes, CNAME chains)")
+			}
+		}
+		if ps.Sets[netfilter.SetName(p.ID, netfilter.KindDomain, false)] == 0 && p.HasDomains() {
 			warn("domain set empty: no client has resolved these domains through the router yet")
 		}
 		out = append(out, lc)

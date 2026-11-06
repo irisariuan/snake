@@ -460,7 +460,7 @@ func dryRun() error {
 	_ = e.Apply("dry run")
 	fmt.Println(rec.Joined())
 	fmt.Println("\n# dnsmasq fragment")
-	fmt.Print(dnsmasq.Generate(e.Config()))
+	fmt.Print(dnsmasq.Generate(e.Config(), e.Caps().NFQueue))
 	return nil
 }
 

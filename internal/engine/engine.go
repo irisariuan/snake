@@ -16,6 +16,7 @@ import (
 
 	"github.com/irisariuan/snake/internal/asn"
 	"github.com/irisariuan/snake/internal/config"
+	"github.com/irisariuan/snake/internal/dnsinspect"
 	"github.com/irisariuan/snake/internal/dnsmasq"
 	"github.com/irisariuan/snake/internal/health"
 	"github.com/irisariuan/snake/internal/logx"
@@ -81,6 +82,8 @@ type Engine struct {
 	caps       Caps
 	mon        *health.Monitor
 	rtc        *webrtc.Tracker
+	dns        *dnsinspect.Inspector
+	dnsOn      bool
 	asnCache   *asn.Cache
 	active     map[int]string
 	cands      map[int][]Candidate
@@ -105,6 +108,7 @@ func New(p Paths, r system.Runner) *Engine {
 		R:         r,
 		mon:       health.NewMonitor(r),
 		rtc:       webrtc.NewTracker(netfilter.IPSet{R: r}, 0),
+		dns:       &dnsinspect.Inspector{IPSet: netfilter.IPSet{R: r}},
 		active:    map[int]string{},
 		cands:     map[int][]Candidate{},
 		asnErrors: map[int]string{},
@@ -339,7 +343,7 @@ func setSpecs(cfg *config.Config, states []netfilter.PolicyState, v6 bool) []net
 			anyDoH = true
 		}
 		for _, f := range fams {
-			if len(p.Domains) > 0 {
+			if p.HasDomains() {
 				specs = append(specs, netfilter.SetSpec{Name: netfilter.SetName(p.ID, netfilter.KindDomain, f), Type: "hash:net", V6: f, Timeout: s.DomainSetTimeout, MaxElem: 131072})
 			}
 			if len(p.ASNs)+len(p.CIDRs) > 0 {
@@ -421,7 +425,7 @@ func (e *Engine) Apply(reason string) error {
 		if st.ActiveTunnel != "" {
 			r.Iface = config.TunnelInterface(st.ActiveTunnel)
 		}
-		if st.Policy.Leak.DNSViaTunnel && len(st.Policy.Domains) > 0 {
+		if st.Policy.Leak.DNSViaTunnel && st.Policy.HasDomains() {
 			r.DNSServer = st.Policy.Leak.DNSServer
 		}
 		routes = append(routes, r)
@@ -445,7 +449,15 @@ func (e *Engine) Apply(reason string) error {
 			existing[k] = v
 		}
 	}
-	plan := netfilter.Build(s, states, netfilter.Options{IPv6: caps.IPv6, IPv6NAT: caps.IPv6NAT, Existing: existing})
+	// DNS inspector: on whenever a policy has domain rules and the kernel
+	// has NFQUEUE (needed for wildcards/regexes/exclusions and CNAME chains).
+	dnsRules := e.dnsRules(states, caps)
+	dnsOn := caps.NFQueue && len(dnsRules) > 0
+	dnsQueue := 0
+	if dnsOn {
+		dnsQueue = s.QueueBase
+	}
+	plan := netfilter.Build(s, states, netfilter.Options{IPv6: caps.IPv6, IPv6NAT: caps.IPv6NAT, DNSQueue: dnsQueue, Existing: existing})
 	if err := nf.Apply(plan); err != nil {
 		errs = append(errs, err.Error())
 	}
@@ -458,7 +470,26 @@ func (e *Engine) Apply(reason string) error {
 	}
 
 	// 5. dnsmasq
-	frag := dnsmasq.Generate(cfg)
+	if !e.DryRun && e.isDaemon() {
+		if dnsOn {
+			ttl := 10 * time.Minute
+			if s.DomainSetTimeout > 0 {
+				ttl = time.Duration(s.DomainSetTimeout/2) * time.Second
+			}
+			e.dns.CacheTTL = ttl
+			e.dns.SetRules(dnsRules)
+			if err := e.dns.Start(uint16(s.QueueBase)); err != nil {
+				errs = append(errs, err.Error())
+			}
+		} else {
+			e.dns.Stop()
+		}
+	}
+	e.mu.Lock()
+	e.dnsOn = dnsOn
+	e.mu.Unlock()
+
+	frag := dnsmasq.Generate(cfg, dnsOn)
 	if !e.DryRun {
 		changed, err := system.WriteIfChanged(e.P.DNSMasq, []byte(frag), 0o644)
 		if err != nil {
@@ -506,6 +537,24 @@ func (e *Engine) Apply(reason string) error {
 	}
 	logx.Infof("applied (%s): %d policies", reason, len(states))
 	return nil
+}
+
+// dnsRules compiles the domain rules of enabled policies in policy order.
+func (e *Engine) dnsRules(states []netfilter.PolicyState, caps Caps) []dnsinspect.Rules {
+	var out []dnsinspect.Rules
+	for _, st := range states {
+		p := st.Policy
+		if !p.HasDomains() {
+			continue
+		}
+		r := dnsinspect.Rules{ID: p.ID, Name: p.Name, Set: p.DomainRules(), FollowCNAME: !p.IgnoreCNAME,
+			Set4: netfilter.SetName(p.ID, netfilter.KindDomain, false)}
+		if caps.IPv6 {
+			r.Set6 = netfilter.SetName(p.ID, netfilter.KindDomain, true)
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 func (e *Engine) isDaemon() bool {
@@ -602,7 +651,7 @@ func (e *Engine) PreResolve() {
 		if !p.Enabled {
 			continue
 		}
-		for _, d := range p.Domains {
+		for _, d := range p.DomainRules().Bases() {
 			for _, h := range []string{d, "www." + d} {
 				wg.Add(1)
 				sem <- struct{}{}
@@ -687,3 +736,10 @@ func (e *Engine) Monitor() *health.Monitor { return e.mon }
 
 // Decide runs failover selection now (exported for tools and tests).
 func (e *Engine) Decide() []int { return e.decide() }
+
+// Caps returns the detected capabilities.
+func (e *Engine) Caps() Caps {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.caps
+}

@@ -63,14 +63,27 @@ func TestSelect(t *testing.T) {
 func TestMatchDomain(t *testing.T) {
 	c := config.Default()
 	c.Policies = []config.Policy{
-		{ID: 1, Name: "a", Enabled: true, Domains: []string{"example.com"}},
-		{ID: 2, Name: "b", Enabled: true, Domains: []string{"video.example.com"}},
+		{ID: 1, Name: "a", Enabled: true, Domains: []string{"example.com", "!=ads.example.com"}},
+		{ID: 2, Name: "b", Enabled: true, Domains: []string{"**.example.com", "/^cdn\\d+\\.akamai\\.net$/"}},
 		{ID: 3, Name: "c", Enabled: false, Domains: []string{"cdn.video.example.com"}},
+		{ID: 4, Name: "d", Enabled: true, IgnoreCNAME: true, Domains: []string{"~edge"}},
 	}
-	if p, d, ok := MatchDomain(c, "x.cdn.video.example.com"); !ok || p.ID != 2 || d != "video.example.com" {
-		t.Fatalf("got %v %q %v", p.ID, d, ok)
+	if p, r, _, ok := MatchDomain(c, "x.cdn.video.example.com"); !ok || p.ID != 1 || r.Rule != "example.com" {
+		t.Fatalf("first policy should win: %v %+v %v", p.ID, r, ok)
 	}
-	if _, _, ok := MatchDomain(c, "notexample.com"); ok {
+	// exclusion in policy 1 falls through to policy 2
+	if p, r, excl, ok := MatchDomain(c, "ads.example.com"); !ok || p.ID != 2 || r.Rule != "**.example.com" || len(excl) != 1 {
+		t.Fatalf("exclusion fallthrough: %v %+v %v %v", p.ID, r, excl, ok)
+	}
+	// CNAME chain matching
+	if p, r, _, ok := MatchDomain(c, "play.partner.tv", "cdn12.akamai.net"); !ok || p.ID != 2 || r.Name != "cdn12.akamai.net" {
+		t.Fatalf("cname: %v %+v %v", p.ID, r, ok)
+	}
+	// IgnoreCNAME: policy 4 only looks at the query name
+	if _, _, _, ok := MatchDomain(c, "play.partner.tv", "edge.cdn.tv"); ok {
+		t.Fatal("ignore_cname policy matched via chain")
+	}
+	if _, _, _, ok := MatchDomain(c, "notexample.com"); ok {
 		t.Fatal("suffix without dot boundary matched")
 	}
 }

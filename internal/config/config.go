@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/irisariuan/snake/internal/match"
 )
 
 // Tunnel names supported by Asuswrt-Merlin.
@@ -67,7 +69,8 @@ type Policy struct {
 	Tunnels         []string `json:"tunnels"`          // ordered by priority, failover candidates
 	KillSwitch      bool     `json:"kill_switch"`      // drop instead of WAN when no tunnel healthy
 	ExpectedCountry string   `json:"expected_country"` // ISO 3166 alpha-2, optional
-	Domains         []string `json:"domains"`          // suffix match (example.com matches *.example.com)
+	Domains         []string `json:"domains"`          // domain rules, see package match for the format
+	IgnoreCNAME     bool     `json:"ignore_cname"`     // match the queried name only, not its CNAME chain
 	ASNs            []int    `json:"asns"`
 	CIDRs           []string `json:"cidrs"`
 	Devices         []string `json:"devices"` // MAC addresses or "group:<name>"
@@ -263,9 +266,8 @@ func (s Settings) MaxPolicyID() int {
 }
 
 var (
-	nameRe   = regexp.MustCompile(`^[A-Za-z0-9 _.\-+]{1,40}$`)
-	domainRe = regexp.MustCompile(`^([a-z0-9_]([a-z0-9_\-]{0,61}[a-z0-9_])?\.)*[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?$`)
-	ccRe     = regexp.MustCompile(`^[A-Z]{2}$`)
+	nameRe = regexp.MustCompile(`^[A-Za-z0-9 _.\-+]{1,40}$`)
+	ccRe   = regexp.MustCompile(`^[A-Z]{2}$`)
 )
 
 // NormalizeMAC lowercases and validates a MAC address.
@@ -277,7 +279,8 @@ func NormalizeMAC(s string) (string, error) {
 	return hw.String(), nil
 }
 
-// NormalizeDomain strips wildcards, schemes and trailing dots.
+// NormalizeDomain turns a plain domain (as used by Domain VPN Routing, where
+// "*.example.com" means "example.com and its subdomains") into a suffix rule.
 func NormalizeDomain(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	s = strings.TrimPrefix(s, "https://")
@@ -319,7 +322,12 @@ func (c *Config) Normalize() {
 			used[next] = true
 		}
 		p.Name = strings.TrimSpace(p.Name)
-		p.Domains = dedup(mapStr(p.Domains, NormalizeDomain))
+		p.Domains = dedup(mapStr(p.Domains, func(s string) string {
+			if t := strings.TrimSpace(s); strings.HasPrefix(t, "#") {
+				return t // keep comment lines
+			}
+			return match.Normalize(s)
+		}))
 		p.CIDRs = dedup(mapStr(p.CIDRs, strings.TrimSpace))
 		p.Devices = dedup(mapStr(p.Devices, func(s string) string {
 			s = strings.TrimSpace(s)
@@ -443,9 +451,9 @@ func (c *Config) Validate() error {
 		if p.ExpectedCountry != "" && !ccRe.MatchString(p.ExpectedCountry) {
 			add(pre+"expected_country %q must be a 2-letter code", p.ExpectedCountry)
 		}
-		for _, d := range p.Domains {
-			if !domainRe.MatchString(d) || !strings.Contains(d, ".") && len(d) < 2 {
-				add(pre+"invalid domain %q", d)
+		if _, lerrs := match.Compile(p.Domains); len(lerrs) > 0 {
+			for _, le := range lerrs {
+				add(pre+"rule %q: %s", le.Rule, le.Error)
 			}
 		}
 		for _, cidr := range p.CIDRs {
@@ -462,7 +470,7 @@ func (c *Config) Validate() error {
 				add(pre+"%v", err)
 			}
 		}
-		if len(p.Domains)+len(p.ASNs)+len(p.CIDRs)+len(p.Devices) == 0 {
+		if !p.HasDomains() && len(p.ASNs)+len(p.CIDRs)+len(p.Devices) == 0 {
 			add(pre + "needs at least one domain, ASN, CIDR or device")
 		}
 		switch p.Leak.IPv6 {
@@ -505,9 +513,23 @@ func (c *Config) ResolveDevices(p Policy) []string {
 	return dedup(out)
 }
 
+// HasDomains reports whether the policy has at least one domain rule
+// (comment lines do not count).
+func (p Policy) HasDomains() bool {
+	for _, d := range p.Domains {
+		if match.StripComment(d) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// DomainRules compiles the policy's domain rules.
+func (p Policy) DomainRules() *match.Set { return match.MustCompile(p.Domains) }
+
 // HasDestinations reports whether the policy matches on destination.
 func (p Policy) HasDestinations() bool {
-	return len(p.Domains)+len(p.ASNs)+len(p.CIDRs) > 0
+	return p.HasDomains() || len(p.ASNs)+len(p.CIDRs) > 0
 }
 
 // Scope describes the policy match mode for display.

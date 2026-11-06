@@ -101,6 +101,7 @@ func (a Applier) Teardown(ipv6 bool, lan string) {
 		hooks := []Hook{
 			{V6: v6, Table: "mangle", Chain: "PREROUTING", Args: []string{"-i", lan, "-j", ChainMain}},
 			{V6: v6, Table: "mangle", Chain: "FORWARD", Args: []string{"-j", ChainMSS}},
+			{V6: v6, Table: "mangle", Chain: "OUTPUT", Args: []string{"-p", "udp", "--sport", "53", "-j", ChainDNSOut}},
 			{V6: v6, Table: "filter", Chain: "FORWARD", Args: []string{"-j", ChainFwd}},
 			{V6: v6, Table: "nat", Chain: "PREROUTING", Args: []string{"-i", lan, "-j", ChainDNS}},
 			{V6: v6, Table: "nat", Chain: "POSTROUTING", Args: []string{"-j", ChainNAT}},

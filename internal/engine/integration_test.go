@@ -8,6 +8,7 @@ package engine
 
 import (
 	"encoding/json"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,7 +17,10 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/dns/dnsmessage"
+
 	"github.com/irisariuan/snake/internal/config"
+	"github.com/irisariuan/snake/internal/dnsinspect"
 	"github.com/irisariuan/snake/internal/health"
 	"github.com/irisariuan/snake/internal/system"
 	"github.com/irisariuan/snake/internal/webrtc"
@@ -192,4 +196,121 @@ func TestIntegrationApply(t *testing.T) {
 		e.rtc.Stop()
 	}
 	t.Logf("plan:\n%s", e.Plan().Restore["4/mangle"])
+}
+
+// fakeDNS answers A queries on 127.0.0.1:53 from a fixed table.
+func fakeDNS(t *testing.T, table map[string][]string) func() {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:53")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			var m dnsmessage.Message
+			if m.Unpack(buf[:n]) != nil || len(m.Questions) == 0 {
+				continue
+			}
+			q := m.Questions[0]
+			b := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: m.Header.ID, Response: true})
+			_ = b.StartQuestions()
+			_ = b.Question(q)
+			_ = b.StartAnswers()
+			owner := q.Name
+			if q.Type == dnsmessage.TypeA {
+				for _, v := range table[strings.TrimSuffix(q.Name.String(), ".")] {
+					if ip := net.ParseIP(v); ip != nil {
+						var a [4]byte
+						copy(a[:], ip.To4())
+						_ = b.AResource(dnsmessage.ResourceHeader{Name: owner, Class: dnsmessage.ClassINET, TTL: 30}, dnsmessage.AResource{A: a})
+					} else {
+						cn := dnsmessage.MustNewName(v + ".")
+						_ = b.CNAMEResource(dnsmessage.ResourceHeader{Name: owner, Class: dnsmessage.ClassINET, TTL: 30}, dnsmessage.CNAMEResource{CNAME: cn})
+						owner = cn
+					}
+				}
+			}
+			out, _ := b.Finish()
+			_, _ = pc.WriteTo(out, addr)
+		}
+	}()
+	return func() { pc.Close() }
+}
+
+func TestIntegrationDNSInspector(t *testing.T) {
+	if os.Getuid() != 0 || os.Getenv("SNAKE_INTEGRATION") == "" {
+		t.Skip("set SNAKE_INTEGRATION=1 and run as root inside `unshare -n`")
+	}
+	sh(t, "ip link set lo up")
+	sh(t, "ip link show br0 >/dev/null 2>&1 || ip link add br0 type bridge; ip link set br0 up")
+	sh(t, "ip link show wgc1 >/dev/null 2>&1 || ip tuntap add mode tun dev wgc1; ip link set wgc1 up")
+	stop := fakeDNS(t, map[string][]string{
+		"ipv4-c042-lhr001.oca.nflxvideo.net": {"203.0.113.50"},                         // regex rule
+		"play.partner.tv":                    {"x1.cdn.nflxvideo.net", "203.0.113.51"}, // via CNAME -> **.nflxvideo.net
+		"customerevents.netflix.com":         {"203.0.113.52"},                         // excluded
+		"api.nflxso.net":                     {"203.0.113.53"},                         // keyword ~nflxso
+		"www.example.org":                    {"203.0.113.54"},                         // no match
+	})
+	defer stop()
+
+	dir := t.TempDir()
+	c := config.Default()
+	c.Policies = []config.Policy{{Name: "nf", Enabled: true, Tunnels: []string{"wgc1"}, KillSwitch: true,
+		Domains: []string{"netflix.com", "**.nflxvideo.net", `/^ipv4-c\d+-.*\.oca\.nflxvideo\.net$/`, "~nflxso", "!=customerevents.netflix.com"},
+		Leak:    config.Leak{IPv6: "off", WebRTC: "off"}}}
+	c.Settings.PreResolve = false
+	c.Normalize()
+	if err := config.Save(filepath.Join(dir, "config.json"), c); err != nil {
+		t.Fatal(err)
+	}
+	e := New(DefaultPaths(dir), fakeMerlin{})
+	e.daemon = true
+	if err := e.Load(); err != nil {
+		t.Fatal(err)
+	}
+	e.DetectCaps()
+	if !e.caps.NFQueue {
+		t.Skip("kernel without NFQUEUE")
+	}
+	e.SeedHealth()
+	e.decide()
+	if err := e.Apply("dns test"); err != nil {
+		t.Fatal(err)
+	}
+	defer e.dns.Stop()
+	if !e.dns.Running() {
+		t.Fatal("inspector not running")
+	}
+	for _, q := range []string{"ipv4-c042-lhr001.oca.nflxvideo.net", "play.partner.tv", "customerevents.netflix.com", "api.nflxso.net", "www.example.org"} {
+		a, err := dnsinspect.Query("127.0.0.1:53", q, 3*time.Second)
+		if err != nil {
+			t.Fatalf("query %s: %v", q, err)
+		}
+		t.Logf("%s -> chain %v ips %v", q, a.Chain, a.IPs)
+	}
+	set := sh(t, "ipset list SNK_1_d4")
+	for _, ip := range []string{"203.0.113.50", "203.0.113.51", "203.0.113.53"} {
+		if !strings.Contains(set, ip) {
+			t.Errorf("%s should have been added:\n%s", ip, set)
+		}
+	}
+	for _, ip := range []string{"203.0.113.52", "203.0.113.54"} {
+		if strings.Contains(set, ip) {
+			t.Errorf("%s must not be added", ip)
+		}
+	}
+	st := e.dns.Stats()
+	t.Logf("inspector stats: %+v", st)
+	if st.Matched != 3 {
+		t.Errorf("matched = %d, want 3", st.Matched)
+	}
+	// The domain tester sees the CNAME chain and the matching rule.
+	dt := e.TestDomain("play.partner.tv")
+	if dt.Policy != "nf" || dt.Matched != "**.nflxvideo.net" || dt.Via != "x1.cdn.nflxvideo.net" || len(dt.Addrs) != 1 || dt.Addrs[0].InSet != "SNK_1_d4" {
+		t.Errorf("TestDomain = %+v", dt)
+	}
 }

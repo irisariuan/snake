@@ -38,6 +38,7 @@ const (
 	ChainDNS    = "SNAKE_DNS"
 	ChainNAT    = "SNAKE_NAT"
 	ChainFwd    = "SNAKE_FWD"
+	ChainDNSOut = "SNAKE_DNSO" // mangle OUTPUT: dnsmasq answers -> DNS inspector
 	chainPolicy = "SNAKE_P"
 	chainMark   = "SNAKE_M"
 )

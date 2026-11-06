@@ -35,6 +35,9 @@ type PolicyState struct {
 type Options struct {
 	IPv6    bool
 	IPv6NAT bool
+	// DNSQueue > 0 sends dnsmasq's UDP answers to LAN clients (and to the
+	// router itself) through the DNS inspector queue.
+	DNSQueue int
 	// Existing chain names per "family/table" key (e.g. "4/mangle"); chains
 	// that are no longer generated get deleted.
 	Existing map[string][]string
@@ -127,6 +130,7 @@ func Build(s config.Settings, states []PolicyState, opt Options) Plan {
 		plan.Hooks = append(plan.Hooks,
 			Hook{V6: v6, Table: "mangle", Chain: "PREROUTING", Args: []string{"-i", lan, "-j", ChainMain}},
 			Hook{V6: v6, Table: "mangle", Chain: "FORWARD", Args: []string{"-j", ChainMSS}},
+			Hook{V6: v6, Table: "mangle", Chain: "OUTPUT", Args: []string{"-p", "udp", "--sport", "53", "-j", ChainDNSOut}},
 			Hook{V6: v6, Table: "filter", Chain: "FORWARD", Args: []string{"-j", ChainFwd}},
 		)
 		if !v6 || opt.IPv6NAT {
@@ -143,8 +147,13 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 	mangle, nat, filter = &table{}, &table{}, &table{}
 	mask := hex(s.MarkMask)
 	lan := s.LANInterfaces
-	for _, c := range []string{ChainMain, ChainSave, ChainRTC, ChainMSS} {
+	for _, c := range []string{ChainMain, ChainSave, ChainRTC, ChainMSS, ChainDNSOut} {
 		mangle.chain(c)
+	}
+	if opt.DNSQueue > 0 {
+		q := fmt.Sprint(opt.DNSQueue)
+		mangle.add(ChainDNSOut, "-o", lan, "-j NFQUEUE --queue-num", q, "--queue-bypass")
+		mangle.add(ChainDNSOut, "-o lo -j NFQUEUE --queue-num", q, "--queue-bypass")
 	}
 	nat.chain(ChainDNS)
 	nat.chain(ChainNAT)
@@ -205,7 +214,7 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		mangle.add(mc, "-g", ChainSave)
 
 		dsets := []string{}
-		if len(p.Domains) > 0 {
+		if p.HasDomains() {
 			dsets = append(dsets, SetName(id, KindDomain, v6))
 		}
 		if len(p.ASNs)+len(p.CIDRs) > 0 {

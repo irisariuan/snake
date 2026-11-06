@@ -93,7 +93,10 @@ func TestBuild(t *testing.T) {
 		t.Error("ipv6 off policy present in v6 rules")
 	}
 	mustContain(t, f6, "-A SNAKE_FWD -m mark --mark 0x20000/0xff0000 -j REJECT --reject-with icmp6-adm-prohibited", "icmp6-port-unreachable")
-	if len(plan.Hooks) != 10 {
+	if strings.Contains(m4, "NFQUEUE --queue-num 4200") {
+		t.Error("DNS queue rule without DNSQueue option")
+	}
+	if len(plan.Hooks) != 12 {
 		t.Errorf("hooks = %d", len(plan.Hooks))
 	}
 }
@@ -114,5 +117,22 @@ func TestBuildNoIPv6NAT(t *testing.T) {
 func TestSetNamesFit(t *testing.T) {
 	if n := SetName(200, KindSession, true); len(n) > 31 {
 		t.Fatal(n)
+	}
+}
+
+func TestBuildDNSInspector(t *testing.T) {
+	c, st := states(t)
+	plan := Build(c.Settings, st, Options{DNSQueue: 4200})
+	mustContain(t, plan.Restore["4/mangle"],
+		"-A SNAKE_DNSO -o br+ -j NFQUEUE --queue-num 4200 --queue-bypass",
+		"-A SNAKE_DNSO -o lo -j NFQUEUE --queue-num 4200 --queue-bypass")
+	found := false
+	for _, h := range plan.Hooks {
+		if h.Table == "mangle" && h.Chain == "OUTPUT" && strings.Join(h.Args, " ") == "-p udp --sport 53 -j SNAKE_DNSO" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("OUTPUT hook missing")
 	}
 }

@@ -3,7 +3,8 @@
 Split tunnelling for **Asuswrt-Merlin** routers, written in Go, with a web UI
 in the router's *Addons* menu.
 
-Pick what goes through which VPN client by domain, ASN, CIDR or device. Each
+Pick what goes through which VPN client by domain rule (plain domains,
+wildcards, regexes, keywords, exclusions, CNAME chains), ASN, CIDR or device. Each
 policy has failover between tunnels, a per-policy kill switch, and leak
 protection that covers DNS, DoH/DoT, IPv6 and WebRTC. The main use case is
 streaming services (Netflix, Disney+, ...) that must exit in a specific country
@@ -16,7 +17,8 @@ Inspired by and able to import from Ranger802004's
 
 | | Domain VPN Routing | snake |
 |---|---|---|
-| Domain → IP | `nslookup` polling on cron / AdGuardHome log | **dnsmasq `ipset=` in real time**: every answer is added the moment a client resolves it, subdomains included |
+| Domain → IP | `nslookup` polling on cron / AdGuardHome log | **in real time**: every DNS answer is matched before the client receives it |
+| Domain rules | domain list | suffix, exact, subdomains-only, `*`/`**`/`?` wildcards, `~keyword`, `/regex/`, `!exclusions`, CNAME-chain matching |
 | Tunnels per policy | one | **ordered list with failover / fail-back** |
 | Health | – | interface + WireGuard handshake / OpenVPN state, TCP probes *through* the tunnel, **exit-country check** |
 | Tunnel down | traffic goes via WAN | **kill switch** (per policy) or WAN, your choice |
@@ -60,7 +62,7 @@ A policy is:
 
 * **Tunnels**, in priority order. The first healthy one is used. Later ones are
   failover backups.
-* **Match**: domains (suffix match), ASNs, CIDRs and/or devices (MACs or groups).
+* **Match**: [domain rules](#domain-rules), ASNs, CIDRs and/or devices (MACs or groups).
   * destinations only → those destinations, for every device
   * devices only → the **whole device** (most reliable for TV apps)
   * both → those destinations, only for those devices
@@ -69,8 +71,55 @@ A policy is:
   the VPN reconnected to another server) counts as failed for this policy.
 * **Leak protection** toggles, below.
 
-Policies are evaluated top to bottom; the first match wins. Templates for
-Netflix and Disney+ are offered as editable starting points.
+Policies are evaluated top to bottom; the first match wins.
+
+## Domain rules
+
+One rule per line:
+
+| Rule | Matches |
+|---|---|
+| `example.com` | `example.com` and every subdomain |
+| `.example.com` | subdomains only, not `example.com` |
+| `=example.com` | exactly `example.com` |
+| `*.example.com` | `*` = any text within one label: `a.example.com`, not `a.b.example.com` |
+| `**.example.com` | `**` = any text across labels: `a.example.com`, `a.b.example.com` |
+| `cdn-?.example.com` | `?` = one character (not a dot) |
+| `api-*.*.example.com` | wildcards can appear anywhere |
+| `~nflx` | any name containing `nflx` |
+| `/^ipv4-c\d+-.*\.oca\.nflxvideo\.net$/` | RE2 regular expression, case-insensitive (`re:...` also works) |
+| `!=ads.example.com` | exclusion: any rule prefixed with `!` |
+| `# comment` | ignored; a trailing ` # comment` is allowed too (except in regexes) |
+
+* **Exclusions** veto a policy for that answer. A later policy can still match it.
+* **CNAME chains**: when on (the default, per-policy toggle), a rule also
+  matches when any name in the answer's CNAME chain matches. For example,
+  `play.partner.tv → x1.cdn.nflxvideo.net` is caught by `**.nflxvideo.net`, and
+  `**.akamaized.net` catches services that CNAME into Akamai.
+* **Resolve via tunnel** applies to each rule's literal suffix: `nflxvideo.net`
+  for `**.nflxvideo.net`, `oca.nflxvideo.net` for the regex above. Keywords and
+  unanchored regexes have no suffix, so their DNS is resolved normally.
+
+The policy editor has a live checker that flags bad lines and tests a name
+against the rules. *Diagnostics → Test a domain* shows the real CNAME chain and
+which rule matched.
+
+### How matching works
+
+* **Plain domain rules** (`example.com`) are also written as dnsmasq
+  `ipset=` lines. They keep working even if the daemon is down.
+* **The DNS inspector** handles everything else (and CNAME chains). It reads
+  dnsmasq's UDP answers to LAN clients from an NFQUEUE on the router's OUTPUT
+  path, matches every name in the answer, and adds the A/AAAA addresses to the
+  first matching policy's set. Only then does it release the answer, so the
+  client's first connection is already routed.
+* **Fail-open queue**: if the daemon stops, answers pass straight through.
+* **Exclusions disable the dnsmasq fast path** for a policy, because dnsmasq
+  cannot honour them.
+* **Without NFQUEUE** in the kernel, only plain domain rules work (exclusions
+  are ignored). Status and the leak audit say so.
+* **TCP DNS answers** are not inspected. Clients use UDP unless an answer is
+  truncated.
 
 ## Leak protection
 
@@ -146,6 +195,7 @@ LAN client ──► mangle PREROUTING -i br+ ─► SNAKE
 filter FORWARD SNAKE_FWD: DoT/DoH/QUIC/IPv6 rejects, then accept LAN⇄tunnel
 nat PREROUTING SNAKE_DNS: port-53 REDIRECT
 dnsmasq: ipset=/netflix.com/.../SNK_1_d4,SNK_1_d6   server=/netflix.com/9.9.9.9
+mangle OUTPUT SNAKE_DNSO: dnsmasq's UDP answers → NFQUEUE → DNS inspector → SNK_<id>_d4/d6
 ```
 
 * fwmark bits `0x00ff0000` (configurable). These don't overlap Merlin's VPN

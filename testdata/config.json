@@ -4,7 +4,7 @@
   "devices": [{"name": "Apple TV", "mac": "aa:bb:cc:00:00:01"}],
   "policies": [
     {"name": "Netflix US", "enabled": true, "tunnels": ["wgc1", "ovpnc2"], "kill_switch": true, "expected_country": "us",
-     "domains": ["netflix.com", "*.nflxvideo.net", "https://nflximg.net/"], "asns": [2906], "cidrs": ["23.246.0.0/18"],
+     "domains": ["# Netflix", "netflix.com", "**.nflxvideo.net", "https://nflximg.net/", "/^ipv4-c\\d+-.*\\.oca\\.nflxvideo\\.net$/", "~nflxso", "!=customerevents.netflix.com"], "asns": [2906], "cidrs": ["23.246.0.0/18"],
      "leak": {"dns_via_tunnel": true, "dns_server": "9.9.9.9", "hijack_dns": true, "block_dot": true, "block_doh": true, "ipv6": "tunnel", "webrtc": "track"}},
     {"name": "Disney UK TV", "enabled": true, "tunnels": ["wgc2"], "kill_switch": false,
      "domains": ["disneyplus.com"], "devices": ["group:living-room"],
