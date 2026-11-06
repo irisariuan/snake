@@ -523,6 +523,9 @@ hand and run `snake reload`. See `testdata/config.json` for an example.
 
 ## Development
 
+Building needs Go 1.26 or newer (with the default `GOTOOLCHAIN=auto`, an
+older `go` downloads it).
+
 Releases are built by GitHub Actions: push a tag like `v1.2.3` and
 `.github/workflows/release.yml` tests, builds `snake-arm64` and `snake-armv7`,
 and publishes them with `SHA256SUMS` as a GitHub release. Every push also runs
