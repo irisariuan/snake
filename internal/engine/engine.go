@@ -514,8 +514,9 @@ func (e *Engine) Apply(reason string) error {
 		if st.ActiveTunnel != "" {
 			r.Iface = config.TunnelInterface(st.ActiveTunnel)
 		}
-		if st.Policy.Leak.DNSViaTunnel && st.Policy.HasDomains() {
+		if st.Policy.Leak.DNSViaTunnel && !st.Policy.Leak.Encrypted() && st.Policy.HasDomains() {
 			r.DNSServer = st.Policy.Leak.DNSServer
+			r.DNSTunnel = st.ActiveTunnel
 		}
 		routes = append(routes, r)
 	}
@@ -583,7 +584,7 @@ func (e *Engine) Apply(reason string) error {
 	e.dnsOn = dnsOn
 	e.mu.Unlock()
 
-	frag := dnsmasq.Generate(cfg, dnsOn)
+	frag := dnsmasq.Generate(cfg, dnsOn, dnsUpstreams(states, e.fwd.Endpoints()))
 	if !e.DryRun {
 		changed, err := system.WriteIfChanged(e.P.DNSMasq, []byte(frag), 0o644)
 		if err != nil {
@@ -691,11 +692,38 @@ func forwarders(cfg *config.Config, states []netfilter.PolicyState) []dnsfwd.Spe
 		if !p.Leak.Encrypted() || !p.HasDomains() {
 			continue
 		}
+		var mark uint32
+		if st.ActiveTunnel != "" {
+			mark = cfg.Settings.ProbeMark(st.ActiveTunnel)
+		}
 		out = append(out, dnsfwd.Spec{
 			ID:     p.ID,
 			Listen: net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.Settings.DNSForwardPort+p.ID)),
-			Up:     dnsfwd.Upstream{Proto: p.Leak.DNSProtocol, IP: p.Leak.DNSServer, TLSName: p.Leak.DNSTLSName, Path: p.Leak.DNSDoHPath},
+			Up: dnsfwd.Upstream{Proto: p.Leak.DNSProtocol, IP: p.Leak.DNSServer, TLSName: p.Leak.DNSTLSName, Path: p.Leak.DNSDoHPath,
+				Mark: mark, Disabled: st.ActiveTunnel == ""},
 		})
+	}
+	return out
+}
+
+func dnsUpstreams(states []netfilter.PolicyState, ready map[int]string) map[int]string {
+	out := map[int]string{}
+	for _, st := range states {
+		p := st.Policy
+		if !p.Enabled || !p.Leak.DNSViaTunnel || !p.HasDomains() {
+			continue
+		}
+		switch {
+		case p.Leak.Encrypted():
+			// A running disabled forwarder returns SERVFAIL when no tunnel
+			// is healthy. A failed bind leaves no endpoint, so dnsmasq
+			// handles the domain locally instead of sending to a dead port.
+			out[p.ID] = ready[p.ID]
+		case st.ActiveTunnel != "":
+			out[p.ID] = p.Leak.DNSServer + "@" + config.TunnelInterface(st.ActiveTunnel)
+		default:
+			out[p.ID] = ""
+		}
 	}
 	return out
 }

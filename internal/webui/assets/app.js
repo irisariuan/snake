@@ -910,7 +910,7 @@
       mode('block_dot', 'Block DNS over TLS (port 853)', 'DoT'),
       mode('block_doh', 'Block DNS over HTTPS (known resolvers)', 'DoH'),
       el('div', { class: 'small muted' }, '"Per policy" uses each policy\'s leak protection toggle. Blocking makes devices fall back to the router\'s DNS, which snake needs to see which domains they use. "Never" lets them keep encrypted DNS, but domain rules then miss those devices\' lookups.'),
-      num('dns_forward_port', 'Local port for DoT/DoH forwarders', 'Policy id is added (policy 1 uses this port + 1). Only reachable from the router itself.'));
+      num('dns_forward_port', 'Preferred local port base for DoT/DoH', 'Policy id is added. Occupied ports and mDNS port 5353 are skipped automatically; Status shows the actual port. Only reachable from the router itself.'));
   }
 
   // ---------- updates ----------

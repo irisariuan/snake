@@ -290,11 +290,20 @@ resolver:
 | DNS over TLS | TLS to `<resolver>:853` (RFC 7858). |
 | DNS over HTTPS | HTTPS POST to `https://<name><path>` at `<resolver>:443` (RFC 8484). |
 
-For DoT and DoH the daemon runs a small forwarder per policy on
-`127.0.0.1:<dns_forward_port + policy id>` (default 5350 + id). dnsmasq sends
-the policy's domains there, and the forwarder dials the resolver **by IP**, so
-no bootstrap lookup is needed and the same `ip rule` routes it into the
-tunnel. The certificate is checked against *Certificate name*, which is filled
+Plain DNS stays in the router's dnsmasq, which binds its upstream queries
+to the selected tunnel interface. Snake does not start a plain-DNS listener.
+
+For DoT and DoH the daemon runs a small forwarder per policy on loopback.
+`dns_forward_port + policy id` is a preferred port; mDNS port 5353 and occupied
+UDP/TCP ports are skipped automatically. Status shows the actual listener.
+Only successfully bound endpoints are published to dnsmasq. If a listener
+cannot start, its policy domains are handled locally without forwarding;
+other policies continue to work.
+
+The forwarder dials the resolver **by IP**, with a socket mark selecting
+the policy's active tunnel, so no bootstrap lookup is needed. Multiple policies
+may use the same resolver IP through different tunnels; ordinary router DNS
+traffic to that resolver is not diverted. The certificate is checked against *Certificate name*, which is filled
 in for well-known resolvers (Quad9, Cloudflare, Google, AdGuard, OpenDNS,
 Mullvad). Connections are reused, and the Status tab shows queries, latency
 and errors per policy.

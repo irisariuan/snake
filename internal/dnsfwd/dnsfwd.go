@@ -3,8 +3,9 @@
 // (RFC 8484) queries to the policy's resolver.
 //
 // Each forwarder listens on 127.0.0.1 (UDP and TCP). The resolver is dialled
-// by IP; the router's policy routing (an "ip rule to <resolver>" per policy)
-// sends that connection through the policy's tunnel, so the ISP sees neither
+// by IP with the selected tunnel's socket mark; policy routing sends that
+// connection through that tunnel, independently of other policies using the
+// same resolver. The ISP sees neither
 // the query nor that it is DNS, and the resolver sees the VPN exit address.
 package dnsfwd
 
@@ -23,6 +24,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/irisariuan/snake/internal/logx"
@@ -36,11 +38,13 @@ const (
 
 // Upstream is an encrypted resolver.
 type Upstream struct {
-	Proto   string // dot | doh
-	IP      string // dialled directly (no bootstrap lookup)
-	Port    int    // 0 = 853 (DoT) / 443 (DoH)
-	TLSName string // certificate name, also the DoH Host
-	Path    string // DoH path
+	Proto    string // dot | doh
+	IP       string // dialled directly (no bootstrap lookup)
+	Port     int    // 0 = 853 (DoT) / 443 (DoH)
+	TLSName  string // certificate name, also the DoH Host
+	Path     string // DoH path
+	Mark     uint32 // tunnel probe mark; independent of the resolver IP
+	Disabled bool   // no healthy tunnel: SERVFAIL without dialing
 	// RootCAs overrides the system roots (tests).
 	RootCAs *x509.CertPool
 }
@@ -107,7 +111,7 @@ type dot struct {
 func newDoT(u Upstream) *dot { return &dot{up: u, pool: make(chan *tls.Conn, 4)} }
 
 func (d *dot) dial(ctx context.Context) (*tls.Conn, error) {
-	nd := net.Dialer{Timeout: queryTimeout}
+	nd := upstreamDialer(d.up.Mark, queryTimeout)
 	raw, err := nd.DialContext(ctx, "tcp", d.up.addr())
 	if err != nil {
 		return nil, err
@@ -214,7 +218,7 @@ func newDoH(u Upstream) *doh {
 	tr := &http.Transport{
 		Proxy: nil, // never through an HTTP proxy: the tunnel is the path
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			nd := net.Dialer{Timeout: queryTimeout}
+			nd := upstreamDialer(u.Mark, queryTimeout)
 			return nd.DialContext(ctx, "tcp", u.addr()) // always the configured IP
 		},
 		TLSClientConfig:     tlsConfig(u),
@@ -286,13 +290,9 @@ func start(sp Spec) (*server, error) {
 	default:
 		return nil, fmt.Errorf("dnsfwd: unknown protocol %q", sp.Up.Proto)
 	}
-	udp, err := net.ListenPacket("udp", sp.Listen)
+	udp, tcp, err := listenPair(sp.Listen)
 	if err != nil {
-		return nil, fmt.Errorf("dns forwarder for policy %d: %w", sp.ID, err)
-	}
-	tcp, err := net.Listen("tcp", sp.Listen)
-	if err != nil {
-		udp.Close()
+		ex.close()
 		return nil, fmt.Errorf("dns forwarder for policy %d: %w", sp.ID, err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -300,8 +300,41 @@ func start(sp Spec) (*server, error) {
 	s.wg.Add(2)
 	go s.serveUDP(ctx)
 	go s.serveTCP(ctx)
-	logx.Infof("dns forwarder for policy %d on %s -> %s", sp.ID, sp.Listen, sp.Up)
+	logx.Infof("dns forwarder for policy %d on %s -> %s", sp.ID, udp.LocalAddr(), sp.Up)
 	return s, nil
+}
+
+// Reserve both transports together, without taking another service's port.
+// Never use mDNS's port 5353, even when it is currently unoccupied.
+func listenPair(preferred string) (net.PacketConn, net.Listener, error) {
+	host, port, err := net.SplitHostPort(preferred)
+	if err != nil {
+		return nil, nil, err
+	}
+	addr := preferred
+	if port == "5353" {
+		addr = net.JoinHostPort(host, "0")
+	}
+	for attempt := 0; attempt < 32; attempt++ {
+		udp, err := net.ListenPacket("udp", addr)
+		if err != nil {
+			if !errors.Is(err, syscall.EADDRINUSE) {
+				return nil, nil, err
+			}
+			addr = net.JoinHostPort(host, "0")
+			continue
+		}
+		tcp, err := net.Listen("tcp", udp.LocalAddr().String())
+		if err == nil {
+			return udp, tcp, nil
+		}
+		udp.Close()
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			return nil, nil, err
+		}
+		addr = net.JoinHostPort(host, "0")
+	}
+	return nil, nil, errors.New("could not reserve a UDP/TCP DNS listener pair")
 }
 
 func (s *server) resolve(ctx context.Context, q []byte) ([]byte, error) {
@@ -312,7 +345,13 @@ func (s *server) resolve(ctx context.Context, q []byte) ([]byte, error) {
 	defer cancel()
 	t0 := time.Now()
 	s.queries.Add(1)
-	resp, err := s.ex.exchange(ctx, q)
+	var resp []byte
+	var err error
+	if s.spec.Up.Disabled {
+		err = errors.New("no healthy tunnel for DNS")
+	} else {
+		resp, err = s.ex.exchange(ctx, q)
+	}
 	if err != nil {
 		s.errs.Add(1)
 		s.mu.Lock()
@@ -407,7 +446,7 @@ func (s *server) stop() {
 }
 
 func (s *server) stats() Stats {
-	st := Stats{Upstream: s.spec.Up.String(), Listen: s.spec.Listen, Queries: s.queries.Load(), Errors: s.errs.Load()}
+	st := Stats{Upstream: s.spec.Up.String(), Listen: s.udp.LocalAddr().String(), Queries: s.queries.Load(), Errors: s.errs.Load()}
 	if ok := st.Queries - st.Errors; ok > 0 {
 		st.AvgMS = float64(s.totalNS.Load()) / float64(ok) / 1e6
 	}
@@ -467,7 +506,7 @@ func (m *Manager) Configure(specs []Spec) error {
 
 func sameSpec(a, b Spec) bool {
 	return a.Listen == b.Listen && a.Up.Proto == b.Up.Proto && a.Up.IP == b.Up.IP && a.Up.Port == b.Up.Port &&
-		a.Up.TLSName == b.Up.TLSName && a.Up.Path == b.Up.Path && a.Up.RootCAs == b.Up.RootCAs
+		a.Up.TLSName == b.Up.TLSName && a.Up.Path == b.Up.Path && a.Up.RootCAs == b.Up.RootCAs && a.Up.Mark == b.Up.Mark && a.Up.Disabled == b.Up.Disabled
 }
 
 func joinErrs(errs []string) string {
@@ -491,6 +530,18 @@ func (m *Manager) Stats() map[int]Stats {
 	out := map[int]Stats{}
 	for id, s := range m.srvs {
 		out[id] = s.stats()
+	}
+	return out
+}
+
+// Endpoints contains only successfully bound listeners, in dnsmasq syntax.
+func (m *Manager) Endpoints() map[int]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[int]string{}
+	for id, s := range m.srvs {
+		host, port, _ := net.SplitHostPort(s.udp.LocalAddr().String())
+		out[id] = host + "#" + port
 	}
 	return out
 }

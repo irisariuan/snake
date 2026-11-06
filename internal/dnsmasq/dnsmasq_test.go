@@ -107,8 +107,8 @@ func TestGenerateEncryptedUpstream(t *testing.T) {
 		{ID: 4, Name: "dot", Enabled: true, Domains: []string{"netflix.com"}, Leak: config.Leak{DNSViaTunnel: true, DNSServer: "9.9.9.9", DNSProtocol: config.DNSDoT, DNSTLSName: "dns.quad9.net"}},
 		{ID: 5, Name: "plain", Enabled: true, Domains: []string{"hulu.com"}, Leak: config.Leak{DNSViaTunnel: true, DNSServer: "1.1.1.1", DNSProtocol: config.DNSUDP}},
 	}
-	out := Generate(c, true)
-	for _, s := range []string{"server=/netflix.com/127.0.0.1#5354", "server=/hulu.com/1.1.1.1"} {
+	out := Generate(c, true, map[int]string{4: "127.0.0.1#34567", 5: "1.1.1.1@wgc2"})
+	for _, s := range []string{"server=/netflix.com/127.0.0.1#34567", "server=/hulu.com/1.1.1.1@wgc2"} {
 		if !strings.Contains(out, s) {
 			t.Errorf("missing %q in\n%s", s, out)
 		}
@@ -120,6 +120,24 @@ func TestGenerateEncryptedUpstream(t *testing.T) {
 	c.Settings.BlockDoH = config.BlockAlways
 	if !strings.Contains(Generate(c, true), "local=/dns.google/") {
 		t.Error("block_doh=always did not block DoH hostnames")
+	}
+}
+
+func TestFailedForwarderDoesNotPublishDeadPort(t *testing.T) {
+	c := config.Default()
+	c.Policies = []config.Policy{
+		{ID: 3, Name: "failed", Enabled: true, Domains: []string{"failed.example"}, Leak: config.Leak{DNSViaTunnel: true, DNSServer: "9.9.9.9", DNSProtocol: config.DNSDoH}},
+		{ID: 4, Name: "ready", Enabled: true, Domains: []string{"ready.example"}, Leak: config.Leak{DNSViaTunnel: true, DNSServer: "9.9.9.9", DNSProtocol: config.DNSDoT}},
+	}
+	out := Generate(c, true, map[int]string{3: "", 4: "127.0.0.1#34567"})
+	if !strings.Contains(out, "local=/failed.example/") || !strings.Contains(out, "server=/ready.example/127.0.0.1#34567") {
+		t.Fatal(out)
+	}
+	if strings.Contains(out, "#5353") || strings.Contains(out, "failed.example/9.9.9.9") {
+		t.Fatal("failed policy pointed at a dead or unencrypted resolver")
+	}
+	if preview := Generate(c, true); strings.Contains(preview, "server=/failed.example/") {
+		t.Fatal("unbound encrypted listener published without readiness information")
 	}
 }
 

@@ -35,7 +35,8 @@ type PolicyRoute struct {
 	Kill      bool   // install unreachable default when Iface == ""
 	V6        bool   // also manage the IPv6 table
 	V6Route   bool   // IPv6 goes via Iface (otherwise unreachable)
-	DNSServer string // router-originated queries to this IP use the table
+	DNSServer string // plain resolver selected by dnsmasq's bound interface
+	DNSTunnel string // oif selector; encrypted queries use a socket mark instead
 }
 
 // ProbeRoute is a table used by health probes to reach the internet through a tunnel.
@@ -74,8 +75,13 @@ func (m Manager) Sync(s config.Settings, routes []PolicyRoute, probes []ProbeRou
 				errs = append(errs, err.Error())
 			}
 		}
-		if r.DNSServer != "" {
-			want[false] = append(want[false], rule{pref: netfilter.DNSRulePrefBase + r.ID, spec: []string{"iif", "lo", "to", r.DNSServer + "/32"}, table: table})
+		if r.DNSServer != "" && r.DNSTunnel != "" {
+			// SO_BINDTODEVICE from dnsmasq's @interface identifies the
+			// tunnel even when several policies share one resolver IP.
+			// Probe tables always fail closed when an interface goes down.
+			want[false] = append(want[false], rule{pref: netfilter.DNSRulePrefBase + r.ID,
+				spec:  []string{"iif", "lo", "oif", config.TunnelInterface(r.DNSTunnel), "to", r.DNSServer + "/32"},
+				table: netfilter.ProbeTableBase + config.TunnelIndex(r.DNSTunnel)})
 		}
 	}
 	for _, p := range probes {

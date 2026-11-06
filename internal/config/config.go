@@ -145,8 +145,8 @@ type Settings struct {
 	// (whole LAN) or never (overrides every policy).
 	BlockDoT string `json:"block_dot"`
 	BlockDoH string `json:"block_doh"`
-	// DNSForwardPort is the first local port of the encrypted-DNS
-	// forwarders (policy id is added); dnsmasq sends policy domains there.
+	// DNSForwardPort is the preferred encrypted-DNS listener port base.
+	// Occupied/reserved ports are replaced by allocated runtime endpoints.
 	DNSForwardPort int `json:"dns_forward_port"`
 }
 
@@ -245,11 +245,6 @@ var KnownResolverNames = map[string]string{
 // (through snake's local forwarder) rather than plain DNS.
 func (l Leak) Encrypted() bool {
 	return l.DNSViaTunnel && (l.DNSProtocol == DNSDoT || l.DNSProtocol == DNSDoH)
-}
-
-// DNSForwardAddr is the local address of a policy's encrypted-DNS forwarder.
-func (s Settings) DNSForwardAddr(id int) string {
-	return "127.0.0.1#" + strconv.Itoa(s.DNSForwardPort+id)
 }
 
 func blocked(mode string, policy bool) bool {

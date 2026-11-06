@@ -21,7 +21,7 @@ jobs:
       - run: go test ./...
       - name: Integration test (real iptables/ipset in a netns)
         run: |
-          sudo apt-get install -y ipset conntrack python3
+          sudo apt-get install -y ipset conntrack python3 dnsmasq-base
           sudo SNAKE_INTEGRATION=1 unshare -n env "PATH=$PATH" "HOME=$HOME" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)" \
             go test -count=1 -tags integration ./internal/engine -run Integration -v
       - run: make arm64 armv7

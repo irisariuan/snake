@@ -18,7 +18,7 @@ func TestSyncReconciles(t *testing.T) {
 	m := Manager{R: rec}
 	s := config.DefaultSettings()
 	err := m.Sync(s, []PolicyRoute{
-		{ID: 1, Iface: "wgc1", Kill: true, DNSServer: "9.9.9.9"},
+		{ID: 1, Iface: "wgc1", Kill: true, DNSServer: "9.9.9.9", DNSTunnel: "wgc1"},
 		{ID: 2, Iface: "", Kill: true},
 		{ID: 3, Iface: "", Kill: false},
 	}, []ProbeRoute{{Tunnel: "wgc1", Iface: "wgc1", Up: true}}, false)
@@ -31,7 +31,7 @@ func TestSyncReconciles(t *testing.T) {
 		"ip -4 route replace unreachable default table 1002",
 		"ip -4 route flush table 1003",
 		"ip -4 rule add pref 5202 fwmark 0x20000/0xc0ff0000 lookup 1002",
-		"ip -4 rule add pref 5001 iif lo to 9.9.9.9/32 lookup 1001",
+		"ip -4 rule add pref 5001 iif lo oif wgc1 to 9.9.9.9/32 lookup 1301",
 		"ip -4 rule add pref 4981 fwmark 0xf60000/0xc0ff0000 lookup 1301",
 		"ip -4 route replace default dev wgc1 table 1301",
 		"ip -4 rule del pref 5209 from all fwmark 0x90000/0xc0ff0000 lookup 1009",

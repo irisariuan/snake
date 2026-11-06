@@ -269,3 +269,66 @@ func TestReconfigure(t *testing.T) {
 		t.Fatal("stop left forwarders")
 	}
 }
+
+func TestOccupiedPortsAndSharedResolver(t *testing.T) {
+	for _, transport := range []string{"udp", "tcp"} {
+		t.Run(transport, func(t *testing.T) {
+			var addr string
+			if transport == "udp" {
+				l, err := net.ListenPacket("udp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer l.Close()
+				addr = l.LocalAddr().String()
+			} else {
+				l, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer l.Close()
+				addr = l.Addr().String()
+			}
+			var m Manager
+			defer m.Stop()
+			up := Upstream{Proto: DoT, IP: "9.9.9.9", TLSName: "dns.quad9.net", Disabled: true}
+			if err := m.Configure([]Spec{{ID: 1, Listen: addr, Up: up}, {ID: 2, Listen: addr, Up: up}}); err != nil {
+				t.Fatal(err)
+			}
+			st := m.Stats()
+			if st[1].Listen == addr || st[2].Listen == addr || st[1].Listen == st[2].Listen {
+				t.Fatalf("listeners collided: %v", st)
+			}
+			for _, s := range st {
+				for _, response := range [][]byte{exchangeUDP(t, s.Listen, query(55, "test.example.")), exchangeTCP(t, s.Listen, query(55, "test.example."))} {
+					var p dnsmessage.Parser
+					h, err := p.Start(response)
+					if err != nil || h.RCode != dnsmessage.RCodeServerFailure {
+						t.Fatalf("disabled tunnel did not fail closed: %v %v", h, err)
+					}
+				}
+			}
+			first := m.srvs[1]
+			if err := m.Configure([]Spec{{ID: 1, Listen: addr, Up: up}, {ID: 2, Listen: addr, Up: up}}); err != nil {
+				t.Fatal(err)
+			}
+			if m.srvs[1] != first {
+				t.Fatal("allocated listener changed on an unchanged apply")
+			}
+		})
+	}
+}
+
+func TestMDNSReservedAndPartialFailure(t *testing.T) {
+	var m Manager
+	defer m.Stop()
+	up := Upstream{Proto: DoT, IP: "9.9.9.9", TLSName: "dns.quad9.net", Disabled: true}
+	err := m.Configure([]Spec{{ID: 3, Listen: "127.0.0.1:5353", Up: up}, {ID: 4, Listen: "not-an-address", Up: up}})
+	if err == nil {
+		t.Fatal("invalid listener unexpectedly succeeded")
+	}
+	ready := m.Endpoints()
+	if ready[3] == "" || ready[3] == "127.0.0.1#5353" || ready[4] != "" {
+		t.Fatalf("unsafe readiness map: %v", ready)
+	}
+}
