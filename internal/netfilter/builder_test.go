@@ -3,6 +3,7 @@ package netfilter
 import (
 	"encoding/json"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -46,7 +47,7 @@ func TestBuild(t *testing.T) {
 	mustContain(t, m4,
 		"-A SNAKE -m mark --mark 0/0xff0000 -j CONNMARK --restore-mark --nfmask 0xff0000 --ctmask 0xff0000",
 		"-A SNAKE -m mark ! --mark 0/0xff0000 -g SNAKE_SAVE",
-		"-A SNAKE -m mark --mark 0/0xff0000 -m conntrack ! --ctstate NEW -j RETURN",
+		"-A SNAKE -m mark --mark 0/0xff0000 -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN",
 		"-A SNAKE_M1 -j MARK --set-xmark 0x10000/0xff0000",
 		"-A SNAKE_P1 -m set --match-set SNK_1_d4 dst -g SNAKE_M1",
 		"-A SNAKE_P1 -m set --match-set SNK_1_n4 dst -g SNAKE_M1",
@@ -216,4 +217,30 @@ func TestBuildDoTDoHOverrides(t *testing.T) {
 		t.Error("never did not override policy DoT blocking")
 	}
 	mustContain(t, f, "SNK_DOH4")
+}
+
+func TestBuildTunnelConnectionRecovery(t *testing.T) {
+	// A connection NATed out a tunnel keeps going into it when its
+	// conntrack mark is lost; the rule must come before the WAN-affinity
+	// RETURN.
+	c, st := states(t)
+	plan := Build(c.Settings, st, Options{IPv6: true, IPv6NAT: true, TunnelAddrs: map[string][]string{
+		"wgc1": {"10.66.0.2", "fd00::2"}, "wgc2": {"10.77.0.2"},
+	}})
+	m4, m6 := plan.Restore["4/mangle"], plan.Restore["6/mangle"]
+	rec := "-A SNAKE -m mark --mark 0/0xff0000 -m conntrack --ctstate ESTABLISHED,RELATED --ctrepldst 10.66.0.2 -g SNAKE_M1"
+	ret := "-A SNAKE -m mark --mark 0/0xff0000 -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN"
+	mustContain(t, m4, rec, "--ctrepldst 10.77.0.2 -g SNAKE_M2", ret)
+	if strings.Index(m4, rec) > strings.Index(m4, ret) {
+		t.Error("recovery rule after the WAN-affinity RETURN")
+	}
+	if strings.Contains(m4, "fd00::2") || strings.Contains(m6, "10.66.0.2") {
+		t.Error("address of the other family used")
+	}
+	// IPv6 is routed into wgc1 for policy 1 only (V6Route); policy 2 blocks IPv6.
+	mustContain(t, m6, "--ctrepldst fd00::2 -g SNAKE_M1")
+	// Policy 3 has no active tunnel: nothing recovers into it.
+	if regexp.MustCompile(`ctrepldst \S+ -g SNAKE_M3`).MatchString(m4) {
+		t.Error("recovery rule for a policy without tunnel")
+	}
 }

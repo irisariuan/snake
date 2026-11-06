@@ -544,7 +544,8 @@ func (e *Engine) Apply(reason string) error {
 	if dnsOn {
 		dnsQueue = s.QueueBase
 	}
-	plan := netfilter.Build(s, states, netfilter.Options{IPv6: caps.IPv6, IPv6NAT: caps.IPv6NAT, DNSQueue: dnsQueue, Existing: existing})
+	plan := netfilter.Build(s, states, netfilter.Options{IPv6: caps.IPv6, IPv6NAT: caps.IPv6NAT, DNSQueue: dnsQueue, Existing: existing,
+		TunnelAddrs: tunnelAddrs(usedTunnels(cfg))})
 	if err := nf.Apply(plan); err != nil {
 		errs = append(errs, err.Error())
 	}
@@ -633,6 +634,31 @@ func (e *Engine) Apply(reason string) error {
 	}
 	logx.Infof("applied (%s): %d policies", reason, len(states))
 	return nil
+}
+
+// tunnelAddrs returns the global addresses of each tunnel interface.
+func tunnelAddrs(tunnels []string) map[string][]string {
+	out := map[string][]string{}
+	for _, t := range tunnels {
+		ifc := config.TunnelInterface(t)
+		ni, err := net.InterfaceByName(ifc)
+		if err != nil {
+			continue
+		}
+		addrs, err := ni.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok || ipn.IP.IsLinkLocalUnicast() || ipn.IP.IsLoopback() {
+				continue
+			}
+			out[ifc] = append(out[ifc], ipn.IP.String())
+		}
+		sort.Strings(out[ifc])
+	}
+	return out
 }
 
 // forwarders lists the DoT/DoH forwarders of policies resolving through

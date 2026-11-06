@@ -127,7 +127,9 @@ One rule per line:
   destination later joins a policy set (shared CDN addresses are answered for
   many names), because moving it would send its WAN NAT binding into the
   tunnel and stall it. The next connection to that address follows the
-  policy. Failover clears policy connections so they move to the new tunnel.
+  policy. Failover clears policy connections so they move to the new tunnel. A connection that went into a tunnel is recognised by its NAT address
+  (the tunnel's own address), so it stays in the tunnel even if another
+  firmware component rewrites its conntrack mark.
 * **Exclusions** veto a policy for that answer. A later policy can still match it.
 * **Drop rules** block instead of route. DNS still answers, but the answered
   addresses go into the policy's drop set (`SNK_<id>_x4/6`; `drop:asn:` and

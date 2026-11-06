@@ -111,6 +111,13 @@ func (e *Engine) checkHealth(geo bool) {
 		s := snap[t]
 		lk = append(lk, fmt.Sprintf("%s:%v%v%v", t, s.Exists, s.Up, s.HasIPv6))
 	}
+	// A reconnect can give the tunnel a new address: the rules that keep
+	// its connections in it name the address.
+	addrs := tunnelAddrs(tunnels)
+	for _, t := range tunnels { // fixed order: the key must be stable
+		ifc := config.TunnelInterface(t)
+		lk = append(lk, ifc+"="+strings.Join(addrs[ifc], "/"))
+	}
 	linkKey := strings.Join(lk, ",")
 	e.mu.Lock()
 	linkChanged := linkKey != e.linkKey

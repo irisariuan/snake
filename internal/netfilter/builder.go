@@ -2,6 +2,7 @@ package netfilter
 
 import (
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 
@@ -42,6 +43,11 @@ type Options struct {
 	// Existing chain names per "family/table" key (e.g. "4/mangle"); chains
 	// that are no longer generated get deleted.
 	Existing map[string][]string
+	// TunnelAddrs are the addresses of each tunnel interface (both
+	// families). Connections NATed out a tunnel have its address as reply
+	// destination, which identifies them even when their conntrack mark is
+	// lost.
+	TunnelAddrs map[string][]string
 }
 
 // Plan is a set of iptables-restore payloads keyed by "family/table".
@@ -173,13 +179,37 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 	mangle.add(ChainMain, "-m mark --mark 0/"+mask, "-j CONNMARK --restore-mark --nfmask", mask, "--ctmask", mask)
 	mangle.add(ChainMain, "-m mark ! --mark 0/"+mask, "-g", ChainSave)
 	mangle.add(ChainMain, "-d", strings.Join(private, ","), "-j RETURN")
+	// A connection NATed out a tunnel (reply destination = the tunnel's
+	// address) stays in that tunnel even if its conntrack mark was lost:
+	// other firmware components rewrite conntrack marks, and without this
+	// such a connection fell through to the WAN rule below and timed out
+	// (its packets left via WAN with the tunnel's source address).
+	recovered := map[string]bool{}
+	for _, st := range states {
+		if !st.Policy.Enabled || st.ActiveTunnel == "" || (v6 && st.IPv6Mode != V6Route) {
+			continue
+		}
+		ifc := config.TunnelInterface(st.ActiveTunnel)
+		if recovered[ifc] {
+			continue
+		}
+		recovered[ifc] = true
+		for _, a := range opt.TunnelAddrs[ifc] {
+			ip := net.ParseIP(a)
+			if ip == nil || (ip.To4() == nil) != v6 {
+				continue
+			}
+			mangle.add(ChainMain, "-m mark --mark 0/"+mask, "-m conntrack --ctstate ESTABLISHED,RELATED --ctrepldst", a, "-g", MarkChain(st.Policy.ID))
+		}
+	}
 	// A connection keeps the route it started with. One that began on WAN
 	// (no policy mark) must not move into a tunnel when its destination
 	// joins a policy set later (e.g. a CDN address shared with a policy
 	// domain): its NAT binding is WAN's, so in the tunnel it would stall.
 	// Only new connections are matched against policies; failover clears
-	// the conntrack entries it needs to move.
-	mangle.add(ChainMain, "-m mark --mark 0/"+mask, "-m conntrack ! --ctstate NEW -j RETURN")
+	// the conntrack entries it needs to move. Packets without a usable
+	// conntrack entry (INVALID, UNTRACKED) are matched normally.
+	mangle.add(ChainMain, "-m mark --mark 0/"+mask, "-m conntrack --ctstate ESTABLISHED,RELATED -j RETURN")
 	mangle.add(ChainRTC, "-m mark ! --mark 0/"+mask, "-j RETURN")
 
 	tunnels := map[string]bool{}
