@@ -1,0 +1,527 @@
+package engine
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/irisariuan/snake/internal/config"
+	"github.com/irisariuan/snake/internal/health"
+	"github.com/irisariuan/snake/internal/logx"
+	"github.com/irisariuan/snake/internal/netfilter"
+	"github.com/irisariuan/snake/internal/system"
+	"github.com/irisariuan/snake/internal/webrtc"
+)
+
+// Run is the daemon main loop.
+func (e *Engine) Run(ctx context.Context) error {
+	e.mu.Lock()
+	e.daemon = true
+	e.mu.Unlock()
+	if err := e.Load(); err != nil {
+		return err
+	}
+	e.DetectCaps()
+	ips := netfilter.IPSet{R: e.R}
+	if _, err := os.Stat(e.P.IPSetSave); err == nil {
+		if err := ips.RestoreFile(e.P.IPSetSave); err != nil {
+			logx.Warnf("restore saved ipsets: %v", err)
+		}
+	}
+	e.SeedHealth()
+	e.decide()
+	if err := e.Apply("startup"); err != nil {
+		logx.Warnf("startup apply had errors (continuing)")
+	}
+	go e.refreshASNs(false)
+	go e.PreResolve()
+
+	cfg := e.Config()
+	healthT := time.NewTicker(time.Duration(cfg.Settings.HealthInterval) * time.Second)
+	hookT := time.NewTicker(30 * time.Second)
+	asnT := time.NewTicker(time.Hour)
+	saveT := time.NewTicker(time.Duration(cfg.Settings.SaveInterval) * time.Second)
+	defer healthT.Stop()
+	defer hookT.Stop()
+	defer asnT.Stop()
+	defer saveT.Stop()
+
+	e.checkHealth(true)
+	for {
+		select {
+		case <-ctx.Done():
+			e.saveSets()
+			e.rtc.Stop()
+			logx.Infof("daemon stopped")
+			return nil
+		case <-healthT.C:
+			e.checkHealth(false)
+		case <-e.kick:
+			e.checkHealth(true)
+		case <-hookT.C:
+			e.mu.Lock()
+			hooks := e.plan.Hooks
+			e.mu.Unlock()
+			if len(hooks) > 0 && !(netfilter.Applier{R: e.R}).HooksPresent(hooks) {
+				logx.Warnf("firewall hooks missing (firewall restarted?), re-applying")
+				_ = e.Apply("firewall restart detected")
+			}
+		case <-asnT.C:
+			go e.refreshASNs(false)
+		case <-saveT.C:
+			e.saveSets()
+		}
+	}
+}
+
+// checkHealth probes all used tunnels in parallel, runs failover and applies
+// when needed.
+func (e *Engine) checkHealth(geo bool) {
+	cfg := e.Config()
+	tunnels := usedTunnels(cfg)
+	e.mon.Prune(tunnels)
+	var wg sync.WaitGroup
+	for _, t := range tunnels {
+		wg.Add(1)
+		go func(t string) {
+			defer wg.Done()
+			e.mon.Check(cfg.Settings, t, geo)
+		}(t)
+	}
+	wg.Wait()
+
+	snap := e.mon.Snapshot()
+	var lk []string
+	for _, t := range tunnels {
+		s := snap[t]
+		lk = append(lk, fmt.Sprintf("%s:%v%v%v", t, s.Exists, s.Up, s.HasIPv6))
+	}
+	linkKey := strings.Join(lk, ",")
+	e.mu.Lock()
+	linkChanged := linkKey != e.linkKey
+	e.linkKey = linkKey
+	e.mu.Unlock()
+
+	changed := e.decide()
+	if len(changed) > 0 || linkChanged {
+		reason := "tunnel state change"
+		if len(changed) > 0 {
+			reason = "failover"
+		}
+		_ = e.Apply(reason)
+		for _, id := range changed {
+			e.flushConntrack(id)
+		}
+	}
+}
+
+func (e *Engine) saveSets() {
+	if e.DryRun {
+		return
+	}
+	ips := netfilter.IPSet{R: e.R}
+	var names []string
+	for _, n := range ips.Names() {
+		// Only DNS-learned sets are worth persisting; static sets are rebuilt.
+		if strings.HasSuffix(n, "_"+netfilter.KindDomain+"4") || strings.HasSuffix(n, "_"+netfilter.KindDomain+"6") {
+			names = append(names, n)
+		}
+	}
+	if err := ips.Save(e.P.IPSetSave, names); err != nil {
+		logx.Warnf("save ipsets: %v", err)
+	}
+}
+
+// PolicyStatus is the runtime view of a policy.
+type PolicyStatus struct {
+	ID          int            `json:"id"`
+	Name        string         `json:"name"`
+	Enabled     bool           `json:"enabled"`
+	Scope       string         `json:"scope"`
+	Active      string         `json:"active"`
+	KillEngaged bool           `json:"kill_engaged"`
+	Leaking     bool           `json:"leaking"` // no tunnel and no kill switch: traffic uses WAN
+	IPv6Mode    string         `json:"ipv6_mode"`
+	WebRTCMode  string         `json:"webrtc_mode"`
+	Candidates  []Candidate    `json:"candidates"`
+	Sets        map[string]int `json:"sets"`
+	Packets     uint64         `json:"packets"`
+	Bytes       uint64         `json:"bytes"`
+	WebRTC      *webrtc.Stats  `json:"webrtc,omitempty"`
+	ASNErrors   []string       `json:"asn_errors,omitempty"`
+	Country     string         `json:"country,omitempty"`
+}
+
+// Status is the API status document.
+type Status struct {
+	Version    string                   `json:"version"`
+	Uptime     string                   `json:"uptime"`
+	Caps       Caps                     `json:"caps"`
+	LastApply  time.Time                `json:"last_apply"`
+	ApplyCount int                      `json:"apply_count"`
+	LastError  string                   `json:"last_error,omitempty"`
+	WANIP      string                   `json:"wan_ip"`
+	Tunnels    map[string]health.Status `json:"tunnels"`
+	Policies   []PolicyStatus           `json:"policies"`
+	Events     []Event                  `json:"events"`
+}
+
+// Status builds the status document.
+func (e *Engine) Status() Status {
+	cfg := e.Config()
+	e.mu.Lock()
+	caps := e.caps
+	st := Status{
+		Version:    Version,
+		Uptime:     time.Since(e.started).Round(time.Second).String(),
+		Caps:       caps,
+		LastApply:  e.lastApply,
+		ApplyCount: e.applyCount,
+		LastError:  e.lastError,
+		Events:     append([]Event(nil), e.events...),
+	}
+	active := map[int]string{}
+	for k, v := range e.active {
+		active[k] = v
+	}
+	cands := map[int][]Candidate{}
+	for k, v := range e.cands {
+		cands[k] = v
+	}
+	asnErr := map[int]string{}
+	for k, v := range e.asnErrors {
+		asnErr[k] = v
+	}
+	e.mu.Unlock()
+	st.WANIP = system.NVRAM{R: e.R}.Get("wan0_ipaddr")
+	st.Tunnels = e.mon.Snapshot()
+	ips := netfilter.IPSet{R: e.R}
+	counters := (netfilter.Applier{R: e.R}).Counters(false)
+	if caps.IPv6 {
+		for k, v := range (netfilter.Applier{R: e.R}).Counters(true) {
+			c := counters[k]
+			counters[k] = [2]uint64{c[0] + v[0], c[1] + v[1]}
+		}
+	}
+	rtcStats := e.rtc.Stats()
+	states := e.states(cfg, caps)
+	stByID := map[int]netfilter.PolicyState{}
+	for _, s := range states {
+		stByID[s.Policy.ID] = s
+	}
+	for _, p := range cfg.Policies {
+		ps := PolicyStatus{ID: p.ID, Name: p.Name, Enabled: p.Enabled, Scope: p.Scope(), Sets: map[string]int{}}
+		if p.Enabled {
+			ps.Active = active[p.ID]
+			ps.KillEngaged = ps.Active == "" && p.KillSwitch
+			ps.Leaking = ps.Active == "" && !p.KillSwitch
+			ps.Candidates = cands[p.ID]
+			s := stByID[p.ID]
+			ps.IPv6Mode, ps.WebRTCMode = s.IPv6Mode, s.WebRTCMode
+			for _, kind := range []string{netfilter.KindDomain, netfilter.KindNet, netfilter.KindSession, netfilter.KindPeer} {
+				for _, v6 := range []bool{false, true} {
+					if v6 && !caps.IPv6 {
+						continue
+					}
+					n := netfilter.SetName(p.ID, kind, v6)
+					if c := ips.Count(n); c >= 0 {
+						ps.Sets[n] = c
+					}
+				}
+			}
+			c := counters[netfilter.MarkChain(p.ID)]
+			ps.Packets, ps.Bytes = c[0], c[1]
+			if rs, ok := rtcStats[p.ID]; ok {
+				rs := rs
+				ps.WebRTC = &rs
+			}
+			for _, n := range p.ASNs {
+				if msg, ok := asnErr[n]; ok {
+					ps.ASNErrors = append(ps.ASNErrors, msg)
+				}
+			}
+			if ps.Active != "" {
+				ps.Country = st.Tunnels[ps.Active].Country
+			}
+		}
+		st.Policies = append(st.Policies, ps)
+	}
+	return st
+}
+
+// DomainTest is the result of the "test domain" tool.
+type DomainTest struct {
+	Domain   string           `json:"domain"`
+	Policy   string           `json:"policy,omitempty"`
+	PolicyID int              `json:"policy_id,omitempty"`
+	Matched  string           `json:"matched,omitempty"` // configured domain that matched
+	Tunnel   string           `json:"tunnel,omitempty"`
+	Country  string           `json:"country,omitempty"`
+	Addrs    []AddrResult     `json:"addrs"`
+	Error    string           `json:"error,omitempty"`
+	Notes    []string         `json:"notes,omitempty"`
+	Others   []map[string]any `json:"other_matches,omitempty"`
+}
+
+// AddrResult tells whether a resolved address is in the policy sets.
+type AddrResult struct {
+	IP    string `json:"ip"`
+	InSet string `json:"in_set,omitempty"`
+}
+
+// MatchDomain finds the most specific policy domain matching name.
+func MatchDomain(cfg *config.Config, name string) (config.Policy, string, bool) {
+	name = config.NormalizeDomain(name)
+	var best config.Policy
+	bestD := ""
+	for _, p := range cfg.Policies {
+		if !p.Enabled {
+			continue
+		}
+		for _, d := range p.Domains {
+			if (name == d || strings.HasSuffix(name, "."+d)) && len(d) > len(bestD) {
+				best, bestD = p, d
+			}
+		}
+	}
+	return best, bestD, bestD != ""
+}
+
+// TestDomain resolves a domain through dnsmasq (which also fills the sets)
+// and reports how its traffic would be routed.
+func (e *Engine) TestDomain(name string) DomainTest {
+	cfg := e.Config()
+	name = config.NormalizeDomain(name)
+	res := DomainTest{Domain: name}
+	p, matched, ok := MatchDomain(cfg, name)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	addrs, err := LocalResolver().LookupIPAddr(ctx, name)
+	if err != nil {
+		res.Error = err.Error()
+	}
+	ips := netfilter.IPSet{R: e.R}
+	for _, a := range addrs {
+		ar := AddrResult{IP: a.IP.String()}
+		v6 := a.IP.To4() == nil
+		for _, pol := range cfg.Policies {
+			if !pol.Enabled {
+				continue
+			}
+			for _, k := range []string{netfilter.KindDomain, netfilter.KindNet} {
+				n := netfilter.SetName(pol.ID, k, v6)
+				if ips.Test(n, ar.IP) {
+					if ar.InSet == "" {
+						ar.InSet = n
+					}
+					if !ok && k == netfilter.KindNet {
+						res.Others = append(res.Others, map[string]any{"policy": pol.Name, "set": n, "ip": ar.IP})
+					}
+				}
+			}
+		}
+		res.Addrs = append(res.Addrs, ar)
+	}
+	if ok {
+		res.Policy, res.PolicyID, res.Matched = p.Name, p.ID, matched
+		e.mu.Lock()
+		res.Tunnel = e.active[p.ID]
+		e.mu.Unlock()
+		if res.Tunnel != "" {
+			if st, ok := e.mon.Get(res.Tunnel); ok {
+				res.Country = st.Country
+			}
+		} else if p.KillSwitch {
+			res.Notes = append(res.Notes, "no healthy tunnel: kill switch is blocking this traffic")
+		} else {
+			res.Notes = append(res.Notes, "no healthy tunnel: traffic currently goes via WAN")
+		}
+		for _, a := range res.Addrs {
+			if a.InSet == "" {
+				res.Notes = append(res.Notes, a.IP+" is not in any set yet: is the router's dnsmasq the resolver? (check DNS hijack / DoH blocking)")
+			}
+		}
+		if len(p.Devices) > 0 {
+			res.Notes = append(res.Notes, "policy is limited to selected devices")
+		}
+	} else if len(res.Others) == 0 {
+		res.Notes = append(res.Notes, "no policy matches: traffic goes via WAN")
+	}
+	return res
+}
+
+// SetMembers lists members of a snake set.
+func (e *Engine) SetMembers(name string, limit int) ([]string, error) {
+	if !strings.HasPrefix(name, netfilter.SetPrefix) {
+		return nil, fmt.Errorf("not a snake set")
+	}
+	return netfilter.IPSet{R: e.R}.Members(name, limit), nil
+}
+
+// FlushLearned empties DNS-learned and WebRTC sets of a policy.
+func (e *Engine) FlushLearned(id int) {
+	ips := netfilter.IPSet{R: e.R}
+	for _, k := range []string{netfilter.KindDomain, netfilter.KindPeer, netfilter.KindSession} {
+		for _, v6 := range []bool{false, true} {
+			_ = ips.Flush(netfilter.SetName(id, k, v6))
+		}
+	}
+	e.event("", "flush", "flushed learned addresses of policy %d", id)
+	go e.PreResolve()
+}
+
+// Client is a LAN client seen by the router.
+type Client struct {
+	MAC  string `json:"mac"`
+	IP   string `json:"ip"`
+	Name string `json:"name"`
+}
+
+// Clients merges dnsmasq leases and the ARP table.
+func Clients() []Client {
+	byMAC := map[string]*Client{}
+	if f, err := os.Open("/var/lib/misc/dnsmasq.leases"); err == nil {
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			x := strings.Fields(sc.Text())
+			if len(x) >= 4 {
+				if m, err := config.NormalizeMAC(x[1]); err == nil {
+					name := x[3]
+					if name == "*" {
+						name = ""
+					}
+					byMAC[m] = &Client{MAC: m, IP: x[2], Name: name}
+				}
+			}
+		}
+		f.Close()
+	}
+	if f, err := os.Open("/proc/net/arp"); err == nil {
+		sc := bufio.NewScanner(f)
+		sc.Scan()
+		for sc.Scan() {
+			x := strings.Fields(sc.Text())
+			if len(x) >= 6 && strings.HasPrefix(x[5], "br") {
+				m, err := config.NormalizeMAC(x[3])
+				if err != nil || m == "00:00:00:00:00:00" {
+					continue
+				}
+				if _, ok := byMAC[m]; !ok {
+					byMAC[m] = &Client{MAC: m, IP: x[0]}
+				}
+			}
+		}
+		f.Close()
+	}
+	out := make([]Client, 0, len(byMAC))
+	for _, c := range byMAC {
+		out = append(out, *c)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := net.ParseIP(out[i].IP), net.ParseIP(out[j].IP)
+		if a != nil && b != nil {
+			return strings.Compare(string(a.To16()), string(b.To16())) < 0
+		}
+		return out[i].IP < out[j].IP
+	})
+	return out
+}
+
+// LeakCheck is a router-side audit of leak protections.
+type LeakCheck struct {
+	Policy string   `json:"policy"`
+	OK     []string `json:"ok"`
+	Warn   []string `json:"warn"`
+}
+
+// LeakChecks audits each policy's protections against the live state.
+func (e *Engine) LeakChecks() []LeakCheck {
+	cfg := e.Config()
+	st := e.Status()
+	byID := map[int]PolicyStatus{}
+	for _, p := range st.Policies {
+		byID[p.ID] = p
+	}
+	var out []LeakCheck
+	for _, p := range cfg.Policies {
+		if !p.Enabled {
+			continue
+		}
+		ps := byID[p.ID]
+		lc := LeakCheck{Policy: p.Name}
+		ok := func(f string, a ...any) { lc.OK = append(lc.OK, fmt.Sprintf(f, a...)) }
+		warn := func(f string, a ...any) { lc.Warn = append(lc.Warn, fmt.Sprintf(f, a...)) }
+		switch {
+		case ps.Active != "":
+			ok("routed via %s", ps.Active)
+		case ps.KillEngaged:
+			warn("no healthy tunnel: kill switch engaged (traffic blocked)")
+		default:
+			warn("no healthy tunnel and kill switch off: traffic is using WAN")
+		}
+		if p.ExpectedCountry != "" && ps.Active != "" {
+			if ps.Country == p.ExpectedCountry {
+				ok("exit country %s matches", ps.Country)
+			} else if ps.Country == "" {
+				warn("exit country unknown (geo lookup failed)")
+			}
+		}
+		if len(p.Domains) > 0 {
+			if p.Leak.HijackDNS {
+				ok("hardcoded DNS (port 53) redirected to router")
+			} else {
+				warn("DNS hijack off: devices with hardcoded DNS bypass the domain sets")
+			}
+			if p.Leak.BlockDoH {
+				ok("known DoH resolvers blocked")
+			} else {
+				warn("DoH not blocked: browsers/apps with DoH bypass the domain sets")
+			}
+			if p.Leak.BlockDoT {
+				ok("DoT/DoQ (853) blocked")
+			} else {
+				warn("DoT not blocked (Android Private DNS bypasses the domain sets)")
+			}
+			if p.Leak.DNSViaTunnel {
+				ok("policy domains resolved by %s through the tunnel (CDN picks servers near the exit)", p.Leak.DNSServer)
+			} else {
+				warn("policy domains resolved via WAN DNS: CDNs may pick servers near your real location")
+			}
+		}
+		switch ps.IPv6Mode {
+		case netfilter.V6Route:
+			ok("IPv6 routed through tunnel")
+		case netfilter.V6Block:
+			ok("IPv6 blocked for policy traffic")
+		default:
+			if st.Caps.IPv6 {
+				warn("IPv6 protection off: IPv6 traffic may leak")
+			} else {
+				ok("router has no IPv6")
+			}
+		}
+		switch ps.WebRTCMode {
+		case netfilter.RTCQueue:
+			ok("WebRTC tracked (STUN learning via NFQUEUE)")
+		case netfilter.RTCPorts:
+			warn("WebRTC tracked in fallback mode (NFQUEUE unavailable: only STUN/TURN ports during sessions)")
+		default:
+			if p.Scope() == "whole-device" {
+				ok("whole device routed: WebRTC included")
+			} else {
+				warn("WebRTC tracking off: peer-to-peer media of this service uses WAN")
+			}
+		}
+		if ps.Sets[netfilter.SetName(p.ID, netfilter.KindDomain, false)] == 0 && len(p.Domains) > 0 {
+			warn("domain set empty: no client has resolved these domains through the router yet")
+		}
+		out = append(out, lc)
+	}
+	return out
+}

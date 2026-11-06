@@ -1,0 +1,31 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...
+      - name: Integration test (real iptables/ipset in a netns)
+        run: |
+          sudo apt-get install -y ipset
+          sudo SNAKE_INTEGRATION=1 unshare -n env "PATH=$PATH" "HOME=$HOME" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)" \
+            go test -count=1 -tags integration ./internal/engine -run Integration -v
+      - run: make arm64 armv7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snake-binaries
+          path: dist/

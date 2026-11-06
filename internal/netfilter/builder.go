@@ -1,0 +1,332 @@
+package netfilter
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/irisariuan/snake/internal/config"
+)
+
+// IPv6 effective modes.
+const (
+	V6Route = "route" // mark + route via tunnel
+	V6Block = "block" // mark + reject
+	V6Off   = "off"   // untouched
+)
+
+// WebRTC effective modes.
+const (
+	RTCQueue = "queue" // NFQUEUE STUN learning
+	RTCPorts = "ports" // fallback: STUN/TURN ports during session window
+	RTCOff   = "off"
+)
+
+// PolicyState is a policy plus its runtime decisions.
+type PolicyState struct {
+	Policy       config.Policy
+	MACs         []string // resolved device MACs (groups expanded)
+	ActiveTunnel string   // "" when no tunnel is usable
+	IPv6Mode     string   // V6Route / V6Block / V6Off
+	WebRTCMode   string   // RTCQueue / RTCPorts / RTCOff
+}
+
+// Options describe router capabilities and existing state.
+type Options struct {
+	IPv6    bool
+	IPv6NAT bool
+	// Existing chain names per "family/table" key (e.g. "4/mangle"); chains
+	// that are no longer generated get deleted.
+	Existing map[string][]string
+}
+
+// Plan is a set of iptables-restore payloads keyed by "family/table".
+type Plan struct {
+	Restore map[string]string
+	// Hooks are the jumps from built-in chains to snake chains.
+	Hooks []Hook
+}
+
+// Hook is a jump from a built-in chain.
+type Hook struct {
+	V6    bool
+	Table string
+	Chain string
+	Args  []string
+}
+
+// Tables is the ordered list of family/table keys.
+var Tables = []string{"4/mangle", "4/nat", "4/filter", "6/mangle", "6/nat", "6/filter"}
+
+type table struct {
+	chains []string
+	seen   map[string]bool
+	rules  []string
+}
+
+func (t *table) chain(name string) {
+	if t.seen == nil {
+		t.seen = map[string]bool{}
+	}
+	if !t.seen[name] {
+		t.seen[name] = true
+		t.chains = append(t.chains, name)
+	}
+}
+
+func (t *table) add(chain string, args ...string) {
+	t.rules = append(t.rules, "-A "+chain+" "+strings.Join(args, " "))
+}
+
+func (t *table) render(name string, existing []string) string {
+	var b strings.Builder
+	b.WriteString("*" + name + "\n")
+	for _, c := range t.chains {
+		b.WriteString(":" + c + " - [0:0]\n")
+	}
+	var stale []string
+	for _, c := range existing {
+		if !t.seen[c] {
+			// Declaring flushes it under --noflush; then delete it.
+			b.WriteString(":" + c + " - [0:0]\n")
+			stale = append(stale, c)
+		}
+	}
+	for _, r := range t.rules {
+		b.WriteString(r + "\n")
+	}
+	sort.Strings(stale)
+	for _, c := range stale {
+		b.WriteString("-X " + c + "\n")
+	}
+	b.WriteString("COMMIT\n")
+	return b.String()
+}
+
+func hex(v uint32) string { return fmt.Sprintf("0x%x", v) }
+
+// Build generates the complete ruleset for all enabled policies.
+func Build(s config.Settings, states []PolicyState, opt Options) Plan {
+	plan := Plan{Restore: map[string]string{}}
+	families := []bool{false}
+	if opt.IPv6 {
+		families = append(families, true)
+	}
+	for _, v6 := range families {
+		fam := "4"
+		if v6 {
+			fam = "6"
+		}
+		mangle, nat, filter := buildFamily(s, states, v6, opt)
+		plan.Restore[fam+"/mangle"] = mangle.render("mangle", opt.Existing[fam+"/mangle"])
+		plan.Restore[fam+"/filter"] = filter.render("filter", opt.Existing[fam+"/filter"])
+		if !v6 || opt.IPv6NAT {
+			plan.Restore[fam+"/nat"] = nat.render("nat", opt.Existing[fam+"/nat"])
+		}
+		lan := s.LANInterfaces
+		plan.Hooks = append(plan.Hooks,
+			Hook{V6: v6, Table: "mangle", Chain: "PREROUTING", Args: []string{"-i", lan, "-j", ChainMain}},
+			Hook{V6: v6, Table: "mangle", Chain: "FORWARD", Args: []string{"-j", ChainMSS}},
+			Hook{V6: v6, Table: "filter", Chain: "FORWARD", Args: []string{"-j", ChainFwd}},
+		)
+		if !v6 || opt.IPv6NAT {
+			plan.Hooks = append(plan.Hooks,
+				Hook{V6: v6, Table: "nat", Chain: "PREROUTING", Args: []string{"-i", lan, "-j", ChainDNS}},
+				Hook{V6: v6, Table: "nat", Chain: "POSTROUTING", Args: []string{"-j", ChainNAT}},
+			)
+		}
+	}
+	return plan
+}
+
+func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) (mangle, nat, filter *table) {
+	mangle, nat, filter = &table{}, &table{}, &table{}
+	mask := hex(s.MarkMask)
+	lan := s.LANInterfaces
+	for _, c := range []string{ChainMain, ChainSave, ChainRTC, ChainMSS} {
+		mangle.chain(c)
+	}
+	nat.chain(ChainDNS)
+	nat.chain(ChainNAT)
+	filter.chain(ChainFwd)
+
+	private := PrivateV4
+	reject := "icmp-port-unreachable"
+	if v6 {
+		private = PrivateV6
+		reject = "icmp6-port-unreachable"
+	}
+
+	// Connection affinity: restore the policy mark of an existing connection,
+	// and stop processing anything that already carries a policy mark.
+	mangle.add(ChainSave, "-j CONNMARK --save-mark --nfmask", mask, "--ctmask", mask)
+	mangle.add(ChainMain, "-m mark --mark 0/"+mask, "-j CONNMARK --restore-mark --nfmask", mask, "--ctmask", mask)
+	mangle.add(ChainMain, "-m mark ! --mark 0/"+mask, "-g", ChainSave)
+	mangle.add(ChainMain, "-d", strings.Join(private, ","), "-j RETURN")
+	mangle.add(ChainRTC, "-m mark ! --mark 0/"+mask, "-j RETURN")
+
+	tunnels := map[string]bool{}
+	type scope struct {
+		global bool
+		macs   map[string]bool
+	}
+	scopes := map[string]*scope{} // leak feature -> scope
+	addScope := func(feature string, st PolicyState) {
+		sc := scopes[feature]
+		if sc == nil {
+			sc = &scope{macs: map[string]bool{}}
+			scopes[feature] = sc
+		}
+		if len(st.MACs) == 0 {
+			sc.global = true
+		}
+		for _, m := range st.MACs {
+			sc.macs[m] = true
+		}
+	}
+
+	for _, st := range states {
+		p := st.Policy
+		if !p.Enabled {
+			continue
+		}
+		if v6 && st.IPv6Mode == V6Off {
+			continue
+		}
+		for _, t := range p.Tunnels {
+			tunnels[config.TunnelInterface(t)] = true
+		}
+		id := p.ID
+		mark := hex(s.PolicyMark(id))
+		pc, mc := PolicyChain(id), MarkChain(id)
+		mangle.chain(pc)
+		mangle.chain(mc)
+		mangle.add(mc, "-j MARK --set-xmark", mark+"/"+mask)
+		mangle.add(mc, "-g", ChainSave)
+
+		dsets := []string{}
+		if len(p.Domains) > 0 {
+			dsets = append(dsets, SetName(id, KindDomain, v6))
+		}
+		if len(p.ASNs)+len(p.CIDRs) > 0 {
+			dsets = append(dsets, SetName(id, KindNet, v6))
+		}
+		macMatch := func(m string) string { return "-m mac --mac-source " + m }
+
+		// Session refresh for WebRTC tracking: a NEW connection from a client
+		// to a policy destination (re)opens that client's session window.
+		if st.WebRTCMode != RTCOff && len(dsets) > 0 {
+			sess := SetName(id, KindSession, v6)
+			for _, ds := range dsets {
+				base := "-m conntrack --ctstate NEW -m set --match-set " + ds + " dst"
+				if len(st.MACs) == 0 {
+					mangle.add(ChainMain, base, "-j SET --add-set", sess, "src --exist")
+				}
+				for _, m := range st.MACs {
+					mangle.add(ChainMain, macMatch(m), base, "-j SET --add-set", sess, "src --exist")
+				}
+			}
+		}
+
+		mangle.add(ChainMain, "-j", pc)
+		mangle.add(pc, "-m mark ! --mark 0/"+mask, "-j RETURN")
+		switch {
+		case len(st.MACs) > 0 && len(dsets) == 0: // whole device
+			for _, m := range st.MACs {
+				mangle.add(pc, macMatch(m), "-g", mc)
+			}
+		case len(st.MACs) > 0: // device + destination
+			for _, m := range st.MACs {
+				for _, ds := range dsets {
+					mangle.add(pc, macMatch(m), "-m set --match-set", ds, "dst -g", mc)
+				}
+			}
+		default: // destination only
+			for _, ds := range dsets {
+				mangle.add(pc, "-m set --match-set", ds, "dst -g", mc)
+			}
+		}
+
+		// WebRTC: learned peers are routed only for clients inside a session window.
+		if st.WebRTCMode != RTCOff && len(dsets) > 0 {
+			sess := SetName(id, KindSession, v6)
+			peers := SetName(id, KindPeer, v6)
+			mangle.add(pc, "-p udp -m set --match-set", sess, "src -m set --match-set", peers, "dst -g", mc)
+			switch st.WebRTCMode {
+			case RTCQueue:
+				q := fmt.Sprint(s.QueueBase + id)
+				mangle.add(ChainRTC, "-p udp -m conntrack --ctstate NEW -m set --match-set", sess,
+					"src -j NFQUEUE --queue-num", q, "--queue-bypass")
+			case RTCPorts:
+				mangle.add(pc, "-p udp -m multiport --dports", s.STUNPorts, "-m set --match-set", sess, "src -g", mc)
+			}
+		}
+
+		// IPv6 block: policy traffic that cannot be carried over IPv6 is rejected
+		// so clients fall back to IPv4 (which goes through the tunnel).
+		if v6 && st.IPv6Mode == V6Block {
+			filter.add(ChainFwd, "-m mark --mark", mark+"/"+mask, "-p tcp -j REJECT --reject-with tcp-reset")
+			filter.add(ChainFwd, "-m mark --mark", mark+"/"+mask, "-j REJECT --reject-with icmp6-adm-prohibited")
+		}
+
+		l := p.Leak
+		if l.HijackDNS {
+			addScope("dns", st)
+		}
+		if l.BlockDoT {
+			addScope("dot", st)
+		}
+		if l.BlockDoH {
+			addScope("doh", st)
+		}
+		if l.BlockQUIC {
+			addScope("quic", st)
+		}
+	}
+	mangle.add(ChainMain, "-j", ChainRTC)
+
+	// Leak protection, scoped to the devices of the policies that asked for it
+	// (or the whole LAN for destination-only policies).
+	forScope := func(t *table, chain, feature string, args ...string) {
+		sc := scopes[feature]
+		if sc == nil {
+			return
+		}
+		if sc.global {
+			t.add(chain, append([]string{"-i", lan}, args...)...)
+			return
+		}
+		macs := make([]string, 0, len(sc.macs))
+		for m := range sc.macs {
+			macs = append(macs, m)
+		}
+		sort.Strings(macs)
+		for _, m := range macs {
+			t.add(chain, append([]string{"-i", lan, "-m mac --mac-source", m}, args...)...)
+		}
+	}
+	forScope(nat, ChainDNS, "dns", "-p udp --dport 53 -j REDIRECT --to-ports 53")
+	forScope(nat, ChainDNS, "dns", "-p tcp --dport 53 -j REDIRECT --to-ports 53")
+	forScope(filter, ChainFwd, "dot", "-p tcp --dport 853 -j REJECT --reject-with tcp-reset")
+	forScope(filter, ChainFwd, "dot", "-p udp --dport 853 -j REJECT --reject-with", reject)
+	doh := DoHSet4
+	if v6 {
+		doh = DoHSet6
+	}
+	forScope(filter, ChainFwd, "doh", "-p tcp --dport 443 -m set --match-set", doh, "dst -j REJECT --reject-with tcp-reset")
+	forScope(filter, ChainFwd, "doh", "-p udp --dport 443 -m set --match-set", doh, "dst -j REJECT --reject-with", reject)
+	forScope(filter, ChainFwd, "quic", "-p udp --dport 443 -j REJECT --reject-with", reject)
+
+	ifaces := make([]string, 0, len(tunnels))
+	for t := range tunnels {
+		ifaces = append(ifaces, t)
+	}
+	sort.Strings(ifaces)
+	for _, ifc := range ifaces {
+		mangle.add(ChainMSS, "-o", ifc, "-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu")
+		nat.add(ChainNAT, "-o", ifc, "-m mark ! --mark 0/"+mask, "-j MASQUERADE")
+		filter.add(ChainFwd, "-i", lan, "-o", ifc, "-m mark ! --mark 0/"+mask, "-j ACCEPT")
+		filter.add(ChainFwd, "-i", ifc, "-o", lan, "-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT")
+	}
+	return mangle, nat, filter
+}

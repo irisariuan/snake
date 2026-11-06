@@ -1,0 +1,195 @@
+//go:build integration
+
+// Integration test: applies real iptables/ipset/ip state inside a throwaway
+// network namespace. Run as root:
+//
+//	unshare -n go test -tags integration ./internal/engine -run Integration -v
+package engine
+
+import (
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/irisariuan/snake/internal/config"
+	"github.com/irisariuan/snake/internal/health"
+	"github.com/irisariuan/snake/internal/system"
+	"github.com/irisariuan/snake/internal/webrtc"
+)
+
+// fakeMerlin intercepts router-only tools and runs everything else for real.
+type fakeMerlin struct{ real system.Exec }
+
+func (f fakeMerlin) Run(name string, args ...string) (string, error) {
+	return f.RunInput("", name, args...)
+}
+
+func (f fakeMerlin) RunInput(in, name string, args ...string) (string, error) {
+	switch name {
+	case "nvram":
+		if len(args) == 2 && args[1] == "ipv6_service" {
+			return "native", nil
+		}
+		if len(args) == 2 && strings.HasSuffix(args[1], "_state") {
+			return "2", nil
+		}
+		return "", nil
+	case "service", "modprobe", "conntrack":
+		return "", nil
+	case "wg":
+		return "peerkey\t" + strconv.FormatInt(time.Now().Unix(), 10), nil
+	}
+	return f.real.RunInput(in, name, args...)
+}
+
+func sh(t *testing.T, cmd string) string {
+	t.Helper()
+	out, err := exec.Command("sh", "-c", cmd).CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s: %v\n%s", cmd, err, out)
+	}
+	return string(out)
+}
+
+func TestIntegrationApply(t *testing.T) {
+	if os.Getuid() != 0 || os.Getenv("SNAKE_INTEGRATION") == "" {
+		t.Skip("set SNAKE_INTEGRATION=1 and run as root inside `unshare -n`")
+	}
+	sh(t, "ip link add br0 type bridge && ip link set br0 up")
+	for _, i := range []string{"wgc1", "wgc2", "wgc3", "tun12"} {
+		sh(t, "ip tuntap add mode tun dev "+i+" && ip link set "+i+" up")
+	}
+	_, err := os.Stat("/proc/net/if_inet6")
+	v6 := err == nil
+	sh(t, "ip addr add 10.2.0.2/32 dev wgc1")
+	if v6 {
+		sh(t, "ip -6 addr add 2001:db8::2/128 dev wgc1")
+	} else {
+		t.Log("kernel without IPv6: skipping IPv6 checks")
+	}
+
+	dir := t.TempDir()
+	b, _ := os.ReadFile("../../testdata/config.json")
+	var c config.Config
+	if err := json.Unmarshal(b, &c); err != nil {
+		t.Fatal(err)
+	}
+	c.ApplyDefaults()
+	c.Normalize()
+	if err := config.Save(filepath.Join(dir, "config.json"), &c); err != nil {
+		t.Fatal(err)
+	}
+	p := DefaultPaths(dir)
+	e := New(p, fakeMerlin{})
+	if err := e.Load(); err != nil {
+		t.Fatal(err)
+	}
+	e.DetectCaps()
+	e.SeedHealth()
+	e.decide()
+	if err := e.Apply("integration"); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if err := e.Apply("integration (idempotent)"); err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+
+	save := sh(t, "iptables-save")
+	for _, s := range []string{"-A PREROUTING -i br+ -j SNAKE", "-A SNAKE_P1 -m set --match-set SNK_1_d4 dst -g SNAKE_M1", ":SNAKE_P3", "-A FORWARD -j SNAKE_FWD"} {
+		if !strings.Contains(save, s) {
+			t.Errorf("iptables-save missing %q", s)
+		}
+	}
+	if n := strings.Count(save, "-A PREROUTING -i br+ -j SNAKE\n"); n != 1 {
+		t.Errorf("hook installed %d times", n)
+	}
+	rules := sh(t, "ip -4 rule show")
+	for _, s := range []string{"5201:", "5202:", "5203:", "5001:", "4981:"} {
+		if !strings.Contains(rules, s) {
+			t.Errorf("ip rule missing %s:\n%s", s, rules)
+		}
+	}
+	if n := strings.Count(rules, "5201:"); n != 1 {
+		t.Errorf("rule 5201 present %d times", n)
+	}
+	if r := sh(t, "ip -4 route show table 1001"); !strings.Contains(r, "default dev wgc1") {
+		t.Errorf("table 1001: %s", r)
+	}
+	if r := sh(t, "ip -6 route show table 1001 || true"); v6 && !strings.Contains(r, "default dev wgc1") {
+		t.Errorf("v6 table 1001 (tunnel has IPv6): %s", r)
+	}
+	sets := sh(t, "ipset list -n")
+	for _, s := range []string{"SNK_1_d4", "SNK_1_n4", "SNK_1_s4", "SNK_1_r4", "SNK_2_d4", "SNK_DOH4"} {
+		if !strings.Contains(sets, s) {
+			t.Errorf("missing set %s", s)
+		}
+	}
+	if !strings.Contains(sh(t, "ipset list SNK_1_n4"), "23.246.0.0/18") {
+		t.Error("CIDR not loaded")
+	}
+
+	// Failover: wgc1 dies -> policy 1 moves to ovpnc2 (tun12).
+	e.mon.Set(health.Status{Tunnel: "wgc1", Iface: "wgc1", Exists: true, Up: true, Reason: "probe failed 3 times"})
+	e.mon.Set(health.Status{Tunnel: "ovpnc2", Iface: "tun12", Exists: true, Up: true, LinkOK: true, ProbeOK: true, Healthy: true, HealthySince: time.Now()})
+	if ch := e.decide(); len(ch) != 1 || ch[0] != 1 {
+		t.Fatalf("decide changed = %v", ch)
+	}
+	if err := e.Apply("failover"); err != nil {
+		t.Fatal(err)
+	}
+	if r := sh(t, "ip -4 route show table 1001"); !strings.Contains(r, "default dev tun12") {
+		t.Errorf("after failover table 1001: %s", r)
+	}
+	if v6 {
+		if r := sh(t, "ip -6 route show table 1001"); !strings.Contains(r, "unreachable default") {
+			t.Errorf("v6 after failover to v4-only tunnel should be unreachable: %s", r)
+		}
+		if !strings.Contains(sh(t, "ip6tables-save -t filter"), "-A SNAKE_FWD -m mark --mark 0x10000/0xff0000 -j REJECT") {
+			t.Error("v6 block rule not installed after failover to v4-only tunnel")
+		}
+	}
+
+	// Everything down -> kill switch (policy 1) vs fall-through (policy 2).
+	for k := range e.mon.Snapshot() {
+		e.mon.Set(health.Status{Tunnel: k, Reason: "interface down"})
+	}
+	e.decide()
+	if err := e.Apply("all down"); err != nil {
+		t.Fatal(err)
+	}
+	if r := sh(t, "ip -4 route show table 1001"); !strings.Contains(r, "unreachable default") {
+		t.Errorf("kill switch: %s", r)
+	}
+	if r := sh(t, "ip -4 route show table 1002"); strings.TrimSpace(r) != "" {
+		t.Errorf("no-kill policy should fall through to main: %q", r)
+	}
+
+	// Remove a policy -> its chains, rules and sets disappear.
+	c2 := e.Config()
+	c2.Policies = c2.Policies[:1]
+	if err := e.SetConfig(c2); err != nil {
+		t.Fatal(err)
+	}
+	save = sh(t, "iptables-save")
+	if strings.Contains(save, "SNAKE_P2") || strings.Contains(save, "SNAKE_P3") {
+		t.Error("stale chains left behind")
+	}
+	if strings.Contains(sh(t, "ip -4 rule show"), "5202:") {
+		t.Error("stale rule left behind")
+	}
+	if strings.Contains(sh(t, "ipset list -n"), "SNK_2_") {
+		t.Error("stale sets left behind")
+	}
+	if e.caps.NFQueue {
+		if err := e.rtc.Configure([]webrtc.PolicyTrack{{ID: 1, Queue: 4201, Mark: 0x10000}}, true); err != nil {
+			t.Errorf("nfqueue listener: %v", err)
+		}
+		e.rtc.Stop()
+	}
+	t.Logf("plan:\n%s", e.Plan().Restore["4/mangle"])
+}
