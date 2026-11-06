@@ -89,3 +89,34 @@ func TestDisableEnable(t *testing.T) {
 		t.Fatalf("enable should re-apply: %v", err)
 	}
 }
+
+func TestDoHSetHoldsOnlyResolverAddresses(t *testing.T) {
+	dir := t.TempDir()
+	c := config.Default()
+	c.Policies = []config.Policy{{Name: "p", Enabled: true, Tunnels: []string{"wgc1"}, Domains: []string{"example.com"},
+		Leak: config.Leak{BlockDoH: true, IPv6: "off", WebRTC: "off"}}}
+	c.Normalize()
+	if err := config.Save(filepath.Join(dir, "config.json"), c); err != nil {
+		t.Fatal(err)
+	}
+	rec := &system.Recorder{}
+	e := New(DefaultPaths(dir), rec)
+	e.DryRun = true
+	if err := e.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Apply("test"); err != nil {
+		t.Fatal(err)
+	}
+	// Replaced (flush + exact members), so addresses learned by older
+	// versions, such as Google front ends, are dropped.
+	var restore string
+	for _, cmd := range rec.Commands {
+		if strings.Contains(cmd, "ipset -exist restore") && strings.Contains(cmd, "SNK_DOH4") {
+			restore = cmd
+		}
+	}
+	if restore == "" || !strings.Contains(restore, "flush SNK_DOH4") || !strings.Contains(restore, "add SNK_DOH4_t 8.8.8.8") {
+		t.Fatalf("DoH set not replaced with the resolver list:\n%v", rec.Commands)
+	}
+}

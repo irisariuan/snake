@@ -258,7 +258,7 @@ snake rules export --policy "Netflix US" --expand
 |---|---|
 | Resolve via tunnel | `server=/domain/<resolver>` in dnsmasq, and an `ip rule` sends the router's queries to that resolver through the policy's tunnel. CDNs then pick servers near the VPN exit, not near you. The router can talk to the resolver in plain DNS, **DNS over TLS** or **DNS over HTTPS** (see below). |
 | Hijack DNS | Redirects port 53 from scoped clients to the router, so devices with hardcoded DNS (e.g. `8.8.8.8`) are still seen by dnsmasq. |
-| Block DoH | Rejects TCP/UDP 443 to known DoH resolvers (static list plus dnsmasq-learned addresses of DoH hostnames). Also answers the Firefox and iCloud Private Relay canary domains with NXDOMAIN (network-wide, Settings → *DoH canary*). |
+| Block DoH | Rejects TCP/UDP 443 to the dedicated addresses of known DoH resolvers (8.8.8.8, 1.1.1.1, Quad9, AdGuard, NextDNS, ...). When DoH is blocked for the whole LAN (a destination-only policy, or Settings → *Always*), DoH hostnames such as `dns.google` also get NXDOMAIN from dnsmasq, so browsers fall back to normal DNS. Addresses are never learned from DNS answers: names like `dns.google.com` share addresses with ordinary Google sites, and blocking those cut Google downloads. Also answers the Firefox and iCloud Private Relay canary domains with NXDOMAIN (network-wide, Settings → *DoH canary*). |
 | Block DoT | Rejects port 853 (DoT/DoQ), so Android "Private DNS" falls back to normal DNS. |
 | Block QUIC | Rejects UDP 443 (optional). |
 | IPv6 | *tunnel*: route IPv6 through the tunnel if it has IPv6, else reject IPv6 policy traffic so clients fall back to IPv4. *block*: always reject. *off*: untouched. |

@@ -250,6 +250,24 @@ func (c *Config) DoHBlockedAnywhere() bool {
 	return false
 }
 
+// DoHBlockedLANWide is whether DoH is blocked for every LAN device (by
+// Settings, or by a destination-only policy). DoH hostnames are then
+// blocked in DNS, which applies to the whole LAN.
+func (c *Config) DoHBlockedLANWide() bool {
+	switch c.Settings.BlockDoH {
+	case BlockAlways:
+		return true
+	case BlockNever:
+		return false
+	}
+	for _, p := range c.Policies {
+		if p.Enabled && p.Leak.BlockDoH && len(c.ResolveDevices(p)) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // Config is the root document.
 type Config struct {
 	Version   int        `json:"version"`

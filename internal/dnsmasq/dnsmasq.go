@@ -63,9 +63,18 @@ func Generate(c *config.Config, inspector bool) string {
 		}
 	}
 	if anyDoH {
-		b.WriteString("# DoH resolvers\n")
-		for _, part := range chunks(netfilter.DefaultDoHDomains) {
-			fmt.Fprintf(&b, "ipset=/%s/%s,%s\n", strings.Join(part, "/"), netfilter.DoHSet4, netfilter.DoHSet6)
+		// DoH hostnames are refused in DNS rather than their answers being
+		// added to the DoH block set: several share addresses with ordinary
+		// sites (dns.google.com is served by Google's web front ends), and
+		// blocking by those addresses cut Google downloads mid-stream. The
+		// block set holds only dedicated resolver addresses. DNS answers
+		// reach every device, so this is only done when DoH is blocked for
+		// the whole LAN; device-scoped policies block the addresses only.
+		if c.DoHBlockedLANWide() {
+			b.WriteString("# DoH resolvers: NXDOMAIN, so clients fall back to normal DNS\n")
+			for _, part := range chunks(netfilter.DefaultDoHDomains) {
+				fmt.Fprintf(&b, "local=/%s/\n", strings.Join(part, "/"))
+			}
 		}
 		if c.Settings.DoHCanary {
 			b.WriteString("# canaries: NXDOMAIN tells Firefox / iCloud Private Relay to stand down\n")

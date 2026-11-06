@@ -23,7 +23,7 @@ func TestGenerate(t *testing.T) {
 	for _, s := range []string{
 		"ipset=/netflix.com/nflxvideo.net/SNK_1_d4,SNK_1_d6",
 		"server=/netflix.com/nflxvideo.net/9.9.9.9",
-		"SNK_DOH4,SNK_DOH6",
+		"local=/dns.google/dns.google.com/",
 		"local=/use-application-dns.net/",
 	} {
 		if !strings.Contains(out, s) {
@@ -118,7 +118,28 @@ func TestGenerateEncryptedUpstream(t *testing.T) {
 	}
 	// DoH blocking from Settings alone fills the DoH set.
 	c.Settings.BlockDoH = config.BlockAlways
-	if !strings.Contains(Generate(c, true), "SNK_DOH4") {
-		t.Error("block_doh=always did not fill the DoH set")
+	if !strings.Contains(Generate(c, true), "local=/dns.google/") {
+		t.Error("block_doh=always did not block DoH hostnames")
+	}
+}
+
+func TestDoHHostnamesNotLearned(t *testing.T) {
+	// DoH hostnames such as dns.google.com share addresses with ordinary
+	// sites: their answers must never feed the DoH block set.
+	c := config.Default()
+	c.Policies = []config.Policy{{ID: 1, Name: "lan", Enabled: true, Domains: []string{"netflix.com"}, Leak: config.Leak{BlockDoH: true}}}
+	if out := Generate(c, true); strings.Contains(out, "SNK_DOH") {
+		t.Errorf("DoH answers added to the block set:\n%s", out)
+	}
+	// Device-scoped policies only: DNS answers reach every device, so DoH
+	// hostnames stay resolvable (the dedicated resolver addresses are
+	// still blocked for those devices by the firewall).
+	c.Policies[0].Devices = []string{"aa:bb:cc:00:00:01"}
+	if out := Generate(c, true); strings.Contains(out, "local=/dns.google/") {
+		t.Errorf("device-scoped DoH blocking refused DoH hostnames LAN-wide:\n%s", out)
+	}
+	c.Settings.BlockDoH = config.BlockNever
+	if out := Generate(c, true); strings.Contains(out, "dns.google") || strings.Contains(out, "use-application-dns") {
+		t.Errorf("block_doh=never still blocks:\n%s", out)
 	}
 }

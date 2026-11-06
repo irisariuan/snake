@@ -471,9 +471,12 @@ func (e *Engine) Apply(reason string) error {
 	}
 	v4, v6 := netfilter.SplitFamilies(netfilter.DefaultDoHIPs)
 	_, v6b := netfilter.SplitFamilies(netfilter.DefaultDoHIPv6)
-	_ = ips.AddMany(netfilter.DoHSet4, v4)
+	// Replace, not add: the DoH sets hold exactly the dedicated resolver
+	// addresses. (Older versions also added DNS answers for DoH hostnames,
+	// which included shared Google front-end addresses.)
+	e.replaceIfChanged(ips, netfilter.SetSpec{Name: netfilter.DoHSet4, Type: "hash:net"}, v4, &errs)
 	if caps.IPv6 {
-		_ = ips.AddMany(netfilter.DoHSet6, append(v6, v6b...))
+		e.replaceIfChanged(ips, netfilter.SetSpec{Name: netfilter.DoHSet6, Type: "hash:net", V6: true}, append(v6, v6b...), &errs)
 	}
 	for _, st := range states {
 		p := st.Policy
