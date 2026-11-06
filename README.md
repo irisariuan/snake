@@ -96,6 +96,12 @@ One rule per line:
 | `com` | rejected: a bare top-level domain would route everything (`**.com` if you really mean it) |
 | `# comment` | ignored; a trailing ` # comment` is allowed too (except in regexes) |
 
+* **Connections keep their route.** Only new connections are matched against
+  policies. A connection that started on WAN stays on WAN when its
+  destination later joins a policy set (shared CDN addresses are answered for
+  many names), because moving it would send its WAN NAT binding into the
+  tunnel and stall it. The next connection to that address follows the
+  policy. Failover clears policy connections so they move to the new tunnel.
 * **Exclusions** veto a policy for that answer. A later policy can still match it.
 * **Drop rules** block instead of route. DNS still answers, but the answered
   addresses go into the policy's drop set (`SNK_<id>_x4/6`; `drop:asn:` and

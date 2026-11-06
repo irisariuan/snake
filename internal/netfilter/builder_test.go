@@ -46,6 +46,7 @@ func TestBuild(t *testing.T) {
 	mustContain(t, m4,
 		"-A SNAKE -m mark --mark 0/0xff0000 -j CONNMARK --restore-mark --nfmask 0xff0000 --ctmask 0xff0000",
 		"-A SNAKE -m mark ! --mark 0/0xff0000 -g SNAKE_SAVE",
+		"-A SNAKE -m mark --mark 0/0xff0000 -m conntrack ! --ctstate NEW -j RETURN",
 		"-A SNAKE_M1 -j MARK --set-xmark 0x10000/0xff0000",
 		"-A SNAKE_P1 -m set --match-set SNK_1_d4 dst -g SNAKE_M1",
 		"-A SNAKE_P1 -m set --match-set SNK_1_n4 dst -g SNAKE_M1",

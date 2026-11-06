@@ -173,6 +173,13 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 	mangle.add(ChainMain, "-m mark --mark 0/"+mask, "-j CONNMARK --restore-mark --nfmask", mask, "--ctmask", mask)
 	mangle.add(ChainMain, "-m mark ! --mark 0/"+mask, "-g", ChainSave)
 	mangle.add(ChainMain, "-d", strings.Join(private, ","), "-j RETURN")
+	// A connection keeps the route it started with. One that began on WAN
+	// (no policy mark) must not move into a tunnel when its destination
+	// joins a policy set later (e.g. a CDN address shared with a policy
+	// domain): its NAT binding is WAN's, so in the tunnel it would stall.
+	// Only new connections are matched against policies; failover clears
+	// the conntrack entries it needs to move.
+	mangle.add(ChainMain, "-m mark --mark 0/"+mask, "-m conntrack ! --ctstate NEW -j RETURN")
 	mangle.add(ChainRTC, "-m mark ! --mark 0/"+mask, "-j RETURN")
 
 	tunnels := map[string]bool{}
