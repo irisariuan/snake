@@ -131,9 +131,12 @@ func (d *dot) exchange(ctx context.Context, q []byte) ([]byte, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		var c *tls.Conn
 		fresh := false
-		select {
-		case c = <-d.pool:
-		default:
+		// A retry must not consume another stale idle entry.
+		if attempt == 0 {
+			select {
+			case c = <-d.pool:
+			default:
+			}
 		}
 		if c == nil {
 			var err error

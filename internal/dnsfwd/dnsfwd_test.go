@@ -180,6 +180,24 @@ func TestDoT(t *testing.T) {
 	if st.Queries != 3 || st.Errors != 0 {
 		t.Fatalf("stats %+v", st)
 	}
+	// Several stale idle entries must not consume both attempts: after
+	// the first failure, the query must succeed on a fresh connection.
+	d := m.srvs[1].ex.(*dot)
+	for len(d.pool) > 0 {
+		old := <-d.pool
+		old.Close()
+	}
+	for i := 0; i < 3; i++ {
+		client, peer := net.Pipe()
+		stale := tls.Client(client, tlsConfig(d.up))
+		client.Close()
+		peer.Close()
+		d.pool <- stale
+	}
+	checkAnswer(t, exchangeUDP(t, listen, query(100, "after-idle.example.com.")), 100)
+	if n := conns.Load(); n != 2 {
+		t.Errorf("stale pool recovery used %d connections, want 2 total", n)
+	}
 }
 
 func TestDoH(t *testing.T) {
