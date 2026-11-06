@@ -803,10 +803,10 @@ func LocalResolver() *net.Resolver {
 }
 
 // migrateMarks saves a configuration whose mark mask Load moved and drops
-// connections still carrying marks in the old bits: under the new mask they
-// would lose their route, and the old bits are Adaptive QoS categories.
+// connections still carrying marks in the old bits, so they do not keep
+// those bits and reconnect on the new marks.
 func (e *Engine) migrateMarks(c *config.Config, old uint32) {
-	e.event("", "config", "mark mask moved from 0x%08x to 0x%08x (clear of Adaptive QoS marks)", old, c.Settings.MarkMask)
+	e.event("", "config", "mark mask moved from 0x%08x back to 0x%08x (the old bits are Broadcom packet fields)", old, c.Settings.MarkMask)
 	if e.DryRun {
 		return
 	}
@@ -838,8 +838,8 @@ func (e *Engine) Warnings() []string {
 	caps := e.Caps()
 	var w []string
 	if caps.AdaptiveQoS && cfg.Settings.MarkMask&config.AdaptiveQoSMask != 0 {
-		w = append(w, fmt.Sprintf("Mark mask 0x%08x overlaps the marks Adaptive QoS uses (0x%08x): QoS can mark WAN connections as if they belonged to a policy, which sends their packets into a tunnel and stalls them, and snake overwrites QoS categories. Set the mark mask to 0x%08x in Settings → Advanced.",
-			cfg.Settings.MarkMask, config.AdaptiveQoSMask, config.DefaultMarkMask))
+		w = append(w, fmt.Sprintf("Adaptive QoS is on and shares mark bits with snake (0x%08x vs 0x%08x). If WAN downloads stall partway, check whether their connection mark equals a policy mark (snake test / conntrack) and report it.",
+			cfg.Settings.MarkMask, config.AdaptiveQoSMask))
 	}
 	return w
 }

@@ -850,7 +850,7 @@
         num('queue_base', 'NFQUEUE base number'),
         el('label', { class: 'f' }, 'Mark mask (hex)'),
         el('input', { type: 'text', value: '0x' + (s.mark_mask >>> 0).toString(16), onchange: function (e) { s.mark_mask = parseInt(e.target.value, 16) >>> 0; markDirty(); } }),
-        el('div', { class: 'small muted' }, 'fwmark bits owned by snake (8 contiguous bits). Default 0x3fc00000 avoids Merlin VPN Director (0xf000) and Adaptive QoS (0xc03fffff). Must not overlap them.')),
+        el('div', { class: 'small muted' }, 'fwmark bits owned by snake. Default 0xff0000 avoids Merlin VPN Director (0xf000). Do not use bits 24-31: Broadcom routers use them for egress port, IPsec and policy routing.')),
       viewDNSSettings(num),
       viewUpdates(bool, txt)));
   }

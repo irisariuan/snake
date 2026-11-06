@@ -146,17 +146,26 @@ type Settings struct {
 
 // CurrentVersion is the configuration format version.
 //
-//	2: the default mark mask moved from 0x00ff0000 to 0x3fc00000.
-const CurrentVersion = 2
+//	2: (withdrawn) moved the default mark mask to 0x3fc00000.
+//	3: moves 0x3fc00000 back to 0x00ff0000: bits 22-29 are Broadcom's
+//	   egress port, IPsec and policy-routing fields, and routed traffic
+//	   stopped working.
+const CurrentVersion = 3
 
 // Mark bits.
+//
+// On Broadcom (HND) kernels every bit of skb->mark has a vendor meaning
+// (bcm_skb_defines.h): queue 0-4, traffic class 5-10, flow id 11-18, ingress
+// priority 19, egress port 20-26, WAN flag 27, IPsec 28, policy routing
+// 29-31. Small values in bits 16-18 (flow id, which Merlin's VPN Director
+// also uses) are harmless; the higher fields change how the packet is sent.
 const (
-	// DefaultMarkMask is bits 22-29: clear of Merlin's VPN Director
-	// (0x0000f000) and Adaptive QoS / bwdpi (0xc03fffff).
-	DefaultMarkMask uint32 = 0x3fc00000
-	// LegacyMarkMask was the default before version 2. It overlaps the
-	// Adaptive QoS category bits (0x003f0000).
-	LegacyMarkMask uint32 = 0x00ff0000
+	DefaultMarkMask uint32 = 0x00ff0000
+	// BadMarkMask is the version 2 default that broke routed traffic.
+	BadMarkMask uint32 = 0x3fc00000
+	// BroadcomReservedMask must not be used: IPsec, WAN flag and policy
+	// routing fields, and the upper egress port bits.
+	BroadcomReservedMask uint32 = 0xff000000
 	// AdaptiveQoSMask is the mark bits Adaptive QoS (bwdpi) classifies with.
 	AdaptiveQoSMask uint32 = 0xc03fffff
 )
@@ -614,6 +623,8 @@ func (c *Config) Validate() error {
 		add("mark_mask must contain at least 6 contiguous bits")
 	} else if (s.MarkMask>>s.MarkShift())&(s.MarkMask>>s.MarkShift()+1) != 0 {
 		add("mark_mask bits must be contiguous")
+	} else if s.MarkMask&BroadcomReservedMask != 0 {
+		add("mark_mask 0x%08x uses bits 24-31, which Broadcom routers use for egress port, IPsec and policy routing (routed traffic breaks); use 0x%08x", s.MarkMask, DefaultMarkMask)
 	}
 	// ipset's maximum timeout.
 	for _, t := range []struct {
@@ -861,12 +872,12 @@ func Load(path string) (*Config, error) {
 	if err := json.Unmarshal(b, c); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	if c.Version < 2 {
-		if c.Settings.MarkMask == LegacyMarkMask {
+	if c.Version < CurrentVersion {
+		if c.Version == 2 && c.Settings.MarkMask == BadMarkMask {
 			c.Settings.MarkMask = DefaultMarkMask
-			c.migratedMask = LegacyMarkMask
+			c.migratedMask = BadMarkMask
 		}
-		c.Version = 2
+		c.Version = CurrentVersion
 	}
 	c.ApplyDefaults()
 	return c, nil
