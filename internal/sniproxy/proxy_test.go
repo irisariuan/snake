@@ -427,3 +427,52 @@ func TestOriginalDstWithoutRedirect(t *testing.T) {
 		t.Fatalf("original dst %v, local %v", ap, c.LocalAddr())
 	}
 }
+
+func TestProxyRefuseECH(t *testing.T) {
+	strict := netflix()
+	strict.RefuseECH = true
+	strict.MACs = map[string]bool{"aa:bb:cc:dd:ee:ff": true}
+	open := Policy{ID: 2, Name: "ech", Set: match.MustCompile([]string{"cloudflare-ech.com"}), Mark: 0x20000}
+	var mac atomic.Value
+	mac.Store("aa:bb:cc:dd:ee:ff")
+	h := newHarness(t, []Policy{strict, open}, func(h *harness) {
+		h.p.neigh.dump = func() (map[netip.Addr]string, error) {
+			return map[netip.Addr]string{netip.MustParseAddr("127.0.0.1"): mac.Load().(string)}, nil
+		}
+	})
+	ext := []byte{0xfe, 0x0d, 0, 1, 0}
+	echHello := buildHello(sniExt("cloudflare-ech.com"), ext)
+
+	// The strict policy's device: refused, even though a later policy
+	// would route the public name.
+	if got, _ := h.send(t, echHello); len(got) != 0 {
+		t.Fatalf("relayed %d bytes", len(got))
+	}
+	select {
+	case m := <-h.marks:
+		t.Fatalf("refused connection dialled upstream (mark %#x)", m)
+	case <-time.After(100 * time.Millisecond):
+	}
+	// Without ECH the same device is routed as usual.
+	if _, err := h.send(t, buildHello(sniExt("www.netflix.com"))); err != nil {
+		t.Fatal(err)
+	}
+	if m := h.mark(t); m != 0x10000 {
+		t.Fatalf("plain hello: mark %#x", m)
+	}
+
+	// Another device: the strict policy does not apply, ECH is routed.
+	mac.Store("11:22:33:44:55:66")
+	h.p.neigh.mu.Lock()
+	h.p.neigh.fetched = time.Time{}
+	h.p.neigh.mu.Unlock()
+	if got, err := h.send(t, echHello); err != nil || !bytes.Equal(got, echHello) {
+		t.Fatalf("relay: %v", err)
+	}
+	if m := h.mark(t); m != 0x20000 {
+		t.Fatalf("other device: mark %#x", m)
+	}
+	if st := h.p.Stats(); st.ECH != 2 || st.ECHRefused != 1 {
+		t.Fatalf("stats %+v", st)
+	}
+}

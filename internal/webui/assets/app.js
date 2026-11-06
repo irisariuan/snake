@@ -196,7 +196,7 @@
       el('span', { class: 'muted small' }, 'WAN ' + (s.wan_ip || '?') + ' · uptime ' + s.uptime + ' · applied ' + ago(s.last_apply) + ' · IPv6 ' + (s.caps.ipv6 ? 'yes' : 'no') + ' · NFQUEUE ' + (s.caps.nfqueue ? 'yes' : 'no') + ' · ipset netlink ' + (s.caps.ipset_netlink ? 'yes' : 'no') +
         (s.dns_inspector ? ' · DNS inspector: ' + s.dns_inspector.answers + ' answers, ' + s.dns_inspector.matched + ' matched' + (s.dns_inspector.dropped ? ' (' + s.dns_inspector.dropped + ' blocked)' : '') + ', ' + s.dns_inspector.added + ' IPs added' : '') +
         (s.sni_proxy ? ' · SNI proxy ' + (s.sni_proxy.listen ? s.sni_proxy.listen : 'not running') + ': ' + s.sni_proxy.conns + ' conns, ' + s.sni_proxy.matched + ' matched, ' + s.sni_proxy.active + ' open' +
-          (s.sni_proxy.ech ? ', ' + s.sni_proxy.ech + ' ECH' : '') + (s.sni_proxy.dropped ? ', ' + s.sni_proxy.dropped + ' blocked' : '') + (s.sni_proxy.errors ? ', ' + s.sni_proxy.errors + ' failed' : '') : ''))));
+          (s.sni_proxy.ech ? ', ' + s.sni_proxy.ech + ' ECH' + (s.sni_proxy.ech_refused ? ' (' + s.sni_proxy.ech_refused + ' refused)' : '') : '') + (s.sni_proxy.dropped ? ', ' + s.sni_proxy.dropped + ' blocked' : '') + (s.sni_proxy.errors ? ', ' + s.sni_proxy.errors + ' failed' : '') : ''))));
     if (s.sni_proxy && s.sni_proxy.last_error && (!s.sni_proxy.listen || (Date.now() - new Date(s.sni_proxy.last_error_at).getTime()) < 600000))
       b.appendChild(el('div', { class: 'small', style: 'color:var(--warn);margin-bottom:8px' }, 'SNI proxy: ' + s.sni_proxy.last_error));
 
@@ -542,7 +542,7 @@
   // ---------- policies ----------
   function defaultPolicy() {
     return { id: 0, name: '', enabled: true, tunnels: [], kill_switch: true, expected_country: '', domains: [], lists: [], ignore_cname: false, asns: [], cidrs: [], devices: [],
-      leak: { dns_via_tunnel: true, dns_server: '9.9.9.9', dns_protocol: 'udp', hijack_dns: true, block_dot: true, block_doh: true, block_quic: false, sniff_sni: false, ipv6: 'tunnel', webrtc: 'track' } };
+      leak: { dns_via_tunnel: true, dns_server: '9.9.9.9', dns_protocol: 'udp', hijack_dns: true, block_dot: true, block_doh: true, block_quic: false, sniff_sni: false, refuse_ech: false, ipv6: 'tunnel', webrtc: 'track' } };
   }
   function viewPolicies(b) {
     if (state.edit) return viewEditor(b);
@@ -569,7 +569,7 @@
         if (gs.block_doh === 'always' || (gs.block_doh !== 'never' && p.leak.block_doh)) prot.push('doh');
         if (gs.block_dot === 'always' || (gs.block_dot !== 'never' && p.leak.block_dot)) prot.push('dot');
         if (p.leak.block_quic) prot.push('quic');
-        if (p.leak.sniff_sni) prot.push('sni');
+        if (p.leak.sniff_sni) prot.push(p.leak.refuse_ech ? 'sni (no ech)' : 'sni');
         prot.push('v6:' + p.leak.ipv6);
         prot.push('rtc:' + p.leak.webrtc);
         return el('tr', null,
@@ -654,6 +654,7 @@
         overridden('block_dot', chk(L, 'block_dot', 'Block DNS-over-TLS / QUIC (port 853)', 'Android "Private DNS" falls back to normal DNS.')),
         chk(L, 'block_quic', 'Block QUIC (UDP 443)', 'Optional; forces HTTP/2 over TCP.'),
         chk(L, 'sniff_sni', 'Route HTTPS by TLS server name (SNI proxy)', 'For devices using DoH/DoT, whose lookups the router cannot see. HTTPS connections no set matched pass through a proxy on the router that reads the server name (nothing is decrypted) and sends matches through the tunnel. Costs router CPU. Unclaimed QUIC is rejected so browsers fall back to TCP. Encrypted Client Hello hides the real name: those connections are routed by their public name (add e.g. cloudflare-ech.com to route them).'),
+        chk(L, 'refuse_ech', 'Refuse Encrypted Client Hello', 'With the option above: reset ECH connections of this policy\'s devices instead of routing them by their public name, so a hidden name cannot get past drop: rules. Sites behind ECH-enabled CDNs (much of Cloudflare) then fail to load in browsers using DoH; browsers do not retry without ECH.'),
         el('label', { class: 'f' }, 'IPv6'),
         el('select', { onchange: function (e) { L.ipv6 = e.target.value; } },
           [['tunnel', 'Route via tunnel if it has IPv6, otherwise block'], ['block', 'Always block IPv6 for policy traffic'], ['off', 'Off (IPv6 may leak)']].map(function (o) { return el('option', { value: o[0], selected: L.ipv6 === o[0] }, o[1]); })),

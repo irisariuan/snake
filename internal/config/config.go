@@ -65,9 +65,13 @@ type Leak struct {
 	// SniffSNI routes the scoped clients' HTTPS connections that no set
 	// matched by their TLS server name, through snake's transparent SNI
 	// proxy, so domain rules also work for devices using DoH/DoT.
-	SniffSNI bool   `json:"sniff_sni"`
-	IPv6     string `json:"ipv6"`   // tunnel | block | off
-	WebRTC   string `json:"webrtc"` // track | off
+	SniffSNI bool `json:"sniff_sni"`
+	// RefuseECH (with SniffSNI) resets Encrypted Client Hello connections
+	// of the policy's devices instead of routing them by their public
+	// name, so the real name cannot slip past drop: rules.
+	RefuseECH bool   `json:"refuse_ech"`
+	IPv6      string `json:"ipv6"`   // tunnel | block | off
+	WebRTC    string `json:"webrtc"` // track | off
 }
 
 // Policy routes matched traffic through an ordered list of tunnels.
