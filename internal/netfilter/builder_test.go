@@ -65,8 +65,10 @@ func TestBuild(t *testing.T) {
 		// stale chains deleted
 		"-X SNAKE_M9", "-X SNAKE_P9",
 	)
-	if strings.Contains(m4, "SNK_2_t4") {
-		t.Error("server set used in ports fallback mode")
+	// learning groups routed via a ports-fallback policy still apply
+	mustContain(t, m4, "-A SNAKE_P2 -m mac --mac-source aa:bb:cc:00:00:01 -p udp -m set --match-set SNK_2_t4 dst -g SNAKE_M2")
+	if strings.Contains(m4, "SNK_3_t4") {
+		t.Error("server set for a policy without WebRTC tracking")
 	}
 	if strings.Contains(m4, "-X SNAKE\n") {
 		t.Error("live chain deleted")

@@ -49,18 +49,55 @@ type Stats struct {
 	Errors  uint64 `json:"errors"`
 }
 
+// ServerEvent is a STUN/TURN server request seen from a device inside a
+// policy session.
+type ServerEvent struct {
+	Policy int // policy whose queue saw it
+	Client string
+	Server string
+	V6     bool
+	Time   time.Time
+}
+
+// SessionKey is a device's session window with a policy.
+type SessionKey struct {
+	Policy int
+	Client string
+}
+
+// Scan is the result of one conntrack pass.
+type Scan struct {
+	Time time.Time
+	// Active holds known servers (per ServerRoute) with a live connection,
+	// whether or not the connection goes through a tunnel.
+	Active map[string]bool
+	// Sessions holds devices with live policy-marked connections.
+	Sessions map[SessionKey]bool
+}
+
 // Tracker owns the NFQUEUE sockets and the session refresher.
 type Tracker struct {
 	IPSet    netfilter.IPSet
 	MarkMask uint32
 
-	mu      sync.Mutex
-	cancel  context.CancelFunc
-	queues  map[int]*nfqueue.Nfqueue
-	tracks  map[int]PolicyTrack
-	learnCh chan learnReq
-	stats   map[int]*Stats
-	wg      sync.WaitGroup
+	// ServerRoute reports how a known STUN/TURN server is routed: the
+	// policy id, or 0 for WAN. known=false means the server is not learned
+	// yet; it then follows the session's policy. Called from the packet
+	// path: must be fast.
+	ServerRoute func(addr string) (policy int, known bool)
+	// OnServer receives server requests (from a dedicated goroutine).
+	OnServer func(ServerEvent)
+	// OnScan receives each conntrack pass.
+	OnScan func(Scan)
+
+	mu       sync.Mutex
+	serverCh chan ServerEvent
+	cancel   context.CancelFunc
+	queues   map[int]*nfqueue.Nfqueue
+	tracks   map[int]PolicyTrack
+	learnCh  chan learnReq
+	stats    map[int]*Stats
+	wg       sync.WaitGroup
 }
 
 type learnReq struct {
@@ -97,8 +134,10 @@ func (t *Tracker) Configure(tracks []PolicyTrack, queue bool) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.cancel = cancel
 	t.learnCh = make(chan learnReq, 1024)
-	t.wg.Add(2)
+	t.serverCh = make(chan ServerEvent, 256)
+	t.wg.Add(3)
 	go t.learner(ctx)
+	go t.serverLoop(ctx, t.serverCh)
 	go t.refresher(ctx)
 	var errs []string
 	for _, tr := range tracks {
@@ -134,7 +173,7 @@ func (t *Tracker) openQueue(ctx context.Context, tr PolicyTrack) error {
 	}
 	st := t.stats[tr.ID]
 	peerSet := map[bool]string{false: netfilter.SetName(tr.ID, netfilter.KindPeer, false), true: netfilter.SetName(tr.ID, netfilter.KindPeer, true)}
-	serverSet := map[bool]string{false: netfilter.SetName(tr.ID, netfilter.KindServer, false), true: netfilter.SetName(tr.ID, netfilter.KindServer, true)}
+	serverCh := t.serverCh
 	fn := func(a nfqueue.Attribute) int {
 		if a.PacketID == nil {
 			return 0
@@ -155,20 +194,32 @@ func (t *Tracker) openQueue(ctx context.Context, tr PolicyTrack) error {
 		if a.Mark != nil {
 			orig = *a.Mark
 		}
-		mark := orig&^t.MarkMask | tr.Mark
-		// NF_REPEAT re-runs mangle with the policy mark set; SNAKE sees the
-		// mark, saves it to the conntrack entry and stops, so the whole flow
-		// (and its NAT binding) follows the tunnel from the first packet.
-		if err := nf.SetVerdictWithOption(id, nfqueue.NfRepeat, nfqueue.WithMark(mark)); err != nil {
-			atomic.AddUint64(&st.Errors, 1)
-		}
 		v6 := pk.Dst.To4() == nil
-		set := peerSet[v6]
+		dst := pk.Dst.String()
 		if Classify(pk.Payload) == TargetServer {
-			set = serverSet[v6]
+			atomic.AddUint64(&st.Servers, 1)
+			select {
+			case serverCh <- ServerEvent{Policy: tr.ID, Client: pk.Src.String(), Server: dst, V6: v6, Time: time.Now()}:
+			default:
+				atomic.AddUint64(&st.Errors, 1)
+			}
+			mark := tr.Mark
+			if t.ServerRoute != nil {
+				if pol, known := t.ServerRoute(dst); known {
+					if pol == 0 {
+						// The user sent this server's group to WAN.
+						_ = nf.SetVerdict(id, nfqueue.NfAccept)
+						return 0
+					}
+					mark = t.policyMark(pol)
+				}
+			}
+			t.repeat(nf, id, orig, mark, st)
+			return 0
 		}
+		t.repeat(nf, id, orig, tr.Mark, st)
 		select {
-		case t.learnCh <- learnReq{set: set, addr: pk.Dst.String()}:
+		case t.learnCh <- learnReq{set: peerSet[v6], addr: dst}:
 		default:
 			atomic.AddUint64(&st.Errors, 1)
 		}
@@ -188,6 +239,41 @@ func (t *Tracker) openQueue(ctx context.Context, tr PolicyTrack) error {
 	t.queues[tr.ID] = nf
 	logx.Infof("webrtc: listening on nfqueue %d for policy %d", tr.Queue, tr.ID)
 	return nil
+}
+
+// repeat re-runs mangle with the policy mark set; SNAKE sees the mark,
+// saves it to the conntrack entry and stops, so the whole flow (and its NAT
+// binding) follows the tunnel from the first packet.
+func (t *Tracker) repeat(nf *nfqueue.Nfqueue, id, orig, mark uint32, st *Stats) {
+	if err := nf.SetVerdictWithOption(id, nfqueue.NfRepeat, nfqueue.WithMark(orig&^t.MarkMask|mark)); err != nil {
+		atomic.AddUint64(&st.Errors, 1)
+	}
+}
+
+func (t *Tracker) policyMark(id int) uint32 {
+	return uint32(id) << markShift(t.MarkMask) & t.MarkMask
+}
+
+func markShift(mask uint32) uint {
+	shift := uint(0)
+	for m := mask; m != 0 && m&1 == 0; m >>= 1 {
+		shift++
+	}
+	return shift
+}
+
+func (t *Tracker) serverLoop(ctx context.Context, ch chan ServerEvent) {
+	defer t.wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-ch:
+			if t.OnServer != nil {
+				t.OnServer(ev)
+			}
+		}
+	}
 }
 
 // learner batches peer additions into ipset.
@@ -268,10 +354,7 @@ func (t *Tracker) refresher(ctx context.Context) {
 
 func (t *Tracker) refreshOnce() {
 	t.mu.Lock()
-	shift := uint(0)
-	for m := t.MarkMask; m != 0 && m&1 == 0; m >>= 1 {
-		shift++
-	}
+	shift := markShift(t.MarkMask)
 	tracked := map[int]bool{}
 	for id := range t.tracks {
 		tracked[id] = true
@@ -286,39 +369,29 @@ func (t *Tracker) refreshOnce() {
 }
 
 func (t *Tracker) refreshFrom(f io.Reader, tracked map[int]bool, shift uint) {
-	// Learned servers, read back from the kernel so entries that expired
-	// are not resurrected.
-	servers := map[string]map[string]bool{}
-	for id := range tracked {
-		for _, v6 := range []bool{false, true} {
-			name := netfilter.SetName(id, netfilter.KindServer, v6)
-			for _, m := range t.IPSet.Members(name, 0) {
-				if servers[name] == nil {
-					servers[name] = map[string]bool{}
-				}
-				servers[name][canonIP(strings.Fields(m)[0])] = true
-			}
-		}
-	}
+	scan := Scan{Time: time.Now(), Active: map[string]bool{}, Sessions: map[SessionKey]bool{}}
 	adds := map[string]map[string]bool{}
-	add := func(set, addr string) {
-		if adds[set] == nil {
-			adds[set] = map[string]bool{}
-		}
-		adds[set][addr] = true
-	}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), 64*1024)
 	for sc.Scan() {
-		c, ok := ParseConntrack(sc.Text(), t.MarkMask, shift)
-		if !ok || !tracked[c.ID] {
+		c, marked, live := parseConn(sc.Text(), t.MarkMask, shift)
+		if !live {
 			continue
 		}
-		add(netfilter.SetName(c.ID, netfilter.KindSession, c.V6), c.Src)
-		srv := netfilter.SetName(c.ID, netfilter.KindServer, c.V6)
-		if servers[srv][c.Dst] {
-			add(srv, c.Dst) // -exist re-add resets the entry's timeout
+		if t.ServerRoute != nil && c.Dst != "" {
+			if _, known := t.ServerRoute(c.Dst); known {
+				scan.Active[c.Dst] = true
+			}
 		}
+		if !marked || !tracked[c.ID] {
+			continue
+		}
+		scan.Sessions[SessionKey{c.ID, c.Src}] = true
+		set := netfilter.SetName(c.ID, netfilter.KindSession, c.V6)
+		if adds[set] == nil {
+			adds[set] = map[string]bool{}
+		}
+		adds[set][c.Src] = true
 	}
 	for set, srcs := range adds {
 		list := make([]string, 0, len(srcs))
@@ -326,6 +399,9 @@ func (t *Tracker) refreshFrom(f io.Reader, tracked map[int]bool, shift uint) {
 			list = append(list, s)
 		}
 		_ = t.IPSet.AddMany(set, list)
+	}
+	if t.OnScan != nil {
+		t.OnScan(scan)
 	}
 }
 
@@ -337,15 +413,21 @@ type Conn struct {
 }
 
 // ParseConntrack extracts the policy id (from the connmark) and the original
-// addresses of an established conntrack line.
-func ParseConntrack(line string, mask uint32, shift uint) (c Conn, ok bool) {
+// addresses of an established, policy-marked conntrack line.
+func ParseConntrack(line string, mask uint32, shift uint) (Conn, bool) {
+	c, marked, live := parseConn(line, mask, shift)
+	return c, marked && live
+}
+
+// parseConn parses any conntrack line. marked: it carries a policy mark;
+// live: it is not a closing TCP connection.
+func parseConn(line string, mask uint32, shift uint) (c Conn, marked, live bool) {
 	f := strings.Fields(line)
 	if len(f) < 6 {
 		return
 	}
 	c.V6 = f[0] == "ipv6"
 	var mark uint64
-	haveMark := false
 	for _, x := range f {
 		if c.Src == "" && strings.HasPrefix(x, "src=") {
 			c.Src = strings.TrimPrefix(x, "src=")
@@ -355,22 +437,17 @@ func ParseConntrack(line string, mask uint32, shift uint) (c Conn, ok bool) {
 		}
 		if strings.HasPrefix(x, "mark=") {
 			mark, _ = strconv.ParseUint(strings.TrimPrefix(x, "mark="), 10, 32)
-			haveMark = true
 		}
 	}
-	if !haveMark || c.Src == "" {
-		return
-	}
-	c.ID = int((uint32(mark) & mask) >> shift)
-	if c.ID == 0 {
-		return
-	}
-	// Only established-ish flows keep a session alive.
-	if strings.Contains(line, " TIME_WAIT ") || strings.Contains(line, " CLOSE ") || strings.Contains(line, " FIN_WAIT ") {
+	if c.Src == "" {
 		return
 	}
 	c.Src, c.Dst = canonIP(c.Src), canonIP(c.Dst)
-	return c, true
+	c.ID = int((uint32(mark) & mask) >> shift)
+	marked = c.ID != 0
+	// Only established-ish flows keep a session alive.
+	live = !strings.Contains(line, " TIME_WAIT ") && !strings.Contains(line, " CLOSE ") && !strings.Contains(line, " FIN_WAIT ")
+	return
 }
 
 // canonIP normalises an address: /proc/net/nf_conntrack prints IPv6 in full

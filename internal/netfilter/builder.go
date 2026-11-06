@@ -233,9 +233,7 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 			for _, ds := range dsets {
 				opens = append(opens, "-m conntrack --ctstate NEW -m set --match-set "+ds+" dst")
 			}
-			if st.WebRTCMode == RTCQueue {
-				opens = append(opens, "-p udp -m conntrack --ctstate NEW -m set --match-set "+SetName(id, KindServer, v6)+" dst")
-			}
+			opens = append(opens, "-p udp -m conntrack --ctstate NEW -m set --match-set "+SetName(id, KindServer, v6)+" dst")
 			for _, base := range opens {
 				if len(st.MACs) == 0 {
 					mangle.add(ChainMain, base, "-j SET --add-set", sess, "src --exist")
@@ -270,18 +268,20 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 			sess := SetName(id, KindSession, v6)
 			peers := SetName(id, KindPeer, v6)
 			mangle.add(pc, "-p udp -m set --match-set", sess, "src -m set --match-set", peers, "dst -g", mc)
+			// STUN/TURN servers of learning groups routed via this policy
+			// (SNK_<id>_t, kept in sync by the daemon) are routed for the
+			// policy's clients even outside a session window, so binding
+			// requests sent before the session opens cannot reveal the WAN
+			// address.
+			srv := SetName(id, KindServer, v6)
+			if len(st.MACs) == 0 {
+				mangle.add(pc, "-p udp -m set --match-set", srv, "dst -g", mc)
+			}
+			for _, m := range st.MACs {
+				mangle.add(pc, macMatch(m), "-p udp -m set --match-set", srv, "dst -g", mc)
+			}
 			switch st.WebRTCMode {
 			case RTCQueue:
-				// Learned STUN/TURN servers are routed for the policy's
-				// clients even outside a session window, so binding requests
-				// sent before the session opens cannot reveal the WAN address.
-				srv := SetName(id, KindServer, v6)
-				if len(st.MACs) == 0 {
-					mangle.add(pc, "-p udp -m set --match-set", srv, "dst -g", mc)
-				}
-				for _, m := range st.MACs {
-					mangle.add(pc, macMatch(m), "-p udp -m set --match-set", srv, "dst -g", mc)
-				}
 				q := fmt.Sprint(s.QueueBase + id)
 				mangle.add(ChainRTC, "-p udp -m conntrack --ctstate NEW -m set --match-set", sess,
 					"src -j NFQUEUE --queue-num", q, "--queue-bypass")

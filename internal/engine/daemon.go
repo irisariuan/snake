@@ -36,6 +36,7 @@ func (e *Engine) Run(ctx context.Context) error {
 			logx.Warnf("restore saved ipsets: %v", err)
 		}
 	}
+	e.importLegacyServers()
 	e.SeedHealth()
 	e.decide()
 	if err := e.Apply("startup"); err != nil {
@@ -131,22 +132,16 @@ func (e *Engine) saveSets() {
 	ips := netfilter.IPSet{R: e.R}
 	var names []string
 	for _, n := range ips.Names() {
-		// Only learned sets are worth persisting; static sets are rebuilt.
-		// Learned STUN servers are kept so they cover ICE gathering that
-		// starts before a session after a reboot too.
-		learned := false
-		for _, k := range []string{netfilter.KindDomain, netfilter.KindServer} {
-			if strings.HasSuffix(n, "_"+k+"4") || strings.HasSuffix(n, "_"+k+"6") {
-				learned = true
-			}
-		}
-		if learned {
+		// Only DNS-learned sets are worth persisting; static sets are
+		// rebuilt and server sets come from the learning store.
+		if strings.HasSuffix(n, "_"+netfilter.KindDomain+"4") || strings.HasSuffix(n, "_"+netfilter.KindDomain+"6") {
 			names = append(names, n)
 		}
 	}
 	if err := ips.Save(e.P.IPSetSave, names); err != nil {
 		logx.Warnf("save ipsets: %v", err)
 	}
+	e.saveLearnings()
 }
 
 // PolicyStatus is the runtime view of a policy.
@@ -408,10 +403,11 @@ func (e *Engine) SetMembers(name string, limit int) ([]string, error) {
 	return netfilter.IPSet{R: e.R}.Members(name, limit), nil
 }
 
-// FlushLearned empties DNS-learned and WebRTC sets of a policy.
+// FlushLearned empties DNS-learned and WebRTC sets of a policy. Learning
+// groups are managed separately (Learnings tab).
 func (e *Engine) FlushLearned(id int) {
 	ips := netfilter.IPSet{R: e.R}
-	for _, k := range []string{netfilter.KindDomain, netfilter.KindPeer, netfilter.KindServer, netfilter.KindSession} {
+	for _, k := range []string{netfilter.KindDomain, netfilter.KindPeer, netfilter.KindSession} {
 		for _, v6 := range []bool{false, true} {
 			_ = ips.Flush(netfilter.SetName(id, k, v6))
 		}
@@ -552,7 +548,7 @@ func (e *Engine) LeakChecks() []LeakCheck {
 		}
 		switch ps.WebRTCMode {
 		case netfilter.RTCQueue:
-			ok("WebRTC tracked (STUN learning via NFQUEUE; learned STUN/TURN servers also covered before a session starts)")
+			ok("WebRTC tracked (STUN learning via NFQUEUE; servers of learning groups routed via this policy are covered before a session starts)")
 		case netfilter.RTCPorts:
 			warn("WebRTC tracked in fallback mode (NFQUEUE unavailable: only STUN/TURN ports during sessions)")
 		default:

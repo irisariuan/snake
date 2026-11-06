@@ -226,31 +226,56 @@ break every other app's calls. snake tracks it per policy instead:
        routed only for devices inside a session window.
      * **Server requests** (plain binding requests, i.e. server-reflexive
        candidate gathering, and TURN Allocate/Refresh/CreatePermission/
-       ChannelBind/Send) go to the server set `SNK_<id>_t`.
+       ChannelBind/Send) are learned into a **learning group** (see below).
+       A request to a server that is already in a group uses that group's
+       routing instead of the session's policy.
    * Anything else passes through untouched.
-3. **Learned servers (pre-session coverage).** Browsers often start gathering
-   ICE candidates before the page's first connection to a policy destination.
-   That early binding request would reveal the WAN address. Learned
-   STUN/TURN servers are therefore routed through the tunnel for the policy's
-   devices (the whole LAN for destination-only policies) **even outside a
-   session**, and a new UDP flow to one opens the device's session window, so
-   the ICE checks that follow are learned too.
-   * Each server has a TTL (`stun_server_ttl`, default 86400 s). The session
-     refresher re-arms it every 20 s while any policy-marked connection to
-     the server is still in conntrack, so the countdown only starts once the
-     server is idle. A server shared with unrelated apps (a public STUN
-     server, for example) therefore drops out after a quiet period instead of
-     staying tunnelled forever.
-   * Server sets are saved with the DNS-learned sets (`save_interval`), so the
-     coverage survives a reboot.
-   * The first visit to a service still has no learned servers, so ICE
-     gathering that starts before its first session can use WAN once.
+3. **Learning groups (pre-session coverage).** Browsers often start
+   gathering ICE candidates before the page's first connection to a policy
+   destination, and that early binding request would reveal the WAN address.
+   Learned STUN/TURN servers are therefore kept in groups that are not tied
+   to the policy that found them, and are routed through a policy of your
+   choice **even outside a session**. See [Learnings](#learnings).
 4. **Fallback.** If the kernel has no NFQUEUE, only STUN/TURN ports
    (`3478,3479,5349,19302:19309`) from devices inside a window are routed.
-   There is no server learning in this mode.
+   There is no server learning in this mode, but learning groups routed via
+   the policy still apply.
 
 WebRTC from other apps, or from the same device outside a session, stays on WAN,
-except UDP to a learned STUN/TURN server of the policy.
+except UDP to STUN/TURN servers of learning groups routed via the policy.
+
+## Learnings
+
+The **Learnings** tab lists the learning groups. A group is created when a
+device in a policy session contacts a STUN/TURN server that no group knows
+yet. Every other new server the same device discovers during that session
+window (kept open while the device has live policy connections) joins the
+same group, so a service's STUN and TURN servers usually end up together. A
+request to a server that is already known refreshes its group instead.
+
+Each group records the sessions that were active when it was discovered:
+every policy whose session window held the device, the tunnel each was
+using, the device (IP, MAC, name) and up to five policy destinations the
+device was connected to, named from the DNS inspector when it has seen them.
+
+| Setting | Effect |
+|---|---|
+| Route via | Policy whose tunnel the group's servers use. It starts as the policy whose session discovered the group. *Off* sends them to WAN. Servers are routed for that policy's devices (the whole LAN for destination-only policies), even before a session starts, and UDP to one opens the device's session window so the ICE checks that follow are learned too. If the policy is deleted, disabled or has WebRTC tracking off, the servers are left alone and follow whatever session they show up in. |
+| Enabled | Off: the group's servers go to WAN, also inside policy sessions. |
+| Idle TTL | Each learned server is dropped once it has had no STUN request and no connection (any conntrack entry, checked every 20 s) for this long. Default: `stun_server_ttl` (1 day). |
+| Pin | Nothing in the group expires. |
+| Name, notes | Free text. A group you renamed or annotated is kept when its servers expire. |
+
+You can also add addresses by hand (they never expire), remove them, move
+them between groups, merge groups and delete groups. An address belongs to
+one group at most.
+
+Groups live in `learnings.json` next to `config.json`, saved on every
+discovery and edit. The daemon installs each policy's share into
+`SNK_<id>_t4/6`. API: `GET/POST /api/learnings`,
+`PUT/DELETE /api/learnings/{id}`, `POST /api/learnings/{id}/servers`
+(`{"add":[…],"remove":[…]}`), `/move` (`{"servers":[…],"to":id}`) and
+`/merge` (`{"into":id}`).
 
 ## Failover
 

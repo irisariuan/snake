@@ -9,7 +9,7 @@ const (
 	KindNet     = "n" // static CIDRs + ASN prefixes
 	KindSession = "s" // WebRTC session window: client IPs with a live policy session
 	KindPeer    = "r" // WebRTC peers learned from STUN (ICE connectivity checks)
-	KindServer  = "t" // STUN/TURN servers learned from STUN; routed outside sessions too
+	KindServer  = "t" // STUN/TURN servers of learning groups routed via the policy; routed outside sessions too
 )
 
 // SetPrefix is shared by every ipset snake owns.

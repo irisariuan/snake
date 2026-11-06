@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/irisariuan/snake/internal/asn"
@@ -20,6 +21,7 @@ import (
 	"github.com/irisariuan/snake/internal/dnsinspect"
 	"github.com/irisariuan/snake/internal/dnsmasq"
 	"github.com/irisariuan/snake/internal/health"
+	"github.com/irisariuan/snake/internal/learn"
 	"github.com/irisariuan/snake/internal/logx"
 	"github.com/irisariuan/snake/internal/netfilter"
 	"github.com/irisariuan/snake/internal/routing"
@@ -37,6 +39,7 @@ type Paths struct {
 	DNSMasq   string
 	IPSetSave string
 	ASNDir    string
+	Learnings string
 	Socket    string
 	PID       string
 }
@@ -49,6 +52,7 @@ func DefaultPaths(base string) Paths {
 		DNSMasq:   filepath.Join(base, "dnsmasq.conf"),
 		IPSetSave: filepath.Join(base, "ipsets.save"),
 		ASNDir:    filepath.Join(base, "asn"),
+		Learnings: filepath.Join(base, "learnings.json"),
 		Socket:    "/var/run/snake.sock",
 		PID:       "/var/run/snake.pid",
 	}
@@ -85,6 +89,9 @@ type Engine struct {
 	caps       Caps
 	mon        *health.Monitor
 	rtc        *webrtc.Tracker
+	learn      *learn.Store
+	learnMu    sync.Mutex   // serialises learning-set syncs
+	learnRoute atomic.Value // map[string]int: server -> policy (0 = WAN), as installed
 	dns        *dnsinspect.Inspector
 	dnsOn      bool
 	asnCache   *asn.Cache
@@ -106,7 +113,7 @@ type Engine struct {
 
 // New creates an engine.
 func New(p Paths, r system.Runner) *Engine {
-	return &Engine{
+	e := &Engine{
 		P:         p,
 		R:         r,
 		mon:       health.NewMonitor(r),
@@ -119,6 +126,10 @@ func New(p Paths, r system.Runner) *Engine {
 		started:   time.Now(),
 		kick:      make(chan struct{}, 1),
 	}
+	e.rtc.ServerRoute = e.serverRoute
+	e.rtc.OnServer = e.onServer
+	e.rtc.OnScan = e.onScan
+	return e
 }
 
 // Load reads configuration from disk.
@@ -136,7 +147,7 @@ func (e *Engine) Load() error {
 	e.rtc.MarkMask = c.Settings.MarkMask
 	e.asnCache = &asn.Cache{Dir: e.P.ASNDir, MaxAge: time.Duration(c.Settings.ASNRefresh) * time.Hour}
 	e.mu.Unlock()
-	return nil
+	return e.openLearnings()
 }
 
 // Config returns a deep copy of the current configuration.
@@ -355,10 +366,10 @@ func setSpecs(cfg *config.Config, states []netfilter.PolicyState, v6 bool) []net
 					netfilter.SetSpec{Name: netfilter.SetName(p.ID, netfilter.KindPeer, f), Type: "hash:ip", V6: f, Timeout: s.PeerTimeout, MaxElem: 65536},
 				)
 			}
-			if st.WebRTCMode == netfilter.RTCQueue {
-				// The tracker refreshes entries while connections to them are
-				// alive, so the TTL only counts down once a server is idle.
-				specs = append(specs, netfilter.SetSpec{Name: netfilter.SetName(p.ID, netfilter.KindServer, f), Type: "hash:ip", V6: f, Timeout: s.STUNServerTTL, MaxElem: 4096})
+			if st.WebRTCMode != netfilter.RTCOff {
+				// Filled from the learning groups routed via this policy;
+				// expiry is managed by the learning store, not the kernel.
+				specs = append(specs, netfilter.SetSpec{Name: netfilter.SetName(p.ID, netfilter.KindServer, f), Type: "hash:ip", V6: f, MaxElem: 65536})
 			}
 		}
 	}
@@ -524,6 +535,11 @@ func (e *Engine) Apply(reason string) error {
 		if err := e.rtc.Configure(tracks, caps.NFQueue); err != nil {
 			errs = append(errs, err.Error())
 		}
+	}
+
+	// 7. learning groups -> per-policy server sets
+	if err := e.syncLearnings(cfg); err != nil {
+		errs = append(errs, err.Error())
 	}
 
 	e.mu.Lock()

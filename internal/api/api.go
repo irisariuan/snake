@@ -126,6 +126,7 @@ func (s *Server) routes(authed bool) http.Handler {
 	s.ruleRoutes(mux)
 	mux.HandleFunc("GET /api/plan", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, s.E.Plan()) })
 	mux.HandleFunc("POST /api/import-dvr", s.importDVR)
+	s.learnRoutes(mux)
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -148,7 +149,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		if o := r.Header.Get("Origin"); o != "" && sameHost(o, r.Host) {
 			w.Header().Set("Access-Control-Allow-Origin", o)
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, POST, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Max-Age", "600")
 			w.Header().Set("Vary", "Origin")
 		}

@@ -131,6 +131,7 @@ type Inspector struct {
 	nf     *nfqueue.Nfqueue
 	cancel context.CancelFunc
 	cache  map[string]time.Time
+	names  map[string]string // address -> name it was answered for (matched answers only)
 	stats  Stats
 	queue  uint16
 }
@@ -138,6 +139,13 @@ type Inspector struct {
 // Stats returns a copy of the counters.
 func (i *Inspector) Stats() Stats {
 	return Stats{atomic.LoadUint64(&i.stats.Answers), atomic.LoadUint64(&i.stats.Matched), atomic.LoadUint64(&i.stats.Added), atomic.LoadUint64(&i.stats.Errors)}
+}
+
+// NameOf returns the policy domain an address was last answered for, or "".
+func (i *Inspector) NameOf(addr string) string {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.names[addr]
 }
 
 // Running reports whether the queue is open.
@@ -231,6 +239,12 @@ func (i *Inspector) handle(raw []byte) {
 	add := map[string][]string{}
 	now := time.Now()
 	i.mu.Lock()
+	if i.names == nil || len(i.names) > 50000 {
+		i.names = map[string]string{}
+	}
+	for _, ip := range ans.IPs {
+		i.names[ip.String()] = ans.Question
+	}
 	for _, ip := range ans.IPs {
 		set := r.Set4
 		if ip.To4() == nil {

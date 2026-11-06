@@ -48,6 +48,21 @@
     if (s < 5400) return Math.round(s / 60) + 'm ago';
     return Math.round(s / 3600) + 'h ago';
   }
+  function until(ts) {
+    if (!ts) return 'never';
+    var s = Math.round((new Date(ts).getTime() - Date.now()) / 1000);
+    if (s <= 0) return 'now';
+    if (s < 90) return 'in ' + s + 's';
+    if (s < 5400) return 'in ' + Math.round(s / 60) + 'm';
+    if (s < 172800) return 'in ' + Math.round(s / 3600) + 'h';
+    return 'in ' + Math.round(s / 86400) + 'd';
+  }
+  function fmtDur(s) {
+    if (s % 86400 === 0) return (s / 86400) + 'd';
+    if (s % 3600 === 0) return (s / 3600) + 'h';
+    if (s % 60 === 0) return (s / 60) + 'm';
+    return s + 's';
+  }
   function lines(s) { return (s || '').split(/[\n,]+/).map(function (x) { return x.trim(); }).filter(Boolean); }
   function clone(o) { return JSON.parse(JSON.stringify(o)); }
 
@@ -104,7 +119,7 @@
   function markDirty() { state.dirty = true; renderBanner(); }
 
   // ---------- layout ----------
-  var TABS = [['status', 'Status'], ['policies', 'Policies'], ['lists', 'Rule lists'], ['devices', 'Devices & groups'], ['diag', 'Diagnostics'], ['settings', 'Settings'], ['import', 'Import']];
+  var TABS = [['status', 'Status'], ['policies', 'Policies'], ['lists', 'Rule lists'], ['devices', 'Devices & groups'], ['learn', 'Learnings'], ['diag', 'Diagnostics'], ['settings', 'Settings'], ['import', 'Import']];
   var bannerBox;
   function render() {
     var scrollY = window.scrollY;
@@ -114,6 +129,7 @@
       return el('button', { type: 'button', class: 'tab' + (state.tab === t[0] ? ' on' : ''), onclick: function () {
         if (state.listEdit && state.listEdit.changed && !confirm('Discard unsaved changes to the rule list?')) return;
         state.tab = t[0]; state.edit = null; state.listEdit = null; render();
+        if (t[0] === 'learn') loadLearnings();
       } }, t[1]);
     })));
     bannerBox = el('div');
@@ -123,7 +139,7 @@
     if (!state.cfg) { root.appendChild(el('p', { class: 'muted' }, 'Loading...')); return; }
     var body = el('div');
     root.appendChild(body);
-    ({ status: viewStatus, policies: viewPolicies, lists: viewLists, devices: viewDevices, diag: viewDiag, settings: viewSettings, import: viewImport })[state.tab](body);
+    ({ status: viewStatus, policies: viewPolicies, lists: viewLists, devices: viewDevices, learn: viewLearnings, diag: viewDiag, settings: viewSettings, import: viewImport })[state.tab](body);
     window.scrollTo(0, scrollY);
   }
   function renderBanner() {
@@ -783,7 +799,7 @@
       el('div', { class: 'card' }, el('b', null, 'WebRTC & sets'),
         num('session_timeout', 'WebRTC session window (s)', 'How long after the last policy connection a device\'s STUN is still attributed to the policy.'),
         num('peer_timeout', 'Learned peer lifetime (s)'),
-        num('stun_server_ttl', 'Learned STUN/TURN server TTL once idle (s)', 'Learned servers stay routed through the tunnel for the policy\'s devices, even before a session starts. The countdown starts when the last connection to the server ends.'),
+        num('stun_server_ttl', 'Learning group default idle TTL (s)', 'How long a learned STUN/TURN server stays in its group (see the Learnings tab) after its last connection. Groups can override it or be pinned.'),
         txt('stun_ports', 'STUN/TURN ports (fallback mode)'),
         num('domain_set_timeout', 'Domain set entry timeout (s, 0 = never)'),
         num('save_interval', 'Persist learned sets every (s)'),
@@ -798,6 +814,134 @@
         el('label', { class: 'f' }, 'Mark mask (hex)'),
         el('input', { type: 'text', value: '0x' + (s.mark_mask >>> 0).toString(16), onchange: function (e) { s.mark_mask = parseInt(e.target.value, 16) >>> 0; markDirty(); } }),
         el('div', { class: 'small muted' }, 'fwmark bits owned by snake. Default 0xff0000 avoids Merlin VPN Director (0xf000) and QoS bits.'))));
+  }
+
+  // ---------- learnings ----------
+  function loadLearnings() {
+    return api('GET', '/api/learnings').then(function (r) { state.learn = r; if (state.tab === 'learn') render(); })
+      .catch(function (e) { state.error = e.message; render(); });
+  }
+  function learnCall(method, path, body, msg) {
+    return api(method, path, body).then(function (r) { state.learn = r; if (msg) toast(msg); render(); })
+      .catch(function (e) { toast(e.message); });
+  }
+  function policyByID(id) { return (state.cfg.policies || []).filter(function (p) { return p.id === id; })[0]; }
+  function tracks(p) {
+    return p && p.enabled && p.leak.webrtc === 'track' && (p.domains.length || p.lists.length || p.asns.length || p.cidrs.length);
+  }
+  function lastActivity(g) {
+    var t = 0;
+    g.servers.forEach(function (x) { [x.last_seen, x.last_active].forEach(function (v) { var n = v ? new Date(v).getTime() : 0; if (n > t) t = n; }); });
+    return t ? new Date(t).toISOString() : '';
+  }
+  function viewLearnings(b) {
+    var L = state.learn;
+    state.learnOpen = state.learnOpen || {};
+    b.appendChild(el('p', { class: 'small muted' },
+      'When a device inside a policy session sends a STUN/TURN server request, the server is learned into a group. ' +
+      'Servers a device discovers during one session window share a group. A group routes its servers through the policy you choose, ' +
+      'for that policy\'s devices, even before a session starts. Each server expires once it has had no connection for the group\'s TTL; ' +
+      'pinned groups and servers you add by hand never expire.'));
+    var filter = el('input', { type: 'text', placeholder: 'filter: name, address, device, policy', size: 34, value: state.learnFilter || '',
+      oninput: function (e) { state.learnFilter = e.target.value; drawList(); } });
+    b.appendChild(el('div', { class: 'row', style: 'margin-bottom:10px' },
+      btn('+ New group', function () {
+        var name = prompt('Name of the new learning group:', '');
+        if (name && name.trim()) learnCall('POST', '/api/learnings', { name: name.trim(), route_via: 0 }, 'Group created');
+      }, 'pri'),
+      btn('Refresh', loadLearnings), filter,
+      L ? el('span', { class: 'small muted' }, L.groups.length + ' groups · default TTL ' + fmtDur(L.default_ttl) + ' (Settings → stun_server_ttl)') : null));
+    var list = el('div');
+    b.appendChild(list);
+    function drawList() {
+      list.innerHTML = '';
+      if (!L) { list.appendChild(el('p', { class: 'muted' }, 'Loading...')); return; }
+      var q = (state.learnFilter || '').toLowerCase().trim();
+      var gs = L.groups.filter(function (g) { return !q || JSON.stringify([g.name, g.notes, g.servers, g.origins, (policyByID(g.route_via) || {}).name]).toLowerCase().indexOf(q) >= 0; });
+      if (!L.groups.length) list.appendChild(el('p', { class: 'muted' }, 'Nothing learned yet. Groups appear when a device in a policy session (WebRTC tracking on) contacts a STUN/TURN server.'));
+      else if (!gs.length) list.appendChild(el('p', { class: 'muted' }, 'No group matches the filter.'));
+      gs.forEach(function (g) { list.appendChild(groupCard(g)); });
+    }
+    drawList();
+  }
+  function groupCard(g) {
+    var path = '/api/learnings/' + g.id;
+    var others = state.learn.groups.filter(function (x) { return x.id !== g.id; });
+    var pol = policyByID(g.route_via);
+    var routeSel = el('select', { onchange: function (e) { learnCall('PUT', path, { route_via: +e.target.value }, 'Route updated'); } },
+      el('option', { value: 0 }, 'Off (WAN)'),
+      (state.cfg.policies || []).map(function (p) {
+        return el('option', { value: p.id, selected: p.id === g.route_via ? 'selected' : null }, p.name + (tracks(p) ? '' : ' (WebRTC tracking off: inactive)'));
+      }));
+    routeSel.value = String(g.route_via);
+    var routeNote = !g.enabled ? badge('disabled: WAN', 'bad') : g.route_via === 0 ? badge('WAN', 'bad') :
+      !pol ? badge('policy deleted: follows sessions', 'warn') : !tracks(pol) ? badge('inactive: follows sessions', 'warn') : badge('via ' + pol.name, 'ok');
+    var nameIn = el('input', { type: 'text', value: g.name, size: 30, onchange: function (e) { learnCall('PUT', path, { name: e.target.value }, 'Renamed'); } });
+    var ttlIn = el('input', { type: 'number', min: 0, value: g.ttl || '', placeholder: 'default ' + fmtDur(state.learn.default_ttl), style: 'width:120px',
+      onchange: function (e) { learnCall('PUT', path, { ttl: +e.target.value || 0 }, 'TTL updated'); } });
+    var open = !!state.learnOpen[g.id];
+    var body = el('div', { style: open ? '' : 'display:none' });
+    var la = lastActivity(g);
+    var head = el('div', { class: 'row', style: 'justify-content:space-between' },
+      el('span', { class: 'row' },
+        el('input', { type: 'checkbox', checked: g.enabled, title: 'enabled', onchange: function (e) { learnCall('PUT', path, { enabled: e.target.checked }); } }),
+        nameIn, routeNote, g.pinned ? badge('pinned', 'info') : null,
+        el('span', { class: 'small muted' }, '#' + g.id + ' · ' + g.servers.length + ' server' + (g.servers.length === 1 ? '' : 's') + ' · active ' + ago(la))),
+      btn(open ? 'Hide' : 'Details', function () { state.learnOpen[g.id] = !open; render(); }));
+
+    body.appendChild(el('div', { class: 'row', style: 'margin:8px 0' },
+      el('span', { class: 'small muted' }, 'Route via'), routeSel,
+      el('label', { class: 'row small' }, el('input', { type: 'checkbox', checked: g.pinned, onchange: function (e) { learnCall('PUT', path, { pinned: e.target.checked }, e.target.checked ? 'Pinned: never expires' : 'Unpinned'); } }), 'Pin (never expire)'),
+      el('span', { class: 'small muted' }, 'Idle TTL (s)'), ttlIn));
+    body.appendChild(el('textarea', { placeholder: 'notes', style: 'min-height:40px', onchange: function (e) { learnCall('PUT', path, { notes: e.target.value }, 'Notes saved'); } }, g.notes || ''));
+
+    // servers
+    var addIn = el('input', { type: 'text', placeholder: 'add address(es), comma separated', size: 34 });
+    body.appendChild(el('h3', null, 'Servers'));
+    body.appendChild(el('div', { class: 'scroll' }, el('table', null,
+      el('tr', null, ['Address', 'First seen', 'Last request', 'Last connection', 'Expires', ''].map(function (h) { return el('th', null, h); })),
+      g.servers.map(function (x) {
+        var mv = el('select', { onchange: function (e) { if (e.target.value) learnCall('POST', path + '/move', { servers: [x.addr], to: +e.target.value }, 'Moved ' + x.addr); } },
+          el('option', { value: '' }, 'Move to...'), others.map(function (o) { return el('option', { value: o.id }, '#' + o.id + ' ' + o.name); }));
+        return el('tr', null,
+          el('td', { class: 'mono' }, x.addr, x.manual ? el('div', null, badge('added by hand', 'info')) : null),
+          el('td', { class: 'small' }, ago(x.first_seen)),
+          el('td', { class: 'small' }, ago(x.last_seen)),
+          el('td', { class: 'small' }, x.last_active && x.last_active.indexOf('0001-') !== 0 ? ago(x.last_active) : 'none seen'),
+          el('td', { class: 'small' }, x.expires_at ? until(x.expires_at) : (g.pinned ? 'pinned' : 'never')),
+          el('td', { class: 'row' }, others.length ? mv : null,
+            btn('Remove', function () { learnCall('POST', path + '/servers', { remove: [x.addr] }, 'Removed ' + x.addr); }, 'danger')));
+      }))));
+    body.appendChild(el('div', { class: 'row', style: 'margin:6px 0' }, addIn,
+      btn('Add', function () { var a = lines(addIn.value); if (a.length) learnCall('POST', path + '/servers', { add: a }, 'Added'); })));
+
+    // provenance
+    body.appendChild(el('h3', null, 'Discovered during'));
+    if (!g.origins.length) body.appendChild(el('p', { class: 'small muted' }, 'Created by hand or imported: no session information.'));
+    else body.appendChild(el('div', { class: 'scroll' }, el('table', null,
+      el('tr', null, ['When', 'Policy session', 'Tunnel', 'Device', 'Connected to'].map(function (h) { return el('th', null, h); })),
+      g.origins.map(function (o) {
+        return el('tr', null,
+          el('td', { class: 'small' }, new Date(o.time).toLocaleString()),
+          el('td', null, o.policy, o.trigger ? el('div', { class: 'small muted' }, 'STUN request seen here') : null),
+          el('td', null, o.tunnel || el('span', { class: 'muted' }, 'none')),
+          el('td', null, o.device || '', el('div', { class: 'small mono muted' }, [o.client_ip, o.mac].filter(Boolean).join(' · '))),
+          el('td', { class: 'small mono' }, (o.destinations || []).length ? o.destinations.map(function (d) { return el('div', null, d); }) : el('span', { class: 'muted' }, 'no live connections found')));
+      }))));
+    body.appendChild(el('div', { class: 'small muted', style: 'margin-top:4px' }, 'Created ' + new Date(g.created).toLocaleString()));
+
+    // group actions
+    var mergeSel = el('select', null, el('option', { value: '' }, 'Merge into...'), others.map(function (o) { return el('option', { value: o.id }, '#' + o.id + ' ' + o.name); }));
+    body.appendChild(el('div', { class: 'row', style: 'margin-top:8px' },
+      others.length ? [mergeSel, btn('Merge', function () {
+        var into = +mergeSel.value;
+        if (into && confirm('Merge "' + g.name + '" into #' + into + '? Its servers and session history move there and this group is deleted.')) {
+          state.learnOpen[into] = true;
+          learnCall('POST', path + '/merge', { into: into }, 'Merged');
+        }
+      })] : null,
+      btn('Delete group', function () { if (confirm('Delete group "' + g.name + '"? Its servers go back to WAN until learned again.')) learnCall('DELETE', path, undefined, 'Deleted'); }, 'danger')));
+    return el('div', { class: 'card', 'data-group': g.id }, head, body);
   }
 
   // ---------- import ----------
