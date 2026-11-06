@@ -181,6 +181,18 @@ snake rules export --policy "Netflix US" --expand
   path, matches every name in the answer, and adds the A/AAAA addresses to the
   first matching policy's set. Only then does it release the answer, so the
   client's first connection is already routed.
+* **Latency.** Every DNS answer to the LAN passes through the inspector, so
+  it is built to stay out of the way of names no policy routes:
+  * Plain domain rules (`example.com`, `.example.com`, `=example.com`) are
+    looked up in a hash index by the name and its parent domains. Only
+    wildcards, keywords and regexes are tested one by one. 20,000 rules cost
+    microseconds per answer.
+  * Answers that need no set change are released immediately. Answers with
+    new addresses are handled by a pool of workers, so a slow update never
+    holds up other lookups.
+  * Set entries are added over netlink (tens of microseconds) instead of by
+    running the `ipset` tool (milliseconds). If the kernel rejects that,
+    snake falls back to the tool; Status shows *ipset netlink yes/no*.
 * **Fail-open queue**: if the daemon stops, answers pass straight through.
 * **Exclusions disable the dnsmasq fast path** for a policy, because dnsmasq
   cannot honour them.

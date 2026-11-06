@@ -7,13 +7,18 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 
+	"github.com/irisariuan/snake/internal/logx"
 	"github.com/irisariuan/snake/internal/system"
 )
 
-// IPSet manages ipsets through the ipset CLI.
+// IPSet manages ipsets through the ipset CLI. When NL is set, adds and
+// tests of plain addresses go over netlink instead (falling back to the CLI
+// if the kernel rejects them).
 type IPSet struct {
-	R system.Runner
+	R  system.Runner
+	NL *NL
 }
 
 // SetSpec describes a set to create.
@@ -97,6 +102,18 @@ func (x IPSet) AddMany(name string, entries []string) error {
 	if len(entries) == 0 {
 		return nil
 	}
+	if x.NL.Usable() {
+		if ips := parseIPs(entries); ips != nil {
+			err := x.NL.Add(name, ips)
+			if err == nil {
+				return nil
+			}
+			if errno(err) != syscall.ENOENT { // missing set: report as the CLI would
+				x.NL.broken.Store(true)
+				logx.Warnf("ipset netlink disabled, using the ipset tool: %v", err)
+			}
+		}
+	}
 	var b strings.Builder
 	for _, e := range entries {
 		b.WriteString("add " + name + " " + e + "\n")
@@ -126,6 +143,13 @@ func (x IPSet) Flush(name string) error {
 
 // Test reports whether ip is in the set.
 func (x IPSet) Test(name, ip string) bool {
+	if x.NL.Usable() {
+		if a := net.ParseIP(ip); a != nil {
+			if in, err := x.NL.Test(name, a); err == nil {
+				return in
+			}
+		}
+	}
 	_, err := x.R.Run("ipset", "test", name, ip)
 	return err == nil
 }

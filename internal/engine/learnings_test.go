@@ -12,7 +12,7 @@ import (
 	"github.com/irisariuan/snake/internal/webrtc"
 )
 
-func learnEngine(t *testing.T) (*Engine, *system.Recorder) {
+func learnEngine(t testing.TB) (*Engine, *system.Recorder) {
 	t.Helper()
 	dir := t.TempDir()
 	b, err := os.ReadFile("../../testdata/config.json")

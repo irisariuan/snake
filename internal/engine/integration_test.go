@@ -244,6 +244,12 @@ func sendSTUN(t *testing.T, addr string, msg []byte) {
 
 // fakeDNS answers A queries on 127.0.0.1:53 from a fixed table.
 func fakeDNS(t *testing.T, table map[string][]string) func() {
+	return fakeDNSFunc(t, func(name string) []string { return table[name] })
+}
+
+// fakeDNSFunc answers A queries on 127.0.0.1:53 with lookup(name): IPs or
+// CNAME targets, in order.
+func fakeDNSFunc(t *testing.T, lookup func(name string) []string) func() {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:53")
 	if err != nil {
 		t.Fatal(err)
@@ -266,7 +272,7 @@ func fakeDNS(t *testing.T, table map[string][]string) func() {
 			_ = b.StartAnswers()
 			owner := q.Name
 			if q.Type == dnsmessage.TypeA {
-				for _, v := range table[strings.TrimSuffix(q.Name.String(), ".")] {
+				for _, v := range lookup(strings.TrimSuffix(q.Name.String(), ".")) {
 					if ip := net.ParseIP(v); ip != nil {
 						var a [4]byte
 						copy(a[:], ip.To4())

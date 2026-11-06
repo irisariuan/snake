@@ -163,7 +163,7 @@
     b.appendChild(el('div', { class: 'row', style: 'margin-bottom:10px' },
       btn('Re-check tunnels', function () { api('POST', '/api/recheck').then(function () { toast('Health check scheduled'); setTimeout(refreshStatus, 4000); }); }),
       btn('Re-apply rules', function () { api('POST', '/api/apply').then(function () { toast('Applied'); refreshStatus(); }).catch(function (e) { toast(e.message); }); }),
-      el('span', { class: 'muted small' }, 'WAN ' + (s.wan_ip || '?') + ' · uptime ' + s.uptime + ' · applied ' + ago(s.last_apply) + ' · IPv6 ' + (s.caps.ipv6 ? 'yes' : 'no') + ' · NFQUEUE ' + (s.caps.nfqueue ? 'yes' : 'no') +
+      el('span', { class: 'muted small' }, 'WAN ' + (s.wan_ip || '?') + ' · uptime ' + s.uptime + ' · applied ' + ago(s.last_apply) + ' · IPv6 ' + (s.caps.ipv6 ? 'yes' : 'no') + ' · NFQUEUE ' + (s.caps.nfqueue ? 'yes' : 'no') + ' · ipset netlink ' + (s.caps.ipset_netlink ? 'yes' : 'no') +
         (s.dns_inspector ? ' · DNS inspector: ' + s.dns_inspector.answers + ' answers, ' + s.dns_inspector.matched + ' matched, ' + s.dns_inspector.added + ' IPs added' : ''))));
 
     var tn = Object.keys(s.tunnels || {}).sort();

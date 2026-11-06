@@ -121,21 +121,25 @@ type Stats struct {
 	Errors  uint64 `json:"errors"`
 }
 
+// inspectorWorkers bounds concurrent set updates for held answers.
+const inspectorWorkers = 16
+
 // Inspector runs the queue.
 type Inspector struct {
 	IPSet netfilter.IPSet
 	// CacheTTL skips re-adding an address seen recently (0 = always add).
 	CacheTTL time.Duration
 
-	mu     sync.Mutex
-	rules  []Rules
-	nf     *nfqueue.Nfqueue
-	cancel context.CancelFunc
-	cache  map[string]time.Time
-	names  map[string]string // address -> name it was answered for (matched answers only)
-	recs   map[string]*Record
-	stats  Stats
-	queue  uint16
+	mu      sync.Mutex
+	rules   []Rules
+	nf      *nfqueue.Nfqueue
+	cancel  context.CancelFunc
+	cache   map[string]time.Time
+	names   map[string]string // address -> name it was answered for (matched answers only)
+	recs    map[string]*Record
+	pending map[string]chan struct{} // set+addr being added right now
+	stats   Stats
+	queue   uint16
 }
 
 // Stats returns a copy of the counters.
@@ -192,17 +196,18 @@ func (i *Inspector) pruneLocked(n int) {
 }
 
 // Records returns copies of the records of the given sets, by address.
-func (i *Inspector) Records(sets ...string) map[string]Record {
+func (i *Inspector) Records(sets ...string) map[string]*Record {
 	want := map[string]bool{}
 	for _, s := range sets {
 		want[s] = true
 	}
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	out := map[string]Record{}
+	out := map[string]*Record{}
 	for _, r := range i.recs {
 		if want[r.Set] {
-			out[r.Addr] = *r
+			c := *r
+			out[r.Addr] = &c
 		}
 	}
 	return out
@@ -304,14 +309,34 @@ func (i *Inspector) Start(queue uint16) error {
 		return fmt.Errorf("dns nfqueue %d: %w", queue, err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	// Answers that need no set change are released at once; the others
+	// are released by workers once their addresses are in the sets, so a
+	// slow add never holds up unrelated lookups.
+	sem := make(chan struct{}, inspectorWorkers)
 	fn := func(a nfqueue.Attribute) int {
 		if a.PacketID == nil {
 			return 0
 		}
+		id := *a.PacketID
+		var work func()
 		if a.Payload != nil {
-			i.handle(*a.Payload)
+			work = i.handle(*a.Payload)
 		}
-		_ = nf.SetVerdict(*a.PacketID, nfqueue.NfAccept)
+		if work == nil {
+			_ = nf.SetVerdict(id, nfqueue.NfAccept)
+			return 0
+		}
+		select {
+		case sem <- struct{}{}:
+			go func() {
+				defer func() { <-sem }()
+				work()
+				_ = nf.SetVerdict(id, nfqueue.NfAccept)
+			}()
+		default: // all workers busy: do it here
+			work()
+			_ = nf.SetVerdict(id, nfqueue.NfAccept)
+		}
 		return 0
 	}
 	errFn := func(e error) int {
@@ -336,14 +361,17 @@ func (i *Inspector) Start(queue uint16) error {
 	return nil
 }
 
-func (i *Inspector) handle(raw []byte) {
+// handle inspects one DNS answer. It returns nil when the answer can be
+// released right away (not a policy answer, or its addresses are already
+// in the sets); otherwise it returns the work that must finish first.
+func (i *Inspector) handle(raw []byte) func() {
 	pk, ok := packet.Parse(raw)
 	if !ok || !pk.UDP {
-		return
+		return nil
 	}
 	ans, ok := ParseAnswer(pk.Payload)
 	if !ok || len(ans.IPs) == 0 {
-		return
+		return nil
 	}
 	atomic.AddUint64(&i.stats.Answers, 1)
 	i.mu.Lock()
@@ -351,17 +379,22 @@ func (i *Inspector) handle(raw []byte) {
 	i.mu.Unlock()
 	r, res, ok := Decide(rules, ans)
 	if !ok {
-		return
+		return nil
 	}
 	atomic.AddUint64(&i.stats.Matched, 1)
 	logx.Debugf("dns: %s matched %q (%s) -> policy %s", ans.Question, res.Rule, res.Name, r.Name)
 	add := map[string][]string{}
+	var keys []string
+	var waits []chan struct{}
 	now := time.Now()
 	client := pk.Dst.String()
 	if pk.Dst.IsLoopback() {
 		client = "router"
 	}
 	i.mu.Lock()
+	if i.pending == nil {
+		i.pending = map[string]chan struct{}{}
+	}
 	for _, ip := range ans.IPs {
 		set := r.Set4
 		if ip.To4() == nil {
@@ -377,6 +410,7 @@ func (i *Inspector) handle(raw []byte) {
 	for _, ip := range ans.IPs {
 		i.names[ip.String()] = ans.Question
 	}
+	done := make(chan struct{})
 	for _, ip := range ans.IPs {
 		set := r.Set4
 		if ip.To4() == nil {
@@ -386,23 +420,54 @@ func (i *Inspector) handle(raw []byte) {
 			continue
 		}
 		key := set + " " + ip.String()
+		if ch, ok := i.pending[key]; ok {
+			// Another answer is adding it right now: release after it.
+			waits = append(waits, ch)
+			continue
+		}
 		if i.CacheTTL > 0 && now.Before(i.cache[key]) {
 			continue
 		}
 		i.cache[key] = now.Add(i.CacheTTL)
+		i.pending[key] = done
+		keys = append(keys, key)
 		add[set] = append(add[set], ip.String())
 	}
 	if len(i.cache) > 50000 {
 		i.cache = map[string]time.Time{}
 	}
 	i.mu.Unlock()
-	for set, ips := range add {
-		if err := i.IPSet.AddMany(set, ips); err != nil {
-			atomic.AddUint64(&i.stats.Errors, 1)
-			logx.Warnf("dns inspector: add to %s: %v", set, err)
-			continue
+	if len(add) == 0 && len(waits) == 0 {
+		return nil
+	}
+	return func() {
+		var failed []string
+		for set, ips := range add {
+			if err := i.IPSet.AddMany(set, ips); err != nil {
+				atomic.AddUint64(&i.stats.Errors, 1)
+				logx.Warnf("dns inspector: add to %s: %v", set, err)
+				for _, ip := range ips {
+					failed = append(failed, set+" "+ip)
+				}
+				continue
+			}
+			atomic.AddUint64(&i.stats.Added, uint64(len(ips)))
 		}
-		atomic.AddUint64(&i.stats.Added, uint64(len(ips)))
+		i.mu.Lock()
+		for _, k := range keys {
+			delete(i.pending, k)
+		}
+		for _, k := range failed {
+			delete(i.cache, k) // retry on the next answer
+		}
+		i.mu.Unlock()
+		close(done)
+		for _, ch := range waits {
+			select {
+			case <-ch:
+			case <-time.After(time.Second):
+			}
+		}
 	}
 }
 

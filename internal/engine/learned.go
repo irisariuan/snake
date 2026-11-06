@@ -129,9 +129,9 @@ func (e *Engine) LearnedAddrs(ref, kind, q string, limit int) (LearnedView, erro
 		v.Kind = LearnedDNS
 	}
 	v.Inspector = k == netfilter.KindDomain && e.dns.Running()
-	ips := netfilter.IPSet{R: e.R}
+	ips := e.ipset()
 	sets := []string{netfilter.SetName(p.ID, k, false), netfilter.SetName(p.ID, k, true)}
-	var recs map[string]dnsinspect.Record
+	var recs map[string]*dnsinspect.Record
 	var sources map[string]string
 	if k == netfilter.KindDomain {
 		recs = e.dns.Records(sets...)
@@ -143,59 +143,84 @@ func (e *Engine) LearnedAddrs(ref, kind, q string, limit int) (LearnedView, erro
 			devices[c.IP] = c.Name
 		}
 	}
+	// Lightweight rows; full LearnedAddr values are built only for the rows
+	// returned (sets can hold 100k+ entries).
+	type row struct {
+		addr string
+		exp  int
+		rec  *dnsinspect.Record
+		last int64
+	}
 	rules := map[string]*RuleCount{}
 	q = strings.ToLower(strings.TrimSpace(q))
-	var all []LearnedAddr
+	has := func(f string) bool { return f != "" && strings.Contains(strings.ToLower(f), q) }
+	var rows []row
 	for _, set := range sets {
 		for _, m := range ips.Members(set, 0) {
-			f := strings.Fields(m)
-			a := LearnedAddr{Addr: f[0]}
-			for i := 1; i+1 < len(f); i++ {
-				if f[i] == "timeout" {
-					a.Expires, _ = strconv.Atoi(f[i+1])
+			r := row{addr: m}
+			if i := strings.IndexByte(m, ' '); i > 0 {
+				r.addr = m[:i]
+				if j := strings.Index(m, " timeout "); j >= 0 {
+					t := m[j+9:]
+					if k := strings.IndexByte(t, ' '); k >= 0 {
+						t = t[:k]
+					}
+					r.exp, _ = strconv.Atoi(t)
 				}
 			}
 			v.Total++
-			if r, ok := recs[a.Addr]; ok {
-				first, last := r.FirstSeen, r.LastSeen
-				a.Name, a.Rule, a.Client, a.Hits, a.FirstSeen, a.LastSeen = r.Name, r.Rule, r.Client, r.Hits, &first, &last
-				if r.Matched != r.Name {
-					a.Matched = r.Matched
+			rule, source := "", ""
+			if rc, ok := recs[r.addr]; ok {
+				r.rec = rc
+				r.last = rc.LastSeen.UnixNano()
+				rule = rc.Rule
+				source = sources[strings.TrimSpace(rule)]
+				if source == "" {
+					source = "removed rule"
 				}
-				a.Source = sources[strings.TrimSpace(r.Rule)]
-				if a.Source == "" {
-					a.Source = "removed rule"
-				}
-				a.Device = devices[r.Client]
 			} else if k == netfilter.KindDomain {
 				v.Unknown++
 			}
-			key := a.Rule
-			if rules[key] == nil {
-				rules[key] = &RuleCount{Rule: a.Rule, Source: a.Source}
+			if rules[rule] == nil {
+				rules[rule] = &RuleCount{Rule: rule, Source: source}
 			}
-			rules[key].Count++
-			if q != "" && !strings.Contains(strings.ToLower(strings.Join([]string{a.Addr, a.Name, a.Matched, a.Rule, a.Source, a.Client, a.Device}, " ")), q) {
+			rules[rule].Count++
+			if q != "" && !strings.Contains(r.addr, q) && (r.rec == nil ||
+				!(has(r.rec.Name) || has(r.rec.Matched) || has(r.rec.Rule) || has(source) || has(r.rec.Client) || has(devices[r.rec.Client]))) {
 				continue
 			}
-			all = append(all, a)
+			rows = append(rows, r)
 		}
 	}
-	v.Matching = len(all)
-	sort.Slice(all, func(i, j int) bool {
-		ti, tj := all[i].LastSeen, all[j].LastSeen
-		switch {
-		case ti != nil && tj != nil && !ti.Equal(*tj):
-			return ti.After(*tj)
-		case (ti == nil) != (tj == nil):
-			return ti != nil
+	v.Matching = len(rows)
+	order := make([]int32, len(rows))
+	for i := range order {
+		order[i] = int32(i)
+	}
+	sort.Slice(order, func(i, j int) bool {
+		a, b := &rows[order[i]], &rows[order[j]]
+		if a.last != b.last {
+			return a.last > b.last // newest first; no record (0) last
 		}
-		return all[i].Addr < all[j].Addr
+		return a.addr < b.addr
 	})
-	if len(all) > limit {
-		all = all[:limit]
+	if len(order) > limit {
+		order = order[:limit]
 	}
-	v.Addrs = append(v.Addrs, all...)
+	for _, i := range order {
+		r := rows[i]
+		a := LearnedAddr{Addr: r.addr, Expires: r.exp}
+		if rc := r.rec; rc != nil {
+			first, last := rc.FirstSeen, rc.LastSeen
+			a.Name, a.Rule, a.Client, a.Hits, a.FirstSeen, a.LastSeen = rc.Name, rc.Rule, rc.Client, rc.Hits, &first, &last
+			if rc.Matched != rc.Name {
+				a.Matched = rc.Matched
+			}
+			a.Source = rules[rc.Rule].Source
+			a.Device = devices[rc.Client]
+		}
+		v.Addrs = append(v.Addrs, a)
+	}
 	if k == netfilter.KindDomain {
 		for _, r := range rules {
 			v.Rules = append(v.Rules, *r)
@@ -229,7 +254,7 @@ func (e *Engine) ForgetLearned(ref string, req ForgetRequest) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	ips := netfilter.IPSet{R: e.R}
+	ips := e.ipset()
 	s4, s6 := netfilter.SetName(p.ID, k, false), netfilter.SetName(p.ID, k, true)
 	if req.All {
 		n := max(ips.Count(s4), 0) + max(ips.Count(s6), 0)

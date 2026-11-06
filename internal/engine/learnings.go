@@ -54,7 +54,7 @@ func (e *Engine) importLegacyServers() {
 		return
 	}
 	cfg := e.runtime()
-	ips := netfilter.IPSet{R: e.R}
+	ips := e.ipset()
 	now := time.Now()
 	for _, p := range cfg.Policies {
 		var addrs []string
@@ -117,7 +117,7 @@ func (e *Engine) syncLearnings(cfg *config.Config) error {
 			per[p] = append(per[p], addr)
 		}
 	}
-	ips := netfilter.IPSet{R: e.R}
+	ips := e.ipset()
 	var errs []string
 	for id := range usable {
 		v4, v6 := netfilter.SplitFamilies(per[id])
@@ -230,7 +230,7 @@ func (e *Engine) gatherOrigins(cfg *config.Config, ev webrtc.ServerEvent) []lear
 		active[k] = v
 	}
 	e.mu.Unlock()
-	ips := netfilter.IPSet{R: e.R}
+	ips := e.ipset()
 	var out []learn.Origin
 	for _, p := range cfg.Policies {
 		if !tracksWebRTC(p) {

@@ -23,6 +23,7 @@ import (
 	"regexp"
 	"regexp/syntax"
 	"strings"
+	"sync"
 )
 
 // Kind of pattern.
@@ -275,10 +276,13 @@ func (p Pattern) Match(name string) bool {
 // Native reports whether dnsmasq's ipset= can implement the rule exactly.
 func (p Pattern) Native() bool { return p.Kind == Suffix && !p.Negate }
 
-// Set is a compiled rule list.
+// Set is a compiled rule list. Do not modify Include/Exclude after the
+// first MatchAny: the lookup index is built once.
 type Set struct {
-	Include []Pattern
-	Exclude []Pattern
+	once     sync.Once
+	inc, exc index
+	Include  []Pattern
+	Exclude  []Pattern
 }
 
 // LineError is a parse error for one rule.
@@ -325,24 +329,91 @@ type Result struct {
 }
 
 // MatchAny tests every name (query name first, then the CNAME chain).
-// A name matching an exclusion vetoes the whole answer.
+// A name matching an exclusion vetoes the whole answer. Among the rules
+// matching the first matching name, the earliest rule is reported.
 func (s *Set) MatchAny(names ...string) Result {
-	var res Result
+	s.once.Do(s.build)
 	for _, n := range names {
-		for _, p := range s.Exclude {
-			if p.Match(n) {
-				return Result{Excluded: p.Raw, Name: n}
-			}
+		if i := s.exc.first(n); i >= 0 {
+			return Result{Excluded: s.Exclude[i].Raw, Name: n}
 		}
 	}
 	for _, n := range names {
-		for _, p := range s.Include {
-			if p.Match(n) {
-				return Result{Matched: true, Name: n, Rule: p.Raw}
-			}
+		if i := s.inc.first(n); i >= 0 {
+			return Result{Matched: true, Name: n, Rule: s.Include[i].Raw}
 		}
 	}
-	return res
+	return Result{}
+}
+
+// index answers "earliest matching pattern" without scanning plain domain
+// rules: suffix/subdomain/exact rules are looked up by the name and each of
+// its parent domains; only globs, keywords and regexes are scanned.
+type index struct {
+	whole map[string]int // name == value: Suffix, Exact
+	sub   map[string]int // name ends in "."+value: Suffix, Subdomains
+	slow  []int          // pattern indexes that need Match
+	pats  []Pattern
+}
+
+func newIndex(pats []Pattern) index {
+	x := index{whole: map[string]int{}, sub: map[string]int{}, pats: pats}
+	keep := func(m map[string]int, k string, i int) {
+		if j, ok := m[k]; !ok || i < j {
+			m[k] = i
+		}
+	}
+	for i, p := range pats {
+		switch p.Kind {
+		case Suffix:
+			keep(x.whole, p.Value, i)
+			keep(x.sub, p.Value, i)
+		case Exact:
+			keep(x.whole, p.Value, i)
+		case Subdomains:
+			keep(x.sub, p.Value, i)
+		default:
+			x.slow = append(x.slow, i)
+		}
+	}
+	return x
+}
+
+// first returns the index of the earliest pattern matching name, or -1.
+func (x *index) first(name string) int {
+	best := -1
+	better := func(i int) {
+		if best < 0 || i < best {
+			best = i
+		}
+	}
+	if i, ok := x.whole[name]; ok {
+		better(i)
+	}
+	for rest := name; ; {
+		dot := strings.IndexByte(rest, '.')
+		if dot < 0 {
+			break
+		}
+		rest = rest[dot+1:]
+		if i, ok := x.sub[rest]; ok {
+			better(i)
+		}
+	}
+	for _, i := range x.slow {
+		if best >= 0 && i > best {
+			break
+		}
+		if x.pats[i].Match(name) {
+			better(i)
+			break
+		}
+	}
+	return best
+}
+
+func (s *Set) build() {
+	s.inc, s.exc = newIndex(s.Include), newIndex(s.Exclude)
 }
 
 // Empty reports whether the set has no include rules.

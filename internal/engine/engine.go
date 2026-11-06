@@ -23,6 +23,7 @@ import (
 	"github.com/irisariuan/snake/internal/health"
 	"github.com/irisariuan/snake/internal/learn"
 	"github.com/irisariuan/snake/internal/logx"
+	"github.com/irisariuan/snake/internal/match"
 	"github.com/irisariuan/snake/internal/netfilter"
 	"github.com/irisariuan/snake/internal/routing"
 	"github.com/irisariuan/snake/internal/system"
@@ -65,6 +66,9 @@ type Caps struct {
 	NFQueue   bool `json:"nfqueue"`
 	Conntrack bool `json:"conntrack_tool"`
 	Procfs    bool `json:"conntrack_procfs"`
+	// IPSetNetlink: set entries are added and tested over netlink instead
+	// of by running the ipset tool.
+	IPSetNetlink bool `json:"ipset_netlink"`
 }
 
 // Event is a notable state change.
@@ -81,34 +85,37 @@ type Engine struct {
 	R      system.Runner
 	DryRun bool
 
-	mu         sync.Mutex
-	applyMu    sync.Mutex     // serialises kernel updates
-	cfgMu      sync.Mutex     // serialises read-modify-write config updates
-	cfg        *config.Config // as stored (rule lists referenced by name)
-	rt         *config.Config // runtime copy: rule lists merged into policies
-	caps       Caps
-	mon        *health.Monitor
-	rtc        *webrtc.Tracker
-	learn      *learn.Store
-	learnMu    sync.Mutex   // serialises learning-set syncs
-	learnRoute atomic.Value // map[string]int: server -> policy (0 = WAN), as installed
-	dns        *dnsinspect.Inspector
-	dnsOn      bool
-	asnCache   *asn.Cache
-	active     map[int]string
-	cands      map[int][]Candidate
-	events     []Event
-	plan       netfilter.Plan
-	lastApply  time.Time
-	lastError  string
-	asnErrors  map[int]string
-	netHashes  map[string]string
-	rtcKey     string
-	started    time.Time
-	applyCount int
-	linkKey    string
-	kick       chan struct{}
-	daemon     bool
+	mu          sync.Mutex
+	applyMu     sync.Mutex     // serialises kernel updates
+	cfgMu       sync.Mutex     // serialises read-modify-write config updates
+	cfg         *config.Config // as stored (rule lists referenced by name)
+	rt          *config.Config // runtime copy: rule lists merged into policies
+	caps        Caps
+	mon         *health.Monitor
+	rtc         *webrtc.Tracker
+	nl          *netfilter.NL
+	compiled    map[int]*match.Set // domain rules of compiledFor, by policy id
+	compiledFor *config.Config
+	learn       *learn.Store
+	learnMu     sync.Mutex   // serialises learning-set syncs
+	learnRoute  atomic.Value // map[string]int: server -> policy (0 = WAN), as installed
+	dns         *dnsinspect.Inspector
+	dnsOn       bool
+	asnCache    *asn.Cache
+	active      map[int]string
+	cands       map[int][]Candidate
+	events      []Event
+	plan        netfilter.Plan
+	lastApply   time.Time
+	lastError   string
+	asnErrors   map[int]string
+	netHashes   map[string]string
+	rtcKey      string
+	started     time.Time
+	applyCount  int
+	linkKey     string
+	kick        chan struct{}
+	daemon      bool
 }
 
 // New creates an engine.
@@ -213,10 +220,27 @@ func (e *Engine) DetectCaps() {
 	c.Conntrack = system.Exists("conntrack")
 	_, err := os.Stat("/proc/net/nf_conntrack")
 	c.Procfs = err == nil
+	if !e.DryRun {
+		e.mu.Lock()
+		have := e.nl != nil
+		e.mu.Unlock()
+		if !have {
+			if nl, err := netfilter.OpenNL(); err == nil {
+				e.mu.Lock()
+				e.nl = nl
+				e.mu.Unlock()
+				e.dns.IPSet.NL = nl
+				e.rtc.IPSet.NL = nl
+			} else {
+				logx.Infof("ipset over netlink unavailable, using the ipset tool: %v", err)
+			}
+		}
+		c.IPSetNetlink = e.ipset().NL.Usable()
+	}
 	e.mu.Lock()
 	e.caps = c
 	e.mu.Unlock()
-	logx.Infof("capabilities: ipv6=%v ipv6nat=%v nfqueue=%v conntrack=%v", c.IPv6, c.IPv6NAT, c.NFQueue, c.Conntrack)
+	logx.Infof("capabilities: ipv6=%v ipv6nat=%v nfqueue=%v conntrack=%v ipset-netlink=%v", c.IPv6, c.IPv6NAT, c.NFQueue, c.Conntrack, c.IPSetNetlink)
 }
 
 func (e *Engine) event(policy, kind, format string, a ...any) {
@@ -228,6 +252,13 @@ func (e *Engine) event(policy, kind, format string, a ...any) {
 		e.events = e.events[1:]
 	}
 	e.events = append(e.events, ev)
+}
+
+// ipset returns the set manager, with netlink when available.
+func (e *Engine) ipset() netfilter.IPSet {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return netfilter.IPSet{R: e.R, NL: e.nl}
 }
 
 // usedTunnels lists tunnels referenced by enabled policies.
@@ -395,7 +426,7 @@ func (e *Engine) Apply(reason string) error {
 	}
 	s := cfg.Settings
 	states := e.states(cfg, caps)
-	ips := netfilter.IPSet{R: e.R}
+	ips := e.ipset()
 	nf := netfilter.Applier{R: e.R}
 	rt := routing.Manager{R: e.R}
 	var errs []string
@@ -568,7 +599,7 @@ func (e *Engine) dnsRules(states []netfilter.PolicyState, caps Caps) []dnsinspec
 		if !p.HasDomains() {
 			continue
 		}
-		r := dnsinspect.Rules{ID: p.ID, Name: p.Name, Set: p.DomainRules(), FollowCNAME: !p.IgnoreCNAME,
+		r := dnsinspect.Rules{ID: p.ID, Name: p.Name, Set: e.domainSet(p), FollowCNAME: !p.IgnoreCNAME,
 			Set4: netfilter.SetName(p.ID, netfilter.KindDomain, false)}
 		if caps.IPv6 {
 			r.Set6 = netfilter.SetName(p.ID, netfilter.KindDomain, true)
@@ -766,13 +797,31 @@ func (e *Engine) Caps() Caps {
 }
 
 // runtime returns the expanded configuration used for routing decisions.
+// It is shared and read-only: configuration changes replace it, they never
+// modify it (deep copies of large rule lists cost real CPU on a router).
 func (e *Engine) runtime() *config.Config {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.rt == nil {
 		return config.Default()
 	}
-	return cloneConfig(e.rt)
+	return e.rt
+}
+
+// domainSet returns a policy's compiled domain rules, compiled once per
+// configuration.
+func (e *Engine) domainSet(p config.Policy) *match.Set {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if s, ok := e.compiled[p.ID]; ok && e.compiledFor == e.rt {
+		return s
+	}
+	if e.compiledFor != e.rt {
+		e.compiled, e.compiledFor = map[int]*match.Set{}, e.rt
+	}
+	s := p.DomainRules()
+	e.compiled[p.ID] = s
+	return s
 }
 
 // UpdateConfig applies fn to a copy of the configuration, then validates,

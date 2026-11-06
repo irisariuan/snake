@@ -30,7 +30,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		return err
 	}
 	e.DetectCaps()
-	ips := netfilter.IPSet{R: e.R}
+	ips := e.ipset()
 	if _, err := os.Stat(e.P.IPSetSave); err == nil {
 		if err := ips.RestoreFile(e.P.IPSetSave); err != nil {
 			logx.Warnf("restore saved ipsets: %v", err)
@@ -130,7 +130,7 @@ func (e *Engine) saveSets() {
 	if e.DryRun {
 		return
 	}
-	ips := netfilter.IPSet{R: e.R}
+	ips := e.ipset()
 	var names []string
 	for _, n := range ips.Names() {
 		// Only DNS-learned sets are worth persisting; static sets are
@@ -216,7 +216,7 @@ func (e *Engine) Status() Status {
 	}
 	st.WANIP = system.NVRAM{R: e.R}.Get("wan0_ipaddr")
 	st.Tunnels = e.mon.Snapshot()
-	ips := netfilter.IPSet{R: e.R}
+	ips := e.ipset()
 	counters := (netfilter.Applier{R: e.R}).Counters(false)
 	if caps.IPv6 {
 		for k, v := range (netfilter.Applier{R: e.R}).Counters(true) {
@@ -309,6 +309,10 @@ type AddrResult struct {
 // MatchDomain finds the first enabled policy whose rules match name or (with
 // CNAME following) any name of its chain.
 func MatchDomain(cfg *config.Config, name string, chain ...string) (config.Policy, match.Result, []string, bool) {
+	return matchDomain(cfg, config.Policy.DomainRules, name, chain...)
+}
+
+func matchDomain(cfg *config.Config, rules func(config.Policy) *match.Set, name string, chain ...string) (config.Policy, match.Result, []string, bool) {
 	names := append([]string{match.Normalize(name)}, chain...)
 	var excluded []string
 	for _, p := range cfg.Policies {
@@ -319,7 +323,7 @@ func MatchDomain(cfg *config.Config, name string, chain ...string) (config.Polic
 		if p.IgnoreCNAME {
 			ns = names[:1]
 		}
-		res := p.DomainRules().MatchAny(ns...)
+		res := rules(p).MatchAny(ns...)
 		if res.Matched {
 			return p, res, excluded, true
 		}
@@ -341,9 +345,9 @@ func (e *Engine) TestDomain(name string) DomainTest {
 		res.Error = err.Error()
 	}
 	res.Chain = ans.Chain
-	p, mr, excl, ok := MatchDomain(cfg, name, ans.Chain...)
+	p, mr, excl, ok := matchDomain(cfg, e.domainSet, name, ans.Chain...)
 	res.Excluded = excl
-	ips := netfilter.IPSet{R: e.R}
+	ips := e.ipset()
 	for _, ip := range ans.IPs {
 		ar := AddrResult{IP: ip.String()}
 		v6 := ip.To4() == nil
@@ -380,7 +384,7 @@ func (e *Engine) TestDomain(name string) DomainTest {
 		} else {
 			res.Notes = append(res.Notes, "no healthy tunnel: traffic currently goes via WAN")
 		}
-		if !dnsOn && (mr.Name != name || p.DomainRules().NeedsInspector()) {
+		if !dnsOn && (mr.Name != name || e.domainSet(p).NeedsInspector()) {
 			res.Notes = append(res.Notes, "this match needs the DNS inspector, which is not running (kernel without NFQUEUE?)")
 		}
 		for _, a := range res.Addrs {
@@ -402,13 +406,13 @@ func (e *Engine) SetMembers(name string, limit int) ([]string, error) {
 	if !strings.HasPrefix(name, netfilter.SetPrefix) {
 		return nil, fmt.Errorf("not a snake set")
 	}
-	return netfilter.IPSet{R: e.R}.Members(name, limit), nil
+	return e.ipset().Members(name, limit), nil
 }
 
 // FlushLearned empties DNS-learned and WebRTC sets of a policy. Learning
 // groups are managed separately (Learnings tab).
 func (e *Engine) FlushLearned(id int) {
-	ips := netfilter.IPSet{R: e.R}
+	ips := e.ipset()
 	for _, k := range []string{netfilter.KindDomain, netfilter.KindPeer, netfilter.KindSession} {
 		for _, v6 := range []bool{false, true} {
 			_ = ips.Flush(netfilter.SetName(id, k, v6))
