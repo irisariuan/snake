@@ -125,13 +125,13 @@ except Exception as e:
 	// must survive policy assignment, and the egress packet must have its
 	// QoS classification restored after the routing decision.
 	sh(t, "iptables "+strings.Replace(foreign, "-A", "-D", 1))
-	sh(t, "iptables -t mangle -N TEST_CLASSIFY; iptables -t mangle -A TEST_CLASSIFY -j CONNMARK --set-xmark 0x80010002/0xc03fffff; iptables -t mangle -A TEST_CLASSIFY -j MARK --set-xmark 0x80010002/0xc03fffff; iptables -t mangle -I PREROUTING 1 -i br0 -d 203.0.113.80 -j TEST_CLASSIFY")
+	sh(t, "iptables -t mangle -N TEST_CLASSIFY; iptables -t mangle -A TEST_CLASSIFY -j CONNMARK --set-xmark 0x8001f002/0xc03fffff; iptables -t mangle -A TEST_CLASSIFY -j MARK --set-xmark 0x8001f002/0xc03fffff; iptables -t mangle -I PREROUTING 1 -i br0 -d 203.0.113.80 -j TEST_CLASSIFY")
 	defer exec.Command("sh", "-c", "iptables -t mangle -D PREROUTING -i br0 -d 203.0.113.80 -j TEST_CLASSIFY; iptables -t mangle -F TEST_CLASSIFY; iptables -t mangle -X TEST_CLASSIFY").Run()
-	sh(t, "iptables -t mangle -N TEST_QOS; iptables -t mangle -A TEST_QOS -j RETURN; iptables -t mangle -A POSTROUTING -o wgc1 -m mark --mark 0x80010002/0xc03fffff -j TEST_QOS")
-	defer exec.Command("sh", "-c", "iptables -t mangle -D POSTROUTING -o wgc1 -m mark --mark 0x80010002/0xc03fffff -j TEST_QOS; iptables -t mangle -F TEST_QOS; iptables -t mangle -X TEST_QOS").Run()
+	sh(t, "iptables -t mangle -N TEST_QOS; iptables -t mangle -A TEST_QOS -j RETURN; iptables -t mangle -A POSTROUTING -o wgc1 -m mark --mark 0x8001f002/0xc03fffff -j TEST_QOS")
+	defer exec.Command("sh", "-c", "iptables -t mangle -D POSTROUTING -o wgc1 -m mark --mark 0x8001f002/0xc03fffff -j TEST_QOS; iptables -t mangle -F TEST_QOS; iptables -t mangle -X TEST_QOS").Run()
 	runClient("tunnel with QoS enabled")
-	ct := sh(t, "conntrack -L -p tcp -s 192.168.77.2 -d 203.0.113.80 --mark 0x80410002/0xffffffff")
-	if !strings.Contains(ct, fmt.Sprintf("mark=%d", c.Settings.ConnMark(1)|0x80010002)) {
+	ct := sh(t, "conntrack -L -p tcp -s 192.168.77.2 -d 203.0.113.80 --mark 0x8041f002/0xffffffff")
+	if !strings.Contains(ct, fmt.Sprintf("mark=%d", c.Settings.ConnMark(1)|0x8001f002)) {
 		t.Fatalf("VPN connmark lost QoS classification or policy ownership: %s", ct)
 	}
 	counters := sh(t, "iptables -t mangle -nvxL TEST_QOS")
@@ -147,8 +147,16 @@ except Exception as e:
 	}
 	sh(t, "ipset del SNK_1_d4 203.0.113.80")
 	runClient("WAN with QoS enabled")
-	ct = sh(t, "conntrack -L -p tcp -s 192.168.77.2 -d 203.0.113.80 --mark 0x80010002/0xffffffff")
-	if !strings.Contains(ct, fmt.Sprintf("mark=%d", uint32(0x80010002))) {
+	ct = sh(t, "conntrack -L -p tcp -s 192.168.77.2 -d 203.0.113.80 --mark 0x8001f002/0xffffffff")
+	if !strings.Contains(ct, fmt.Sprintf("mark=%d", uint32(0x8001f002))) {
 		t.Fatalf("WAN connmark lost QoS classification or acquired policy ownership: %s", ct)
+	}
+	// The opposite QoS direction and a category different from the VPN
+	// policy must work too, while preserving VPN Director's low mark bits.
+	sh(t, "ipset add SNK_1_d4 203.0.113.80; iptables -t mangle -R TEST_CLASSIFY 1 -j CONNMARK --set-xmark 0x4002f003/0xc03fffff; iptables -t mangle -R TEST_CLASSIFY 2 -j MARK --set-xmark 0x4002f003/0xc03fffff")
+	runClient("tunnel with opposite QoS direction and category")
+	ct = sh(t, "conntrack -L -p tcp -s 192.168.77.2 -d 203.0.113.80 --mark 0x4042f003/0xffffffff")
+	if !strings.Contains(ct, fmt.Sprintf("mark=%d", c.Settings.ConnMark(1)|0x4002f003)) {
+		t.Fatalf("VPN connmark lost alternate QoS/Director bits: %s", ct)
 	}
 }

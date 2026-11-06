@@ -91,7 +91,7 @@ func TestBuild(t *testing.T) {
 		"-A SNAKE_FWD -i br+ -p tcp --dport 853 -j REJECT --reject-with tcp-reset",
 		"-A SNAKE_FWD -i br+ -p tcp --dport 443 -m set --match-set SNK_DOH4 dst -j REJECT --reject-with tcp-reset",
 		"-A SNAKE_FWD -i br+ -m mac --mac-source aa:bb:cc:00:00:09 -p udp --dport 443 -j REJECT",
-		"-A SNAKE_FWD -i br+ -o wgc1 -m mark ! --mark 0/0xff0000 -j ACCEPT",
+		"-A SNAKE_FWD -i br+ -o wgc1 -m mark ! --mark 0/0xff0000 -m mark --mark 0/0xc0000000 -j ACCEPT",
 	)
 	// leak blocks must precede accepts
 	if strings.Index(f4, "--dport 853") > strings.Index(f4, "-j ACCEPT") {
@@ -102,7 +102,7 @@ func TestBuild(t *testing.T) {
 	if strings.Contains(m6, "SNAKE_P3") {
 		t.Error("ipv6 off policy present in v6 rules")
 	}
-	mustContain(t, f6, "-A SNAKE_FWD -m mark --mark 0x20000/0xff0000 -j REJECT --reject-with icmp6-adm-prohibited", "icmp6-port-unreachable")
+	mustContain(t, f6, "-A SNAKE_FWD -m mark --mark 0x20000/0xc0ff0000 -j REJECT --reject-with icmp6-adm-prohibited", "icmp6-port-unreachable")
 	if strings.Contains(m4, "NFQUEUE --queue-num 4200") {
 		t.Error("DNS queue rule without DNSQueue option")
 	}

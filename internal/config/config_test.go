@@ -228,3 +228,17 @@ func TestMigrateMarkMask(t *testing.T) {
 		t.Fatal("default mask overlaps reserved bits or VPN Director")
 	}
 }
+
+func TestConnectionMaskRejectsQoSOverlap(t *testing.T) {
+	for _, mask := range []uint32{0xff0000, 0xff00, 0xff000000} {
+		c := Default()
+		c.Settings.ConnMarkMask = mask
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "Adaptive QoS") {
+			t.Errorf("connection mask %#x should reject QoS overlap: %v", mask, err)
+		}
+	}
+	c := Default()
+	if c.Settings.ConnMarkMask&AdaptiveQoSMask != 0 || c.Settings.ConnMarkMask&0xf000 != 0 {
+		t.Fatal("default connection ownership overlaps QoS or VPN Director")
+	}
+}

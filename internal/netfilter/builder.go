@@ -391,8 +391,8 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		// IPv6 block: policy traffic that cannot be carried over IPv6 is rejected
 		// so clients fall back to IPv4 (which goes through the tunnel).
 		if v6 && st.IPv6Mode == V6Block {
-			filter.add(ChainFwd, "-m mark --mark", mark+"/"+mask, "-p tcp -j REJECT --reject-with tcp-reset")
-			filter.add(ChainFwd, "-m mark --mark", mark+"/"+mask, "-j REJECT --reject-with icmp6-adm-prohibited")
+			filter.add(ChainFwd, "-m mark --mark", mark+"/"+rmask, "-p tcp -j REJECT --reject-with tcp-reset")
+			filter.add(ChainFwd, "-m mark --mark", mark+"/"+rmask, "-j REJECT --reject-with icmp6-adm-prohibited")
 		}
 
 		l := p.Leak
@@ -468,7 +468,7 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 				nat.add(ChainNAT, "-o", ifc, "-m mark --mark", hex(s.PolicyMark(st.Policy.ID))+"/"+rmask, "-j MASQUERADE")
 			}
 		}
-		filter.add(ChainFwd, "-i", lan, "-o", ifc, "-m mark ! --mark 0/"+mask, "-j ACCEPT")
+		filter.add(ChainFwd, "-i", lan, "-o", ifc, "-m mark ! --mark 0/"+mask, "-m mark --mark 0/"+qdir, "-j ACCEPT")
 		filter.add(ChainFwd, "-i", ifc, "-o", lan, "-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT")
 	}
 	return mangle, nat, filter
