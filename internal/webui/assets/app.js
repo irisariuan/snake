@@ -715,12 +715,7 @@
       });
     }).catch(function (e) { audit.textContent = e.message; });
 
-    // set viewer
-    var setSel = el('select');
-    var setOut = el('pre', null, '');
-    (state.status.policies || []).forEach(function (p) { Object.keys(p.sets || {}).forEach(function (n) { setSel.appendChild(el('option', { value: n }, p.name + ': ' + n + ' (' + p.sets[n] + ')')); }); });
-    b.appendChild(el('div', { class: 'card' }, el('b', null, 'Learned addresses'), el('div', { class: 'row', style: 'margin:6px 0' }, setSel,
-      btn('Show', function () { api('GET', '/api/set?name=' + encodeURIComponent(setSel.value) + '&limit=1000').then(function (r) { setOut.textContent = (r.members || []).join('\n') || '(empty)'; }); })), setOut));
+    b.appendChild(el('p', { class: 'small muted' }, 'Learned addresses (DNS answers, WebRTC peers, STUN/TURN servers) are in the Learnings tab.'));
 
     // logs + plan
     var logOut = el('pre', null, '');
@@ -835,6 +830,82 @@
     return t ? new Date(t).toISOString() : '';
   }
   function viewLearnings(b) {
+    state.learnView = state.learnView || 'groups';
+    b.appendChild(el('div', { class: 'row', style: 'margin-bottom:10px' },
+      [['groups', 'STUN/TURN server groups'], ['addrs', 'Policy addresses (DNS, WebRTC peers)']].map(function (v) {
+        return btn(v[1], function () { state.learnView = v[0]; render(); }, state.learnView === v[0] ? 'pri' : '');
+      })));
+    if (state.learnView === 'addrs') return viewLearnedAddrs(b);
+    viewLearnGroups(b);
+  }
+  function viewLearnedAddrs(b) {
+    var pols = (state.cfg.policies || []).filter(function (p) { return p.enabled; });
+    var la = state.la = state.la || { policy: pols.length ? pols[0].id : 0, kind: 'dns', q: '' };
+    b.appendChild(el('p', { class: 'small muted' },
+      'Addresses each policy has learned: answers to its domain rules (from the DNS inspector, or dnsmasq when the inspector is off) and WebRTC peers. ' +
+      'Removing an address only lasts until the policy learns it again: the next DNS answer or ICE check adds it back. To stop routing a domain, change the rule.'));
+    var polSel = el('select', { onchange: function (e) { la.policy = +e.target.value; la.data = null; loadLA(); } },
+      pols.map(function (p) { return el('option', { value: p.id, selected: p.id === la.policy ? 'selected' : null }, p.name); }));
+    var kindSel = el('select', { onchange: function (e) { la.kind = e.target.value; la.data = null; loadLA(); } },
+      el('option', { value: 'dns', selected: la.kind === 'dns' ? 'selected' : null }, 'DNS answers'),
+      el('option', { value: 'peer', selected: la.kind === 'peer' ? 'selected' : null }, 'WebRTC peers'));
+    var qIn = el('input', { type: 'text', placeholder: 'filter: address, name, rule, device', size: 30, value: la.q,
+      onkeydown: function (e) { if (e.key === 'Enter') { la.q = qIn.value; loadLA(); } } });
+    b.appendChild(el('div', { class: 'row', style: 'margin-bottom:8px' }, polSel, kindSel, qIn,
+      btn('Search', function () { la.q = qIn.value; loadLA(); }), btn('Refresh', loadLA)));
+    var out = el('div');
+    b.appendChild(out);
+    if (!pols.length) { out.appendChild(el('p', { class: 'muted' }, 'No enabled policies.')); return; }
+    function forget(body, msg) {
+      body.kind = la.kind;
+      api('POST', '/api/learned/' + la.policy + '/forget', body).then(function (r) { toast((msg || 'Removed') + ': ' + r.removed); loadLA(); }).catch(function (e) { toast(e.message); });
+    }
+    function loadLA() {
+      api('GET', '/api/learned/' + la.policy + '?kind=' + la.kind + '&limit=1000&q=' + encodeURIComponent(la.q || ''))
+        .then(function (v) { la.data = v; if (state.tab === 'learn' && state.learnView === 'addrs') render(); })
+        .catch(function (e) { toast(e.message); });
+    }
+    var v = la.data;
+    if (!v || v.policy_id !== la.policy || v.kind !== la.kind) { out.appendChild(el('p', { class: 'muted' }, 'Loading...')); if (!la.loading) { la.loading = true; setTimeout(function () { la.loading = false; loadLA(); }, 0); } return; }
+    var info = v.total + ' in the kernel set' + (v.matching !== v.total ? ' · ' + v.matching + ' match the filter' : '');
+    if (v.kind === 'dns') {
+      if (v.unknown) info += ' · ' + v.unknown + ' without DNS details (added by dnsmasq, or before details were recorded)';
+      if (!v.inspector) info += ' · DNS inspector off: new answers are added by dnsmasq without details';
+    }
+    out.appendChild(el('div', { class: 'row', style: 'margin-bottom:8px' }, el('span', { class: 'small muted' }, info),
+      v.total ? btn('Remove all', function () { if (confirm('Remove all ' + v.total + ' learned ' + (v.kind === 'dns' ? 'DNS' : 'peer') + ' addresses of ' + v.policy + '?')) forget({ all: true }, 'Removed'); }, 'danger') : null));
+    if (v.kind === 'dns' && (v.rules || []).length) {
+      out.appendChild(el('details', { class: 'card', open: la.rulesOpen ? true : null, ontoggle: function (e) { la.rulesOpen = e.target.open; } },
+        el('summary', { style: 'cursor:pointer' }, el('b', null, 'By rule'), el('span', { class: 'small muted' }, ' (' + v.rules.length + ')')),
+        el('table', null, el('tr', null, ['Rule', 'From', 'Addresses', ''].map(function (h) { return el('th', null, h); })),
+          v.rules.map(function (r) {
+            return el('tr', null,
+              el('td', { class: 'mono' }, r.rule || el('span', { class: 'muted' }, '(no details)')),
+              el('td', { class: 'small' }, r.source || ''),
+              el('td', null, r.count),
+              el('td', null, btn('Remove these', function () { if (confirm('Remove the ' + r.count + ' addresses learned by ' + (r.rule || 'unknown rules') + '?')) forget({ rule: r.rule }, 'Removed'); }, 'danger')));
+          }))));
+    }
+    if (!v.addrs.length) { out.appendChild(el('p', { class: 'muted' }, v.total ? 'Nothing matches the filter.' : 'Nothing learned yet.')); return; }
+    var head = v.kind === 'dns' ? ['Address', 'Name', 'Rule', 'Device', 'Last answer', 'Expires', ''] : ['Address', 'Expires', ''];
+    out.appendChild(el('div', { class: 'scroll' }, el('table', null,
+      el('tr', null, head.map(function (h) { return el('th', null, h); })),
+      v.addrs.map(function (a) {
+        var exp = a.expires ? fmtDur(a.expires) : 'never';
+        var rm = btn('Remove', function () { forget({ addrs: [a.addr] }, 'Removed'); }, 'danger');
+        if (v.kind !== 'dns') return el('tr', null, el('td', { class: 'mono' }, a.addr), el('td', { class: 'small' }, exp), el('td', null, rm));
+        return el('tr', null,
+          el('td', { class: 'mono' }, a.addr),
+          el('td', { class: 'small' }, a.name || el('span', { class: 'muted' }, 'unknown'), a.matched ? el('div', { class: 'muted' }, 'via ' + a.matched) : null),
+          el('td', { class: 'small' }, el('span', { class: 'mono' }, a.rule || ''), a.source ? el('div', { class: 'muted' }, a.source) : null),
+          el('td', { class: 'small' }, a.device || '', el('div', { class: 'muted mono' }, a.client || '')),
+          el('td', { class: 'small' }, a.last_seen ? ago(a.last_seen) : '', a.hits ? el('div', { class: 'muted' }, a.hits + ' answers') : null),
+          el('td', { class: 'small' }, exp),
+          el('td', null, rm));
+      }))));
+    if (v.addrs.length < v.matching) out.appendChild(el('p', { class: 'small muted' }, 'Showing ' + v.addrs.length + ' of ' + v.matching + '. Use the filter to narrow it down.'));
+  }
+  function viewLearnGroups(b) {
     var L = state.learn;
     state.learnOpen = state.learnOpen || {};
     b.appendChild(el('p', { class: 'small muted' },

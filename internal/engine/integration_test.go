@@ -354,7 +354,15 @@ func TestIntegrationDNSInspector(t *testing.T) {
 	if st.Matched != 3 {
 		t.Errorf("matched = %d, want 3", st.Matched)
 	}
-	// The domain tester sees the CNAME chain and the matching rule.
+	// Policy addresses view: kernel set joined with the inspector's records.
+	lv, err := e.LearnedAddrs("nf", LearnedDNS, "partner", 0)
+	if err != nil || lv.Total != 3 || len(lv.Addrs) != 1 || lv.Addrs[0].Matched != "x1.cdn.nflxvideo.net" || lv.Addrs[0].Rule != "**.nflxvideo.net" || lv.Addrs[0].Source != "policy" {
+		t.Errorf("LearnedAddrs = %+v %v", lv, err)
+	}
+	if n, err := e.ForgetLearned("nf", ForgetRequest{Kind: LearnedDNS, Addrs: []string{"203.0.113.51"}}); err != nil || n != 1 || strings.Contains(sh(t, "ipset list SNK_1_d4"), "203.0.113.51") {
+		t.Errorf("forget: %d %v", n, err)
+	}
+		// The domain tester sees the CNAME chain and the matching rule.
 	dt := e.TestDomain("play.partner.tv")
 	if dt.Policy != "nf" || dt.Matched != "**.nflxvideo.net" || dt.Via != "x1.cdn.nflxvideo.net" || len(dt.Addrs) != 1 || dt.Addrs[0].InSet != "SNK_1_d4" {
 		t.Errorf("TestDomain = %+v", dt)

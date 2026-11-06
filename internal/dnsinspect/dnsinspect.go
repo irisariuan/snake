@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -132,6 +133,7 @@ type Inspector struct {
 	cancel context.CancelFunc
 	cache  map[string]time.Time
 	names  map[string]string // address -> name it was answered for (matched answers only)
+	recs   map[string]*Record
 	stats  Stats
 	queue  uint16
 }
@@ -139,6 +141,123 @@ type Inspector struct {
 // Stats returns a copy of the counters.
 func (i *Inspector) Stats() Stats {
 	return Stats{atomic.LoadUint64(&i.stats.Answers), atomic.LoadUint64(&i.stats.Matched), atomic.LoadUint64(&i.stats.Added), atomic.LoadUint64(&i.stats.Errors)}
+}
+
+// Record describes how an address got into a policy's domain set.
+type Record struct {
+	Set       string    `json:"set"`
+	Addr      string    `json:"addr"`
+	Name      string    `json:"name"`              // query name
+	Matched   string    `json:"matched,omitempty"` // name in the CNAME chain that matched
+	Rule      string    `json:"rule"`              // rule that matched
+	Client    string    `json:"client,omitempty"`  // device the answer went to ("router" for the router itself)
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
+	Hits      int       `json:"hits"`
+}
+
+// MaxRecords bounds the address records kept in memory.
+const MaxRecords = 100000
+
+func recKey(set, addr string) string { return set + " " + addr }
+
+// record stores an answer; i.mu must be held.
+func (i *Inspector) record(r Record) {
+	if i.recs == nil {
+		i.recs = map[string]*Record{}
+	}
+	k := recKey(r.Set, r.Addr)
+	if old := i.recs[k]; old != nil {
+		r.FirstSeen, r.Hits = old.FirstSeen, old.Hits
+	} else {
+		r.FirstSeen = r.LastSeen
+		if len(i.recs) >= MaxRecords {
+			i.pruneLocked(MaxRecords / 10)
+		}
+	}
+	r.Hits++
+	i.recs[k] = &r
+}
+
+// pruneLocked drops the n least recently seen records.
+func (i *Inspector) pruneLocked(n int) {
+	all := make([]*Record, 0, len(i.recs))
+	for _, r := range i.recs {
+		all = append(all, r)
+	}
+	sort.Slice(all, func(a, b int) bool { return all[a].LastSeen.Before(all[b].LastSeen) })
+	for _, r := range all[:min(n, len(all))] {
+		delete(i.recs, recKey(r.Set, r.Addr))
+	}
+}
+
+// Records returns copies of the records of the given sets, by address.
+func (i *Inspector) Records(sets ...string) map[string]Record {
+	want := map[string]bool{}
+	for _, s := range sets {
+		want[s] = true
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	out := map[string]Record{}
+	for _, r := range i.recs {
+		if want[r.Set] {
+			out[r.Addr] = *r
+		}
+	}
+	return out
+}
+
+// AllRecords returns copies of every record (for saving).
+func (i *Inspector) AllRecords() []Record {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	out := make([]Record, 0, len(i.recs))
+	for _, r := range i.recs {
+		out = append(out, *r)
+	}
+	sort.Slice(out, func(a, b int) bool { return recKey(out[a].Set, out[a].Addr) < recKey(out[b].Set, out[b].Addr) })
+	return out
+}
+
+// LoadRecords restores saved records (existing ones win).
+func (i *Inspector) LoadRecords(rs []Record) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.recs == nil {
+		i.recs = map[string]*Record{}
+	}
+	for _, r := range rs {
+		k := recKey(r.Set, r.Addr)
+		if i.recs[k] == nil && len(i.recs) < MaxRecords {
+			r := r
+			i.recs[k] = &r
+		}
+	}
+}
+
+// Forget drops records (and the re-add cache) for addresses of a set, so a
+// later answer adds them again. nil addrs forgets the whole set.
+func (i *Inspector) Forget(set string, addrs []string) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if addrs == nil {
+		for k, r := range i.recs {
+			if r.Set == set {
+				delete(i.recs, k)
+			}
+		}
+		for k := range i.cache {
+			if strings.HasPrefix(k, set+" ") {
+				delete(i.cache, k)
+			}
+		}
+		return
+	}
+	for _, a := range addrs {
+		delete(i.recs, recKey(set, a))
+		delete(i.cache, recKey(set, a))
+	}
 }
 
 // NameOf returns the policy domain an address was last answered for, or "".
@@ -238,7 +357,20 @@ func (i *Inspector) handle(raw []byte) {
 	logx.Debugf("dns: %s matched %q (%s) -> policy %s", ans.Question, res.Rule, res.Name, r.Name)
 	add := map[string][]string{}
 	now := time.Now()
+	client := pk.Dst.String()
+	if pk.Dst.IsLoopback() {
+		client = "router"
+	}
 	i.mu.Lock()
+	for _, ip := range ans.IPs {
+		set := r.Set4
+		if ip.To4() == nil {
+			set = r.Set6
+		}
+		if set != "" {
+			i.record(Record{Set: set, Addr: ip.String(), Name: ans.Question, Matched: res.Name, Rule: res.Rule, Client: client, LastSeen: now})
+		}
+	}
 	if i.names == nil || len(i.names) > 50000 {
 		i.names = map[string]string{}
 	}

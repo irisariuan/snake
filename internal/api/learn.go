@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/irisariuan/snake/internal/engine"
 	"github.com/irisariuan/snake/internal/learn"
 )
 
@@ -18,6 +19,7 @@ func (s *Server) learnRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/learnings/{id}/servers", s.editLearningServers)
 	mux.HandleFunc("POST /api/learnings/{id}/move", s.moveLearningServers)
 	mux.HandleFunc("POST /api/learnings/{id}/merge", s.mergeLearning)
+	s.learnedRoutes(mux)
 }
 
 type learningsResp struct {
@@ -152,4 +154,29 @@ func (s *Server) mergeLearning(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.edit(w, func(st *learn.Store) error { return st.Merge(id, req.Into) })
+}
+
+func (s *Server) learnedRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/learned/{policy}", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		limit, _ := strconv.Atoi(q.Get("limit"))
+		v, err := s.E.LearnedAddrs(r.PathValue("policy"), q.Get("kind"), q.Get("q"), limit)
+		if err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		writeJSON(w, v)
+	})
+	mux.HandleFunc("POST /api/learned/{policy}/forget", func(w http.ResponseWriter, r *http.Request) {
+		var req engine.ForgetRequest
+		if !decode(w, r, &req) {
+			return
+		}
+		n, err := s.E.ForgetLearned(r.PathValue("policy"), req)
+		if err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		writeJSON(w, map[string]int{"removed": n})
+	})
 }

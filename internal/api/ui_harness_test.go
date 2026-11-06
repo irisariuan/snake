@@ -25,7 +25,16 @@ func TestUIHarness(t *testing.T) {
 	c.ApplyDefaults()
 	c.Normalize()
 	_ = config.Save(filepath.Join(dir, "config.json"), &c)
-	rec := &system.Recorder{Responses: map[string]string{"nvram get wan0_ipaddr": "198.51.100.20", "ipset list SNK_1_d4 -t": "Number of entries: 412"}}
+	rec := &system.Recorder{Responses: map[string]string{"nvram get wan0_ipaddr": "198.51.100.20",
+		"ipset list SNK_1_d4": "Name: SNK_1_d4\nType: hash:net\nNumber of entries: 4\nMembers:\n54.155.178.5\n23.246.50.141\n52.31.4.200\n203.0.113.99\n",
+		"ipset list SNK_1_r4": "Name: SNK_1_r4\nNumber of entries: 2\nMembers:\n81.2.69.160 timeout 412\n81.2.69.161 timeout 75\n"}}
+	now0 := time.Now()
+	recs, _ := json.Marshal([]map[string]any{
+		{"set": "SNK_1_d4", "addr": "54.155.178.5", "name": "www.netflix.com", "matched": "www.netflix.com", "rule": "netflix.com", "client": "192.168.50.23", "first_seen": now0.Add(-3 * time.Hour), "last_seen": now0.Add(-2 * time.Minute), "hits": 14},
+		{"set": "SNK_1_d4", "addr": "23.246.50.141", "name": "play.partner.tv", "matched": "x1.cdn.nflxvideo.net", "rule": "**.nflxvideo.net", "client": "192.168.50.40", "first_seen": now0.Add(-time.Hour), "last_seen": now0.Add(-10 * time.Minute), "hits": 2},
+		{"set": "SNK_1_d4", "addr": "52.31.4.200", "name": "api-global.netflix.com", "matched": "api-global.netflix.com", "rule": "netflix.com", "client": "192.168.50.23", "first_seen": now0.Add(-time.Hour), "last_seen": now0.Add(-30 * time.Minute), "hits": 5},
+	})
+	_ = os.WriteFile(filepath.Join(dir, "dnslearn.json"), recs, 0o600)
 	e := engine.New(engine.DefaultPaths(dir), rec)
 	e.DryRun = true
 	if err := e.Load(); err != nil {
@@ -36,6 +45,7 @@ func TestUIHarness(t *testing.T) {
 	e.Monitor().Set(health.Status{Tunnel: "ovpnc2", Iface: "tun12", Exists: true, Reason: "interface down"})
 	e.Monitor().Set(health.Status{Tunnel: "wgc2", Iface: "wgc2", Exists: true, Up: true, LinkOK: true, ProbeOK: true, Healthy: true, ExitIP: "192.0.2.44", Country: "GB"})
 	e.Decide()
+	e.LoadDNSRecords()
 	now := time.Now()
 	_ = e.EditLearnings(func(st *learn.Store) error {
 		o := learn.Observation{Addr: "66.22.196.34", Client: "192.168.50.23", Policy: 1, Time: now.Add(-50 * time.Minute)}

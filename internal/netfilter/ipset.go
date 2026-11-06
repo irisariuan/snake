@@ -105,6 +105,19 @@ func (x IPSet) AddMany(name string, entries []string) error {
 	return err
 }
 
+// Del removes entries (missing ones are ignored) in one call.
+func (x IPSet) Del(name string, entries []string) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	var b strings.Builder
+	for _, e := range entries {
+		b.WriteString("del " + name + " " + e + "\n")
+	}
+	_, err := x.R.RunInput(b.String(), "ipset", "-exist", "restore")
+	return err
+}
+
 // Flush empties a set.
 func (x IPSet) Flush(name string) error {
 	_, err := x.R.Run("ipset", "flush", name)

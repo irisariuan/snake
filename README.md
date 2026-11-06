@@ -270,12 +270,52 @@ You can also add addresses by hand (they never expire), remove them, move
 them between groups, merge groups and delete groups. An address belongs to
 one group at most.
 
+### Policy addresses
+
+The tab's second view lists the addresses each policy has learned:
+
+* **DNS answers** (`SNK_<id>_d4/6`): for each address, the name that was
+  resolved (and the CNAME that matched), the rule that matched and whether
+  it comes from the policy or a rule list, the device the answer went to,
+  when it was last answered and how often. These details are recorded by
+  the DNS inspector and saved in `dnslearn.json`. Without the inspector
+  (no NFQUEUE), dnsmasq still fills the set and the view shows the kernel
+  contents without details. A per-rule summary lets you remove everything
+  a rule learned.
+* **WebRTC peers** (`SNK_<id>_r4/6`), with the time left before they expire.
+
+Removing an address takes it out of the kernel set; the policy learns it
+again on the next DNS answer or ICE check. To stop routing a domain,
+change the rule.
+
+### CLI
+
+```
+snake learn list                            # groups
+snake learn show 3                          # servers + discovery sessions
+snake learn new "Discord" --route "Netflix US" 162.159.135.234
+snake learn set 3 --name Discord --route off --pin --ttl 12h --notes "voice"
+snake learn add|rm 3 ADDR...
+snake learn move 3 4 ADDR...
+snake learn merge 3 4
+snake learn delete 3
+snake learn addrs "Netflix US" [--kind dns|peer] [--filter nflxvideo]
+snake learn forget "Netflix US" ADDR... | --rule "**.nflxvideo.net" | --all
+```
+
+`--ttl` takes seconds, a duration (`12h`) or `default`; `--route` takes a
+policy name or id, or `off`. `list`, `show` and `addrs` accept `--json`.
+
+### Storage and API
+
 Groups live in `learnings.json` next to `config.json`, saved on every
 discovery and edit. The daemon installs each policy's share into
 `SNK_<id>_t4/6`. API: `GET/POST /api/learnings`,
 `PUT/DELETE /api/learnings/{id}`, `POST /api/learnings/{id}/servers`
 (`{"add":[…],"remove":[…]}`), `/move` (`{"servers":[…],"to":id}`) and
-`/merge` (`{"into":id}`).
+`/merge` (`{"into":id}`). Policy addresses: `GET /api/learned/{policy}?kind=dns|peer&q=&limit=`
+and `POST /api/learned/{policy}/forget`
+(`{"kind":…,"addrs":[…]}`, `{"rule":…}` or `{"all":true}`).
 
 ## Failover
 
@@ -369,7 +409,8 @@ Diagnostics tab:
   protected.
 * **Browser leak test**: HTTP exit IP and WebRTC (STUN) public IPs of the
   device you're browsing from, labelled as WAN / tunnel.
-* **Learned set contents**, daemon logs, and the generated firewall rules.
+* Daemon logs and the generated firewall rules. Learned addresses are in the
+  Learnings tab.
 
 ## Importing from Domain VPN Routing
 

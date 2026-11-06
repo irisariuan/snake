@@ -63,6 +63,9 @@ func PublishToken(customSettings, token string) error {
 	return os.WriteFile(customSettings, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
 }
 
+// Handler is the unauthenticated handler served on the unix socket.
+func (s *Server) Handler() http.Handler { return s.routes(false) }
+
 func (s *Server) routes(authed bool) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/status", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, s.E.Status()) })

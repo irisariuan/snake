@@ -37,6 +37,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		}
 	}
 	e.importLegacyServers()
+	e.LoadDNSRecords()
 	e.SeedHealth()
 	e.decide()
 	if err := e.Apply("startup"); err != nil {
@@ -142,6 +143,7 @@ func (e *Engine) saveSets() {
 		logx.Warnf("save ipsets: %v", err)
 	}
 	e.saveLearnings()
+	e.saveDNSRecords()
 }
 
 // PolicyStatus is the runtime view of a policy.

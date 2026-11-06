@@ -56,6 +56,8 @@ Usage: snake <command> [args]
   test <domain>           show how a domain is routed
   rules list|check|import|export
                           manage rule lists / .rules files (snake rules for help)
+  learn list|show|new|set|add|rm|move|merge|delete|addrs|forget
+                          learning groups and learned addresses (snake learn for help)
   import-dvr [--dir D] [--yes]
                           import Domain VPN Routing policies
   token [--rotate]        print the API token for the standalone UI
@@ -104,6 +106,8 @@ func main() {
 		err = printCall("GET", "/api/test?domain="+args[0])
 	case "rules":
 		err = rulesCmd(args)
+	case "learn", "learnings":
+		err = learnCmd(args)
 	case "import-dvr":
 		err = importCmd(args)
 	case "token":
