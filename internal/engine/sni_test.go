@@ -57,6 +57,18 @@ func TestSNIProxyLifecycle(t *testing.T) {
 	if !strings.Contains(strings.Join(lc[0].OK, "\n"), "TLS server name") {
 		t.Fatalf("leak checks: %+v", lc[0])
 	}
+	if !strings.Contains(strings.Join(lc[0].OK, "\n"), "routed by their public name") {
+		t.Fatalf("leak checks: %+v", lc[0])
+	}
+	if _, err := e.UpdateConfig(func(c *config.Config) error { c.Policies[0].Leak.RefuseECH = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if pols := e.sniPolicies(e.runtime(), e.states(e.runtime(), e.Caps()), e.Caps()); len(pols) != 1 || !pols[0].RefuseECH {
+		t.Fatalf("refuse_ech not passed to the proxy: %+v", pols)
+	}
+	if lc := e.LeakChecks(); !strings.Contains(strings.Join(lc[0].OK, "\n"), "Client Hello connections are refused") {
+		t.Fatalf("leak checks: %+v", lc[0])
+	}
 
 	// A port that cannot be bound: no redirect, and the reason is shown.
 	busy, bl := freePort(t)

@@ -718,7 +718,7 @@ func (e *Engine) sniPolicies(cfg *config.Config, states []netfilter.PolicyState,
 			continue
 		}
 		sp := sniproxy.Policy{ID: p.ID, Name: p.Name, Set: e.domainSet(p), Mark: s.PolicyMark(p.ID),
-			Set4: netfilter.SetName(p.ID, netfilter.KindDomain, false)}
+			Set4: netfilter.SetName(p.ID, netfilter.KindDomain, false), RefuseECH: p.Leak.RefuseECH}
 		if caps.IPv6 && st.IPv6Mode != netfilter.V6Off {
 			sp.Set6 = netfilter.SetName(p.ID, netfilter.KindDomain, true)
 		}

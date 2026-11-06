@@ -18,7 +18,9 @@
 // With Encrypted Client Hello (ECH) the real server name is encrypted; only
 // the outer, public name (e.g. cloudflare-ech.com) is visible. Such
 // connections are routed by that public name like any other: a rule for it
-// sends them through the policy's tunnel, otherwise they go via WAN.
+// sends them through the policy's tunnel, otherwise they go via WAN. A
+// policy can instead refuse them (RefuseECH), for clients it applies to, so
+// its drop: rules cannot be bypassed by hiding the name.
 package sniproxy
 
 import (
@@ -56,6 +58,9 @@ type Policy struct {
 	// connection opens the client's session window, like a connection to a
 	// learned destination does.
 	Session4, Session6 string
+	// RefuseECH resets Encrypted Client Hello connections of the policy's
+	// clients instead of routing them by their public name.
+	RefuseECH bool
 }
 
 // Config is the proxy's desired state.
@@ -72,18 +77,19 @@ type SetAdder interface {
 
 // Stats are the proxy's counters.
 type Stats struct {
-	Listen    string         `json:"listen"`
-	Active    int64          `json:"active"`
-	Conns     uint64         `json:"conns"`
-	Matched   uint64         `json:"matched"`
-	Dropped   uint64         `json:"dropped"` // matched a drop: rule
-	NoSNI     uint64         `json:"no_sni"`  // not TLS or no server name: sent via WAN
-	ECH       uint64         `json:"ech"`     // Encrypted Client Hello: routed by the outer (public) name
-	Errors    uint64         `json:"errors"`  // upstream dial failures
-	Refused   uint64         `json:"refused"` // over the connection limit, or not redirected
-	ByPolicy  map[int]uint64 `json:"by_policy,omitempty"`
-	LastError string         `json:"last_error,omitempty"`
-	LastErrAt time.Time      `json:"last_error_at,omitempty"`
+	Listen     string         `json:"listen"`
+	Active     int64          `json:"active"`
+	Conns      uint64         `json:"conns"`
+	Matched    uint64         `json:"matched"`
+	Dropped    uint64         `json:"dropped"`     // matched a drop: rule
+	NoSNI      uint64         `json:"no_sni"`      // not TLS or no server name: sent via WAN
+	ECH        uint64         `json:"ech"`         // Encrypted Client Hello: routed by the outer (public) name
+	ECHRefused uint64         `json:"ech_refused"` // ECH connections reset (a policy has refuse_ech)
+	Errors     uint64         `json:"errors"`      // upstream dial failures
+	Refused    uint64         `json:"refused"`     // over the connection limit, or not redirected
+	ByPolicy   map[int]uint64 `json:"by_policy,omitempty"`
+	LastError  string         `json:"last_error,omitempty"`
+	LastErrAt  time.Time      `json:"last_error_at,omitempty"`
 }
 
 // Tunables (variables so tests can shorten them).
@@ -123,6 +129,7 @@ type Proxy struct {
 	dropped atomic.Uint64
 	noSNI   atomic.Uint64
 	ech     atomic.Uint64
+	echRef  atomic.Uint64
 	errs    atomic.Uint64
 	refused atomic.Uint64
 	statMu  sync.Mutex
@@ -217,7 +224,7 @@ func (p *Proxy) Stats() Stats {
 	p.mu.Unlock()
 	s := Stats{
 		Listen: listen, Active: p.active.Load(), Conns: p.conns.Load(), Matched: p.matched.Load(),
-		Dropped: p.dropped.Load(), NoSNI: p.noSNI.Load(), ECH: p.ech.Load(), Errors: p.errs.Load(), Refused: p.refused.Load(),
+		Dropped: p.dropped.Load(), NoSNI: p.noSNI.Load(), ECH: p.ech.Load(), ECHRefused: p.echRef.Load(), Errors: p.errs.Load(), Refused: p.refused.Load(),
 	}
 	p.statMu.Lock()
 	if len(p.byPol) > 0 {
@@ -292,23 +299,44 @@ func reset(c *net.TCPConn) {
 // match finds the first policy whose rules match name and that applies to
 // the client.
 func (p *Proxy) match(name string, client netip.Addr) (Policy, match.Result, bool) {
-	pols := p.pol.Load()
-	if pols == nil || name == "" {
+	if name == "" {
 		return Policy{}, match.Result{}, false
 	}
-	mac := ""
-	if p.needMAC.Load() {
-		mac = p.neigh.mac(client)
-	}
-	for _, pol := range *pols {
-		if len(pol.MACs) > 0 && !pol.MACs[mac] {
-			continue
-		}
+	for _, pol := range p.applicable(client) {
 		if res := pol.Set.MatchAny(name); res.Matched {
 			return pol, res, true
 		}
 	}
 	return Policy{}, match.Result{}, false
+}
+
+// applicable lists, in order, the policies that apply to the client.
+func (p *Proxy) applicable(client netip.Addr) []Policy {
+	pols := p.pol.Load()
+	if pols == nil {
+		return nil
+	}
+	mac := ""
+	if p.needMAC.Load() {
+		mac = p.neigh.mac(client)
+	}
+	var out []Policy
+	for _, pol := range *pols {
+		if len(pol.MACs) == 0 || pol.MACs[mac] {
+			out = append(out, pol)
+		}
+	}
+	return out
+}
+
+// refusesECH returns a policy applying to the client that refuses ECH.
+func (p *Proxy) refusesECH(client netip.Addr) (Policy, bool) {
+	for _, pol := range p.applicable(client) {
+		if pol.RefuseECH {
+			return pol, true
+		}
+	}
+	return Policy{}, false
 }
 
 func (p *Proxy) handle(c *net.TCPConn) {
@@ -361,7 +389,14 @@ func (p *Proxy) handle(c *net.TCPConn) {
 	_ = c.SetReadDeadline(time.Time{})
 
 	if hello.ECH {
-		p.ech.Add(1) // routed by the outer (public) name below
+		p.ech.Add(1)
+		if pol, ok := p.refusesECH(client); ok {
+			p.echRef.Add(1)
+			logx.Debugf("sni proxy: %s -> %s (%s) refused: Encrypted Client Hello (policy %s)", client, dst, hello.ServerName, pol.Name)
+			reset(c)
+			return
+		}
+		// Otherwise routed by the outer (public) name below.
 	}
 	var mark uint32
 	pol, res, ok := p.match(hello.ServerName, client)

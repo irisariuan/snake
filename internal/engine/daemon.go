@@ -615,7 +615,11 @@ func (e *Engine) LeakChecks() []LeakCheck {
 			if p.Sniffs() {
 				switch {
 				case sniffing:
-					ok("HTTPS the domain sets miss is routed by TLS server name (SNI proxy %s); unclaimed QUIC is rejected so it falls back to TCP; Encrypted Client Hello connections are routed by their public name", st.SNI.Listen)
+					ech := "Encrypted Client Hello connections are routed by their public name"
+					if p.Leak.RefuseECH {
+						ech = "Encrypted Client Hello connections are refused"
+					}
+					ok("HTTPS the domain sets miss is routed by TLS server name (SNI proxy %s); unclaimed QUIC is rejected so it falls back to TCP; %s", st.SNI.Listen, ech)
 					if st.Caps.IPv6 && !st.Caps.IPv6NAT {
 						warn("IPv6 HTTPS is not sniffed (no ip6tables NAT): devices using encrypted DNS over IPv6 bypass the domain rules")
 					}

@@ -353,6 +353,12 @@ What it costs and where it stops:
   all ECH traffic to that CDN, or leave it out and they go via WAN. Once the
   destination is learned, other connections to that CDN address follow it
   too. The Status tab counts ECH connections.
+  *Refuse Encrypted Client Hello* (`refuse_ech`, off by default) resets
+  them instead, for the policy's devices, so a hidden name cannot get past
+  `drop:` rules. ECH adds no risk to the router or the network, so only turn
+  this on if you rely on `drop:` rules for blocking: browsers using DoH do
+  not retry without ECH, so sites behind ECH-enabled CDNs (much of
+  Cloudflare) stop loading on those devices.
 * **Only TLS on port 443.** Other ports, plain HTTP, and non-TLS protocols
   on 443 (sent via WAN after 5 seconds of silence) are not routed by name.
 * **IPv6** is sniffed only when `ip6tables` has NAT. Without it, IPv6 HTTPS
