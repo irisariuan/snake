@@ -204,21 +204,27 @@ func TestMigrateMarkMask(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if c.Version != CurrentVersion || c.Settings.ConnMarkMask != DefaultConnMarkMask {
+			t.Fatalf("%s: version %d conn mask %#x", js, c.Version, c.Settings.ConnMarkMask)
+		}
 		return c
 	}
-	// The broken version 2 default goes back to the working mask.
-	c := load(`{"version":2,"settings":{"mark_mask":1069547520}}`)
-	if c.Settings.MarkMask != DefaultMarkMask || c.MigratedMarkMask() != BadMarkMask || c.Version != CurrentVersion {
-		t.Fatalf("not migrated: mask %#x migrated %#x version %d", c.Settings.MarkMask, c.MigratedMarkMask(), c.Version)
+	// Older configs kept connection marks in the packet-mark bits: those
+	// connections are cleared once.
+	c := load(`{"version":1,"settings":{"mark_mask":16711680}}`)
+	if c.Settings.MarkMask != DefaultMarkMask || c.MigratedMarkMask() != DefaultMarkMask {
+		t.Fatalf("v1: mask %#x migrated %#x", c.Settings.MarkMask, c.MigratedMarkMask())
 	}
-	// Version 1 on the default, and custom masks, are left alone.
-	for _, js := range []string{`{"version":1,"settings":{"mark_mask":16711680}}`, `{"version":2,"settings":{"mark_mask":65280}}`} {
-		c := load(js)
-		if c.MigratedMarkMask() != 0 || c.Version != CurrentVersion || (c.Settings.MarkMask != DefaultMarkMask && c.Settings.MarkMask != 0xff00) {
-			t.Fatalf("%s: mask %#x migrated %#x", js, c.Settings.MarkMask, c.MigratedMarkMask())
-		}
+	// The broken version 2 default goes back to the working packet mask.
+	c = load(`{"version":2,"settings":{"mark_mask":1069547520}}`)
+	if c.Settings.MarkMask != DefaultMarkMask || c.MigratedMarkMask() != BadMarkMask {
+		t.Fatalf("v2: mask %#x migrated %#x", c.Settings.MarkMask, c.MigratedMarkMask())
 	}
-	// Broadcom's reserved bits are rejected.
+	c = load(`{"version":4,"settings":{"mark_mask":65280}}`)
+	if c.MigratedMarkMask() != 0 || c.Settings.MarkMask != 0xff00 {
+		t.Fatalf("v4: mask %#x migrated %#x", c.Settings.MarkMask, c.MigratedMarkMask())
+	}
+	// Broadcom's reserved bits are rejected in packet marks.
 	c = Default()
 	c.Settings.MarkMask = BadMarkMask
 	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "Broadcom") {
@@ -226,5 +232,17 @@ func TestMigrateMarkMask(t *testing.T) {
 	}
 	if DefaultMarkMask&BroadcomReservedMask != 0 || DefaultMarkMask&0xf000 != 0 {
 		t.Fatal("default mask overlaps reserved bits or VPN Director")
+	}
+	if DefaultConnMarkMask&AdaptiveQoSMask != 0 {
+		t.Fatal("default connection mask overlaps Adaptive QoS")
+	}
+	c = Default()
+	c.Settings.ConnMarkMask = 0xc0000000 | 0x3f000000
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "conn_mark_mask") {
+		t.Fatalf("conn mask on QoS direction bits accepted: %v", err)
+	}
+	c.Settings.ConnMarkMask = 0xf00000 // 4 bits: fewer than mark_mask
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "conn_mark_mask") {
+		t.Fatalf("short conn mask accepted: %v", err)
 	}
 }

@@ -107,7 +107,13 @@ type Device struct {
 
 // Settings are global tunables.
 type Settings struct {
-	MarkMask         uint32   `json:"mark_mask"`
+	MarkMask uint32 `json:"mark_mask"`
+	// ConnMarkMask holds the policy id in the conntrack mark. It is kept
+	// apart from MarkMask: Adaptive QoS writes its category into conntrack
+	// marks (0x003f0000), which snake would otherwise restore as a policy
+	// mark. Conntrack marks are not read by Broadcom's packet path, so bits
+	// that are unsafe in packet marks are fine here.
+	ConnMarkMask     uint32   `json:"conn_mark_mask"`
 	APIPort          int      `json:"api_port"`
 	QueueBase        int      `json:"queue_base"`
 	DomainSetTimeout int      `json:"domain_set_timeout"` // seconds, 0 = never expire
@@ -150,7 +156,8 @@ type Settings struct {
 //	3: moves 0x3fc00000 back to 0x00ff0000: bits 22-29 are Broadcom's
 //	   egress port, IPsec and policy-routing fields, and routed traffic
 //	   stopped working.
-const CurrentVersion = 3
+//	4: conntrack marks move to their own bits (conn_mark_mask).
+const CurrentVersion = 4
 
 // Mark bits.
 //
@@ -168,11 +175,39 @@ const (
 	BroadcomReservedMask uint32 = 0xff000000
 	// AdaptiveQoSMask is the mark bits Adaptive QoS (bwdpi) classifies with.
 	AdaptiveQoSMask uint32 = 0xc03fffff
+	// QoSDirMask is the direction bits every Adaptive QoS mark has one of
+	// (0x8... download, 0x4... upload). snake's marks never set them, and
+	// its ip rules require them clear, so a QoS-marked packet never matches
+	// a policy.
+	QoSDirMask uint32 = 0xc0000000
+	// DefaultConnMarkMask is clear of Adaptive QoS (0xc03fffff).
+	DefaultConnMarkMask uint32 = 0x3fc00000
 )
 
-// MigratedMarkMask returns the mark mask Load replaced (0 if none). The
-// caller should save the configuration and clear connections still marked
-// with the old bits.
+func maskShift(m uint32) uint {
+	var shift uint
+	for m != 0 && m&1 == 0 {
+		m >>= 1
+		shift++
+	}
+	return shift
+}
+
+// RouteMask is the fwmark mask of snake's ip rules: the policy bits plus
+// the Adaptive QoS direction bits, which must be clear.
+func (s Settings) RouteMask() uint32 { return s.MarkMask | QoSDirMask }
+
+// ConnMark is a policy's value in the conntrack mark.
+func (s Settings) ConnMark(id int) uint32 {
+	return uint32(id) << maskShift(s.ConnMarkMask) & s.ConnMarkMask
+}
+
+// ConnMarkShift is the bit offset of the policy id inside ConnMarkMask.
+func (s Settings) ConnMarkShift() uint { return maskShift(s.ConnMarkMask) }
+
+// MigratedMarkMask returns the conntrack mark bits Load retired (0 if
+// none). The caller should save the configuration and clear connections
+// still marked in those bits.
 func (c *Config) MigratedMarkMask() uint32 { return c.migratedMask }
 
 // Router-wide blocking modes for DoT and DoH.
@@ -322,6 +357,7 @@ func dedupKeepComments(in []string) []string {
 func DefaultSettings() Settings {
 	return Settings{
 		MarkMask:         DefaultMarkMask,
+		ConnMarkMask:     DefaultConnMarkMask,
 		APIPort:          8444,
 		QueueBase:        4200,
 		DomainSetTimeout: 0,
@@ -379,6 +415,9 @@ func (c *Config) ApplyDefaults() {
 	s := &c.Settings
 	if s.MarkMask == 0 {
 		s.MarkMask = d.MarkMask
+	}
+	if s.ConnMarkMask == 0 {
+		s.ConnMarkMask = d.ConnMarkMask
 	}
 	setInt := func(v *int, def int) {
 		if *v <= 0 {
@@ -625,6 +664,15 @@ func (c *Config) Validate() error {
 		add("mark_mask bits must be contiguous")
 	} else if s.MarkMask&BroadcomReservedMask != 0 {
 		add("mark_mask 0x%08x uses bits 24-31, which Broadcom routers use for egress port, IPsec and policy routing (routed traffic breaks); use 0x%08x", s.MarkMask, DefaultMarkMask)
+	}
+	cm := s.ConnMarkMask
+	switch {
+	case cm == 0 || (cm>>maskShift(cm))&(cm>>maskShift(cm)+1) != 0:
+		add("conn_mark_mask must be contiguous bits")
+	case cm>>maskShift(cm) < s.MaxMarkValue():
+		add("conn_mark_mask must have at least as many bits as mark_mask")
+	case cm&QoSDirMask != 0:
+		add("conn_mark_mask must not use bits 30-31 (Adaptive QoS direction)")
 	}
 	// ipset's maximum timeout.
 	for _, t := range []struct {
@@ -873,9 +921,10 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	if c.Version < CurrentVersion {
+		// Before version 4 conntrack marks used the packet-mark bits.
+		c.migratedMask = c.Settings.MarkMask
 		if c.Version == 2 && c.Settings.MarkMask == BadMarkMask {
 			c.Settings.MarkMask = DefaultMarkMask
-			c.migratedMask = BadMarkMask
 		}
 		c.Version = CurrentVersion
 	}

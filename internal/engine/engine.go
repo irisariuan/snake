@@ -170,6 +170,7 @@ func (e *Engine) Load() error {
 	e.mu.Lock()
 	e.cfg, e.rt = c, c.Runtime()
 	e.rtc.MarkMask = c.Settings.MarkMask
+	e.rtc.ConnMask = c.Settings.ConnMarkMask
 	e.asnCache = &asn.Cache{Dir: e.P.ASNDir, MaxAge: time.Duration(c.Settings.ASNRefresh) * time.Hour}
 	e.mu.Unlock()
 	return e.openLearnings()
@@ -214,6 +215,7 @@ func (e *Engine) SetConfig(c *config.Config) error {
 	e.mu.Lock()
 	e.cfg, e.rt = c, c.Runtime()
 	e.rtc.MarkMask = c.Settings.MarkMask
+	e.rtc.ConnMask = c.Settings.ConnMarkMask
 	e.asnCache = &asn.Cache{Dir: e.P.ASNDir, MaxAge: time.Duration(c.Settings.ASNRefresh) * time.Hour}
 	e.mu.Unlock()
 	e.event("", "config", "configuration saved")
@@ -598,7 +600,7 @@ func (e *Engine) Apply(reason string) error {
 		}
 		tracks = append(tracks, webrtc.PolicyTrack{ID: st.Policy.ID, Queue: uint16(s.QueueBase + st.Policy.ID), Mark: s.PolicyMark(st.Policy.ID)})
 	}
-	key := fmt.Sprintf("%v%v%x", tracks, caps.NFQueue, s.MarkMask)
+	key := fmt.Sprintf("%v%v%x%x", tracks, caps.NFQueue, s.MarkMask, s.ConnMarkMask)
 	e.mu.Lock()
 	rtcChanged := key != e.rtcKey
 	e.rtcKey = key
@@ -806,7 +808,7 @@ func LocalResolver() *net.Resolver {
 // connections still carrying marks in the old bits, so they do not keep
 // those bits and reconnect on the new marks.
 func (e *Engine) migrateMarks(c *config.Config, old uint32) {
-	e.event("", "config", "mark mask moved from 0x%08x back to 0x%08x (the old bits are Broadcom packet fields)", old, c.Settings.MarkMask)
+	e.event("", "config", "connection marks moved to 0x%08x (clear of Adaptive QoS); clearing connections marked under 0x%08x once", c.Settings.ConnMarkMask, old)
 	if e.DryRun {
 		return
 	}
@@ -822,9 +824,6 @@ func (e *Engine) migrateMarks(c *config.Config, old uint32) {
 	for _, p := range c.Policies {
 		marks[legacy.PolicyMark(p.ID)] = true
 	}
-	for _, t := range config.TunnelNames {
-		marks[legacy.ProbeMark(t)] = true
-	}
 	for m := range marks {
 		arg := fmt.Sprintf("0x%x/0x%x", m, old)
 		_, _ = e.R.Run("conntrack", "-D", "-f", "ipv4", "--mark", arg)
@@ -837,9 +836,9 @@ func (e *Engine) Warnings() []string {
 	cfg := e.runtime()
 	caps := e.Caps()
 	var w []string
-	if caps.AdaptiveQoS && cfg.Settings.MarkMask&config.AdaptiveQoSMask != 0 {
-		w = append(w, fmt.Sprintf("Adaptive QoS is on and shares mark bits with snake (0x%08x vs 0x%08x). If WAN downloads stall partway, check whether their connection mark equals a policy mark (snake test / conntrack) and report it.",
-			cfg.Settings.MarkMask, config.AdaptiveQoSMask))
+	if caps.AdaptiveQoS && cfg.Settings.ConnMarkMask&config.AdaptiveQoSMask != 0 {
+		w = append(w, fmt.Sprintf("Adaptive QoS is on and the connection mark mask 0x%08x overlaps its marks (0x%08x): QoS categories can be taken for policies and WAN downloads stall. Set Connection mark mask to 0x%08x in Settings → Advanced.",
+			cfg.Settings.ConnMarkMask, config.AdaptiveQoSMask, config.DefaultConnMarkMask))
 	}
 	return w
 }
@@ -853,7 +852,7 @@ func (e *Engine) flushConntrack(id int) {
 	if !cfg.Settings.FlushConntrack || !caps.Conntrack || e.DryRun {
 		return
 	}
-	m := fmt.Sprintf("0x%x/0x%x", cfg.Settings.PolicyMark(id), cfg.Settings.MarkMask)
+	m := fmt.Sprintf("0x%x/0x%x", cfg.Settings.ConnMark(id), cfg.Settings.ConnMarkMask)
 	_, _ = e.R.Run("conntrack", "-D", "-f", "ipv4", "--mark", m)
 	if caps.IPv6 {
 		_, _ = e.R.Run("conntrack", "-D", "-f", "ipv6", "--mark", m)
