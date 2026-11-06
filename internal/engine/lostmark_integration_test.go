@@ -114,7 +114,7 @@ except Exception as e:
 	runClient("tunnel with overwritten connmark")
 	// The packets after the first were carried by the rule that recognises
 	// tunnel connections by their NAT address.
-	rec := sh(t, "iptables -t mangle -L SNAKE -v -n -x | grep ctrepldst || true")
+	rec := sh(t, "iptables -t mangle -L SNAKE -v -n -x | grep 'ctrepldst 10.66.0.2' || true")
 	if f := strings.Fields(rec); len(f) == 0 || f[0] == "0" {
 		t.Errorf("tunnel recovery rule missing or unused:\n%s", rec)
 	}
