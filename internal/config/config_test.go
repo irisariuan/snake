@@ -242,3 +242,28 @@ func TestConnectionMaskRejectsQoSOverlap(t *testing.T) {
 		t.Fatal("default connection ownership overlaps QoS or VPN Director")
 	}
 }
+
+func TestSNIProxyPort(t *testing.T) {
+	c := Default()
+	if c.Settings.SNIProxyPort != 5340 {
+		t.Fatalf("default port %d", c.Settings.SNIProxyPort)
+	}
+	for _, port := range []int{80, c.Settings.APIPort, c.Settings.DNSForwardPort + 1, c.Settings.DNSForwardPort + 200} {
+		c.Settings.SNIProxyPort = port
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "sni_proxy_port") {
+			t.Errorf("port %d accepted: %v", port, err)
+		}
+	}
+	c.Settings.SNIProxyPort = c.Settings.DNSForwardPort // below the forwarder range (it starts at +1)
+	if err := c.Validate(); err != nil {
+		t.Error(err)
+	}
+	p := Policy{Domains: []string{"netflix.com"}, Leak: Leak{SniffSNI: true}}
+	if !p.Sniffs() {
+		t.Error("domain policy does not sniff")
+	}
+	p.Domains = []string{"drop:ads.example.com"}
+	if p.Sniffs() {
+		t.Error("drop-only policy sniffs")
+	}
+}

@@ -62,8 +62,12 @@ type Leak struct {
 	BlockDoT    bool   `json:"block_dot"`    // block TCP/UDP 853 (DoT/DoQ) from scoped clients
 	BlockDoH    bool   `json:"block_doh"`    // block known DoH resolvers on 443 from scoped clients
 	BlockQUIC   bool   `json:"block_quic"`   // block UDP 443 from scoped clients
-	IPv6        string `json:"ipv6"`         // tunnel | block | off
-	WebRTC      string `json:"webrtc"`       // track | off
+	// SniffSNI routes the scoped clients' HTTPS connections that no set
+	// matched by their TLS server name, through snake's transparent SNI
+	// proxy, so domain rules also work for devices using DoH/DoT.
+	SniffSNI bool   `json:"sniff_sni"`
+	IPv6     string `json:"ipv6"`   // tunnel | block | off
+	WebRTC   string `json:"webrtc"` // track | off
 }
 
 // Policy routes matched traffic through an ordered list of tunnels.
@@ -148,6 +152,8 @@ type Settings struct {
 	// DNSForwardPort is the first local port of the encrypted-DNS
 	// forwarders (policy id is added); dnsmasq sends policy domains there.
 	DNSForwardPort int `json:"dns_forward_port"`
+	// SNIProxyPort is the port of the transparent SNI proxy (sniff_sni).
+	SNIProxyPort int `json:"sni_proxy_port"`
 }
 
 // CurrentVersion is the configuration format version.
@@ -267,6 +273,10 @@ func (s Settings) DoTBlocked(p Policy) bool { return blocked(s.BlockDoT, p.Leak.
 
 // DoHBlocked is whether DoH is blocked for p's devices.
 func (s Settings) DoHBlocked(p Policy) bool { return blocked(s.BlockDoH, p.Leak.BlockDoH) }
+
+// Sniffs reports whether p's HTTPS connections are routed by server name:
+// only policies that route by domain need it.
+func (p Policy) Sniffs() bool { return p.Leak.SniffSNI && p.HasDomains() }
 
 // DoHBlockedAnywhere is whether any device has DoH blocked (the DoH address
 // set must be filled).
@@ -404,6 +414,7 @@ func DefaultSettings() Settings {
 		BlockDoT:         BlockPolicy,
 		BlockDoH:         BlockPolicy,
 		DNSForwardPort:   5350,
+		SNIProxyPort:     5340,
 	}
 }
 
@@ -482,6 +493,7 @@ func (c *Config) ApplyDefaults() {
 		s.BlockDoH = d.BlockDoH
 	}
 	setInt(&s.DNSForwardPort, d.DNSForwardPort)
+	setInt(&s.SNIProxyPort, d.SNIProxyPort)
 	for i := range c.Policies {
 		p := &c.Policies[i]
 		if p.Leak.IPv6 == "" {
@@ -713,6 +725,14 @@ func (c *Config) Validate() error {
 	}
 	if s.DNSForwardPort < 1024 || s.DNSForwardPort > 65000 {
 		add("dns_forward_port must be between 1024 and 65000")
+	}
+	switch p := s.SNIProxyPort; {
+	case p < 1024 || p > 65535:
+		add("sni_proxy_port must be between 1024 and 65535")
+	case p == s.APIPort:
+		add("sni_proxy_port must differ from api_port")
+	case p > s.DNSForwardPort && p <= s.DNSForwardPort+s.MaxPolicyID():
+		add("sni_proxy_port %d is inside the DoT/DoH forwarder range %d-%d", p, s.DNSForwardPort+1, s.DNSForwardPort+s.MaxPolicyID())
 	}
 	for _, t := range s.ProbeTargets {
 		if _, _, err := net.SplitHostPort(t); err != nil {

@@ -40,6 +40,7 @@ const (
 	ChainRTC    = "SNAKE_RTC"
 	ChainMSS    = "SNAKE_MSS"
 	ChainDNS    = "SNAKE_DNS"
+	ChainSNI    = "SNAKE_SNI" // nat: HTTPS -> SNI proxy (jumped to from SNAKE_DNS)
 	ChainNAT    = "SNAKE_NAT"
 	ChainFwd    = "SNAKE_FWD"
 	ChainDNSOut = "SNAKE_DNSO" // mangle OUTPUT: dnsmasq answers -> DNS inspector

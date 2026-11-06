@@ -264,3 +264,44 @@ func TestBuildWANIdentityBeforeMarks(t *testing.T) {
 		t.Error("WAN guard used an address from the other family")
 	}
 }
+
+func TestSNIRedirect(t *testing.T) {
+	c, st := states(t)
+	st[1].Policy.Leak.SniffSNI = true // Disney: devices + destinations
+	st[2].Policy.Leak.SniffSNI = true // whole device: nothing to sniff
+	st[1].Drops = true
+	plan := Build(c.Settings, st, Options{IPv6: true, IPv6NAT: false, SNIPort: 5340})
+	n4 := plan.Restore["4/nat"]
+	mustContain(t, n4,
+		"-A SNAKE_DNS -i br+ -m mac --mac-source aa:bb:cc:00:00:01 -p tcp --dport 443 -j SNAKE_SNI",
+		"-A SNAKE_DNS -i br+ -m mac --mac-source aa:bb:cc:00:00:02 -p tcp --dport 443 -j SNAKE_SNI",
+		"-A SNAKE_SNI -m connmark ! --mark 0/0x3fc00000 -j RETURN",
+		"-A SNAKE_SNI -d 0.0.0.0/8,10.0.0.0/8",
+		"-A SNAKE_SNI -m set --match-set SNK_DOH4 dst -j RETURN",
+		"-A SNAKE_SNI -m set --match-set SNK_2_x4 dst -j RETURN",
+		"-A SNAKE_SNI -m set --match-set SNK_2_z4 dst -j RETURN",
+		"-A SNAKE_SNI -p tcp -j REDIRECT --to-ports 5340",
+	)
+	if strings.Contains(n4, "aa:bb:cc:00:00:09") {
+		t.Error("whole-device policy redirected to the SNI proxy")
+	}
+	if strings.Index(n4, "-j REDIRECT --to-ports 5340") < strings.Index(n4, "SNK_2_z4") {
+		t.Error("redirect before the RETURN rules")
+	}
+	mustContain(t, plan.Restore["4/filter"],
+		"-A SNAKE_FWD -i br+ -m mac --mac-source aa:bb:cc:00:00:01 -p udp --dport 443 -m connmark --mark 0/0x3fc00000 -j REJECT --reject-with icmp-port-unreachable")
+	// No IPv6 NAT: IPv6 cannot be redirected, and its QUIC is left alone.
+	if strings.Contains(plan.Restore["6/filter"], "--dport 443 -m connmark") {
+		t.Error("IPv6 QUIC rejected without an IPv6 redirect")
+	}
+	// Proxy not running: no redirect, no QUIC rejection.
+	plan = Build(c.Settings, st, Options{IPv6: true, IPv6NAT: true, SNIPort: 0})
+	for k, v := range plan.Restore {
+		if strings.Contains(v, "SNAKE_SNI") || strings.Contains(v, "--dport 443 -m connmark") {
+			t.Errorf("%s has SNI rules without the proxy:\n%s", k, v)
+		}
+	}
+	// With IPv6 NAT both families are redirected.
+	plan = Build(c.Settings, st, Options{IPv6: true, IPv6NAT: true, SNIPort: 5340})
+	mustContain(t, plan.Restore["6/nat"], "-A SNAKE_SNI -m set --match-set SNK_DOH6 dst -j RETURN", "-A SNAKE_SNI -p tcp -j REDIRECT --to-ports 5340")
+}

@@ -23,7 +23,7 @@ Inspired by and able to import from Ranger802004's
 | Health | – | interface + WireGuard handshake / OpenVPN state, TCP probes *through* the tunnel, **exit-country check** |
 | Tunnel down | traffic goes via WAN | **kill switch** (per policy) or WAN, your choice |
 | Device scoping | – | whole device, or device + destinations, groups of devices |
-| DNS leaks | – | policy domains resolved **through the tunnel**, port-53 hijack, DoH/DoT/QUIC blocking, DoH canaries |
+| DNS leaks | – | policy domains resolved **through the tunnel**, port-53 hijack, DoH/DoT/QUIC blocking, DoH canaries, or **routing HTTPS by TLS server name** so DoH/DoT can stay on |
 | IPv6 | separate ipsets | routed via tunnel if it has IPv6, otherwise **blocked** for policy traffic |
 | WebRTC | – | **session-affinity tracking** (see below) |
 | Rule files | – | `.rules` files: import (file/URL, AdGuard/hosts/dnsmasq converted), export, reusable **rule lists**, built-in highlighting editor |
@@ -268,6 +268,7 @@ snake rules export --policy "Netflix US" --expand
 | Block DoH | Rejects TCP/UDP 443 to the dedicated addresses of known DoH resolvers (8.8.8.8, 1.1.1.1, Quad9, AdGuard, NextDNS, ...). When DoH is blocked for the whole LAN (a destination-only policy, or Settings → *Always*), DoH hostnames such as `dns.google` also get NXDOMAIN from dnsmasq, so browsers fall back to normal DNS. Addresses are never learned from DNS answers: names like `dns.google.com` share addresses with ordinary Google sites, and blocking those cut Google downloads. Also answers the Firefox and iCloud Private Relay canary domains with NXDOMAIN (network-wide, Settings → *DoH canary*). |
 | Block DoT | Rejects port 853 (DoT/DoQ), so Android "Private DNS" falls back to normal DNS. |
 | Block QUIC | Rejects UDP 443 (optional). |
+| Route HTTPS by server name | HTTPS connections no set matched go through snake's transparent SNI proxy, which routes them by the name in the TLS ClientHello. Lets devices keep DoH/DoT. See below. |
 | IPv6 | *tunnel*: route IPv6 through the tunnel if it has IPv6, else reject IPv6 policy traffic so clients fall back to IPv4. *block*: always reject. *off*: untouched. |
 | WebRTC | See below. |
 
@@ -304,6 +305,63 @@ SERVFAIL. They never fall back to plain DNS. While the daemon is stopped,
 those domains don't resolve (the watchdog restarts it within 5 minutes; *Emergency
 disable* removes the dnsmasq lines). Other domains keep using the router's
 normal DNS settings.
+
+### Routing HTTPS by server name (SNI sniffing)
+
+Domain rules normally work by watching the router's DNS answers. A device
+using DNS over HTTPS or DNS over TLS hides its lookups, which is why the
+policies block DoH and DoT by default. With *Route HTTPS by server name* on,
+the policy's domains are also recognised in the connections themselves, so
+DoH/DoT can stay allowed (Settings → DNS → *Never*, or the policy toggles
+off).
+
+How it works:
+
+* New TCP 443 connections from the policy's devices (the whole LAN for a
+  destination-only policy) that **no policy claimed** (not in a set, not a
+  routed device) are REDIRECTed to a proxy in the daemon
+  (`sni_proxy_port`, default 5340). Connections the kernel already routes
+  never touch it.
+* The proxy reads the TLS ClientHello, which carries the server name (SNI)
+  in clear text, and matches it against the domain rules (wildcards,
+  regexes, keywords, exclusions, `drop:`). Nothing is decrypted: the bytes
+  are relayed unchanged and the client verifies the real certificate.
+* It dials the original destination itself. On a match the socket carries
+  the policy's fwmark, so the policy's routing table applies: the active
+  tunnel, the kill switch, or WAN when the policy has neither. Anything else
+  is dialled without a mark and leaves via WAN as before. A `drop:` match
+  resets the connection.
+* A matched destination is added to the policy's domain set (as a DNS answer
+  would be), so later connections to it, including QUIC, take the fast
+  kernel path, and a WebRTC session window is opened for the client.
+
+What it costs and where it stops:
+
+* **Router CPU.** Every unclaimed HTTPS connection of those devices is
+  terminated on the router and relayed (with `splice`, so data stays in the
+  kernel). Expect lower throughput than the kernel path and no hardware
+  acceleration for those connections; for a destination-only policy that is
+  most of the LAN's HTTPS. Prefer device-scoped policies.
+* **QUIC.** HTTP/3 hides its server name in an encrypted Initial packet, so
+  UDP 443 that no policy claimed is **rejected** for those devices. Browsers
+  fall back to TCP within a moment, which is then sniffed. QUIC to policy
+  destinations still goes through the tunnel.
+* **Encrypted Client Hello (ECH)** encrypts the real server name behind a
+  public one (e.g. `cloudflare-ech.com` for every ECH site on Cloudflare).
+  Such connections are routed by that **public name**: add it to a policy
+  (`cloudflare-ech.com`) to send them through its tunnel, which then carries
+  all ECH traffic to that CDN, or leave it out and they go via WAN. Once the
+  destination is learned, other connections to that CDN address follow it
+  too. The Status tab counts ECH connections.
+* **Only TLS on port 443.** Other ports, plain HTTP, and non-TLS protocols
+  on 443 (sent via WAN after 5 seconds of silence) are not routed by name.
+* **IPv6** is sniffed only when `ip6tables` has NAT. Without it, IPv6 HTTPS
+  of devices using encrypted DNS bypasses the domain rules (the leak audit
+  says so).
+* **Daemon down.** The redirect is removed when the daemon stops normally.
+  If it crashes, HTTPS from those devices fails until the watchdog restarts
+  it (within 5 minutes) or a firewall restart re-applies the rules without
+  it.
 
 ## WebRTC
 
@@ -452,7 +510,7 @@ LAN client ──► mangle PREROUTING -i br+ ─► SNAKE
                table 1000+id: default dev <active tunnel> | unreachable (kill switch) | empty (→ main/WAN)
             ─► nat POSTROUTING SNAKE_NAT: MASQUERADE marked traffic out of tunnels
 filter FORWARD SNAKE_FWD: DoT/DoH/QUIC/IPv6 rejects, then accept LAN⇄tunnel
-nat PREROUTING SNAKE_DNS: port-53 REDIRECT
+nat PREROUTING SNAKE_DNS: port-53 REDIRECT; TCP 443 → SNAKE_SNI: unclaimed → REDIRECT to the SNI proxy
 dnsmasq: ipset=/netflix.com/.../SNK_1_d4,SNK_1_d6   server=/netflix.com/9.9.9.9
 mangle OUTPUT SNAKE_DNSO: dnsmasq's UDP answers → NFQUEUE → DNS inspector → SNK_<id>_d4/d6
 ```
@@ -564,7 +622,8 @@ hand and run `snake reload`. See `testdata/config.json` for an example.
   *routing and leaks*; whether your VPN exit is accepted is up to the provider.
   Residential or dedicated IPs work best.
 * Domain matching only works when the router's dnsmasq does the resolving.
-  Keep DNS hijack and DoH/DoT blocking on for destination policies. Smart-TV
+  Keep DNS hijack and DoH/DoT blocking on for destination policies (or
+  turn on *Route HTTPS by server name*). Smart-TV
   apps that pin their own encrypted DNS are best handled with a whole-device
   policy.
 * DoT blocking and DoH canaries in a destination-only policy apply to the whole

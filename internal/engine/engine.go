@@ -28,6 +28,7 @@ import (
 	"github.com/irisariuan/snake/internal/match"
 	"github.com/irisariuan/snake/internal/netfilter"
 	"github.com/irisariuan/snake/internal/routing"
+	"github.com/irisariuan/snake/internal/sniproxy"
 	"github.com/irisariuan/snake/internal/system"
 	"github.com/irisariuan/snake/internal/webrtc"
 )
@@ -109,7 +110,9 @@ type Engine struct {
 	learnRoute  atomic.Value // map[string]int: server -> policy (0 = WAN), as installed
 	dns         *dnsinspect.Inspector
 	dnsOn       bool
-	fwd         dnsfwd.Manager // DoT/DoH forwarders for resolve-via-tunnel
+	fwd         dnsfwd.Manager  // DoT/DoH forwarders for resolve-via-tunnel
+	sni         *sniproxy.Proxy // transparent SNI proxy (sniff_sni)
+	sniErr      string          // why the SNI proxy is not running
 	asnCache    *asn.Cache
 	active      map[int]string
 	cands       map[int][]Candidate
@@ -136,6 +139,7 @@ func New(p Paths, r system.Runner) *Engine {
 		mon:       health.NewMonitor(r),
 		rtc:       webrtc.NewTracker(netfilter.IPSet{R: r}, 0),
 		dns:       &dnsinspect.Inspector{IPSet: netfilter.IPSet{R: r}},
+		sni:       &sniproxy.Proxy{Sets: netfilter.IPSet{R: r}},
 		active:    map[int]string{},
 		cands:     map[int][]Candidate{},
 		asnErrors: map[int]string{},
@@ -251,6 +255,7 @@ func (e *Engine) DetectCaps() {
 				e.nl = nl
 				e.mu.Unlock()
 				e.dns.IPSet.NL = nl
+				e.sni.Sets = netfilter.IPSet{R: e.R, NL: nl}
 				e.rtc.IPSet.NL = nl
 			} else {
 				logx.Infof("ipset over netlink unavailable, using the ipset tool: %v", err)
@@ -546,8 +551,11 @@ func (e *Engine) Apply(reason string) error {
 	if dnsOn {
 		dnsQueue = s.QueueBase
 	}
+	// SNI proxy: started before the rules redirect to it. If it cannot
+	// listen, no redirect is installed (HTTPS would otherwise break).
+	sniPort := e.configureSNI(cfg, states, caps, &errs)
 	plan := netfilter.Build(s, states, netfilter.Options{IPv6: caps.IPv6, IPv6NAT: caps.IPv6NAT, DNSQueue: dnsQueue, Existing: existing,
-		TunnelAddrs: tunnelAddrs(usedTunnels(cfg)), WANAddrs: e.wanAddrs()})
+		TunnelAddrs: tunnelAddrs(usedTunnels(cfg)), WANAddrs: e.wanAddrs(), SNIPort: sniPort})
 	if err := nf.Apply(plan); err != nil {
 		errs = append(errs, err.Error())
 	}
@@ -698,6 +706,94 @@ func forwarders(cfg *config.Config, states []netfilter.PolicyState) []dnsfwd.Spe
 		})
 	}
 	return out
+}
+
+// sniPolicies is the SNI proxy's view of the sniffing policies.
+func (e *Engine) sniPolicies(cfg *config.Config, states []netfilter.PolicyState, caps Caps) []sniproxy.Policy {
+	s := cfg.Settings
+	var out []sniproxy.Policy
+	for _, st := range states {
+		p := st.Policy
+		if !p.Sniffs() {
+			continue
+		}
+		sp := sniproxy.Policy{ID: p.ID, Name: p.Name, Set: e.domainSet(p), Mark: s.PolicyMark(p.ID),
+			Set4: netfilter.SetName(p.ID, netfilter.KindDomain, false)}
+		if caps.IPv6 && st.IPv6Mode != netfilter.V6Off {
+			sp.Set6 = netfilter.SetName(p.ID, netfilter.KindDomain, true)
+		}
+		if st.Drops {
+			sp.DropSet4 = netfilter.SetName(p.ID, netfilter.KindDrop, false)
+			if caps.IPv6 {
+				sp.DropSet6 = netfilter.SetName(p.ID, netfilter.KindDrop, true)
+			}
+		}
+		if st.WebRTCMode != netfilter.RTCOff {
+			sp.Session4 = netfilter.SetName(p.ID, netfilter.KindSession, false)
+			if caps.IPv6 {
+				sp.Session6 = netfilter.SetName(p.ID, netfilter.KindSession, true)
+			}
+		}
+		if len(st.MACs) > 0 {
+			sp.MACs = map[string]bool{}
+			for _, m := range st.MACs {
+				sp.MACs[m] = true
+			}
+		}
+		out = append(out, sp)
+	}
+	return out
+}
+
+// configureSNI starts, updates or stops the SNI proxy and returns the port
+// the rules may redirect to (0: none).
+func (e *Engine) configureSNI(cfg *config.Config, states []netfilter.PolicyState, caps Caps, errs *[]string) int {
+	pols := e.sniPolicies(cfg, states, caps)
+	port := cfg.Settings.SNIProxyPort
+	if e.DryRun {
+		if len(pols) == 0 {
+			return 0
+		}
+		return port // show the rules in plans
+	}
+	if !e.isDaemon() {
+		// One-shot applies (firewall hooks) have no proxy to redirect to;
+		// the daemon re-applies within 30 seconds.
+		return 0
+	}
+	err := e.sni.Configure(sniproxy.Config{Port: port, IPv6: caps.IPv6 && caps.IPv6NAT, Policies: pols})
+	e.mu.Lock()
+	e.sniErr = ""
+	if err != nil {
+		e.sniErr = err.Error()
+	}
+	e.mu.Unlock()
+	if err != nil {
+		*errs = append(*errs, err.Error())
+		return 0
+	}
+	if len(pols) == 0 || !e.sni.Running() {
+		return 0
+	}
+	return port
+}
+
+// stopSNI removes the redirect to the proxy before it stops, so HTTPS
+// keeps working while the daemon is down.
+func (e *Engine) stopSNI() {
+	if e.DryRun || !e.sni.Running() {
+		e.sni.Stop()
+		return
+	}
+	nf := netfilter.Applier{R: e.R}
+	for _, v6 := range []bool{false, true} {
+		b := "iptables"
+		if v6 {
+			b = "ip6tables"
+		}
+		_, _ = nf.R.Run(b, "-t", "nat", "-F", netfilter.ChainSNI)
+	}
+	e.sni.Stop()
 }
 
 // dnsRules compiles the domain rules of enabled policies in policy order.

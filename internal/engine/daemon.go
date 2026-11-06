@@ -18,6 +18,7 @@ import (
 	"github.com/irisariuan/snake/internal/logx"
 	"github.com/irisariuan/snake/internal/match"
 	"github.com/irisariuan/snake/internal/netfilter"
+	"github.com/irisariuan/snake/internal/sniproxy"
 	"github.com/irisariuan/snake/internal/system"
 	"github.com/irisariuan/snake/internal/webrtc"
 )
@@ -64,6 +65,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			e.saveSets()
+			e.stopSNI()
 			e.rtc.Stop()
 			e.dns.Stop()
 			e.fwd.Stop()
@@ -184,6 +186,7 @@ type PolicyStatus struct {
 	ASNErrors   []string       `json:"asn_errors,omitempty"`
 	DomainMode  string         `json:"domain_mode,omitempty"`
 	DNSUpstream *dnsfwd.Stats  `json:"dns_upstream,omitempty"` // DoT/DoH forwarder
+	SNIMatched  *uint64        `json:"sni_matched,omitempty"`  // connections routed by server name (sniff_sni)
 	Country     string         `json:"country,omitempty"`
 }
 
@@ -202,6 +205,7 @@ type Status struct {
 	Policies   []PolicyStatus           `json:"policies"`
 	Events     []Event                  `json:"events"`
 	DNS        *dnsinspect.Stats        `json:"dns_inspector,omitempty"`
+	SNI        *sniproxy.Stats          `json:"sni_proxy,omitempty"`
 	Warnings   []string                 `json:"warnings,omitempty"`
 }
 
@@ -233,8 +237,17 @@ func (e *Engine) Status() Status {
 		asnErr[k] = v
 	}
 	dnsOn := e.dnsOn
+	sniErr := e.sniErr
 	e.mu.Unlock()
 	st.Warnings = e.Warnings()
+	var sniStats sniproxy.Stats
+	if e.sni.Running() || sniErr != "" {
+		sniStats = e.sni.Stats()
+		if sniErr != "" {
+			sniStats.LastError = sniErr
+		}
+		st.SNI = &sniStats
+	}
 	if st.Disabled {
 		if t := e.DisabledSince(); !t.IsZero() {
 			st.DisabledAt = &t
@@ -294,6 +307,10 @@ func (e *Engine) Status() Status {
 			}
 			if ps.Active != "" {
 				ps.Country = st.Tunnels[ps.Active].Country
+			}
+			if p.Sniffs() && st.SNI != nil {
+				n := sniStats.ByPolicy[p.ID]
+				ps.SNIMatched = &n
 			}
 			if fs, ok := fwdStats[p.ID]; ok {
 				fs := fs
@@ -594,13 +611,31 @@ func (e *Engine) LeakChecks() []LeakCheck {
 				}
 				return ""
 			}
+			sniffing := p.Sniffs() && st.SNI != nil && st.SNI.Listen != ""
+			if p.Sniffs() {
+				switch {
+				case sniffing:
+					ok("HTTPS the domain sets miss is routed by TLS server name (SNI proxy %s); unclaimed QUIC is rejected so it falls back to TCP; Encrypted Client Hello connections are routed by their public name", st.SNI.Listen)
+					if st.Caps.IPv6 && !st.Caps.IPv6NAT {
+						warn("IPv6 HTTPS is not sniffed (no ip6tables NAT): devices using encrypted DNS over IPv6 bypass the domain rules")
+					}
+				case st.SNI != nil && st.SNI.LastError != "":
+					warn("SNI sniffing on but the proxy is not running: %s", st.SNI.LastError)
+				default:
+					warn("SNI sniffing on but the proxy is not running")
+				}
+			}
 			if s.DoHBlocked(p) {
 				ok("known DoH resolvers blocked%s", override(s.BlockDoH))
+			} else if sniffing {
+				ok("DoH allowed%s: lookups are hidden, connections are routed by SNI", override(s.BlockDoH))
 			} else {
 				warn("DoH not blocked%s: browsers/apps with DoH bypass the domain sets", override(s.BlockDoH))
 			}
 			if s.DoTBlocked(p) {
 				ok("DoT/DoQ (853) blocked%s", override(s.BlockDoT))
+			} else if sniffing {
+				ok("DoT allowed%s: lookups are hidden, connections are routed by SNI", override(s.BlockDoT))
 			} else {
 				warn("DoT not blocked%s (Android Private DNS bypasses the domain sets)", override(s.BlockDoT))
 			}
@@ -652,7 +687,7 @@ func (e *Engine) LeakChecks() []LeakCheck {
 				ok("domain rules matched by DNS inspection (wildcards, regexes, CNAME chains)")
 			}
 		}
-		if ps.Sets[netfilter.SetName(p.ID, netfilter.KindDomain, false)] == 0 && p.HasDomains() {
+		if ps.Sets[netfilter.SetName(p.ID, netfilter.KindDomain, false)] == 0 && p.HasDomains() && !p.Sniffs() {
 			warn("domain set empty: no client has resolved these domains through the router yet")
 		}
 		out = append(out, lc)

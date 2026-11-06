@@ -51,6 +51,10 @@ type Options struct {
 	// WANAddrs identify connections already NATed onto WAN. Firmware can
 	// overwrite their conntrack mark with a value that resembles a policy.
 	WANAddrs []string
+	// SNIPort > 0 is the port of the running SNI proxy: new TCP 443
+	// connections of sniffing policies' clients that no policy claimed are
+	// redirected to it. 0 installs no redirect (proxy not running).
+	SNIPort int
 }
 
 // Plan is a set of iptables-restore payloads keyed by "family/table".
@@ -409,6 +413,9 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		if l.BlockQUIC {
 			addScope("quic", st)
 		}
+		if p.Sniffs() {
+			addScope("sni", st)
+		}
 	}
 	mangle.add(ChainMain, "-j", ChainRTC)
 
@@ -452,6 +459,33 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 	forScope(filter, ChainFwd, "doh", "-p tcp --dport 443 -m set --match-set", doh, "dst -j REJECT --reject-with tcp-reset")
 	forScope(filter, ChainFwd, "doh", "-p udp --dport 443 -m set --match-set", doh, "dst -j REJECT --reject-with", reject)
 	forScope(filter, ChainFwd, "quic", "-p udp --dport 443 -j REJECT --reject-with", reject)
+
+	// SNI sniffing: HTTPS connections no policy claimed go to the proxy,
+	// which routes them by TLS server name. Only families with NAT can be
+	// redirected.
+	if opt.SNIPort > 0 && scopes["sni"] != nil && (!v6 || opt.IPv6NAT) {
+		nat.chain(ChainSNI)
+		forScope(nat, ChainDNS, "sni", "-p tcp --dport 443 -j", ChainSNI)
+		// Claimed by a policy (sets, devices, WebRTC): the kernel routes it.
+		nat.add(ChainSNI, "-m connmark ! --mark 0/"+cmask, "-j RETURN")
+		nat.add(ChainSNI, "-d", strings.Join(private, ","), "-j RETURN")
+		// DoH resolvers and drop sets keep their filter verdicts, which a
+		// redirected connection (now addressed to the router) would skip.
+		nat.add(ChainSNI, "-m set --match-set", doh, "dst -j RETURN")
+		for _, st := range states {
+			if st.Policy.Enabled && st.Drops {
+				for _, k := range []string{KindDrop, KindDropNet} {
+					nat.add(ChainSNI, "-m set --match-set", SetName(st.Policy.ID, k, v6), "dst -j RETURN")
+				}
+			}
+		}
+		nat.add(ChainSNI, "-p tcp -j REDIRECT --to-ports", fmt.Sprint(opt.SNIPort))
+		// QUIC carries its server name in an encrypted Initial packet the
+		// proxy does not handle: unclaimed QUIC is rejected so browsers
+		// fall back to TCP, which is sniffed. QUIC to policy destinations
+		// (connmark set) still goes through the tunnel.
+		forScope(filter, ChainFwd, "sni", "-p udp --dport 443 -m connmark --mark 0/"+cmask, "-j REJECT --reject-with", reject)
+	}
 
 	ifaces := make([]string, 0, len(tunnels))
 	for t := range tunnels {
