@@ -428,7 +428,22 @@ snake rules list|check|import|export
 snake import-dvr [--dir /jffs/configs/domain_vpn_routing] [--yes]
 snake token [--rotate]       API token for the standalone UI at http://router:8444/
 snake start | stop [--flush] | restart
+snake disable | enable       emergency switch (see below)
 ```
+
+### Emergency disable
+
+The red **Emergency disable** button at the top of the web UI (or
+`snake disable` over SSH) removes every rule, route, ipset and dnsmasq option
+snake installed. The router then behaves as if snake were not installed: all
+traffic goes over the normal WAN connection, and **kill switches and leak
+protection stop working**. The daemon keeps running so the UI stays usable;
+your configuration and learned addresses are kept. Firewall/tunnel hooks and
+configuration saves do not re-apply anything while disabled.
+
+The state is a flag file (`/jffs/addons/snake/disabled`), so snake stays
+disabled across restarts and reboots until you press **Enable snake** or run
+`snake enable`.
 
 ## Web UI and API
 

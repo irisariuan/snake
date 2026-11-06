@@ -43,6 +43,8 @@ type Paths struct {
 	Learnings string
 	Socket    string
 	PID       string
+	// Disabled is the emergency-disable flag file; present = disabled.
+	Disabled string
 }
 
 // DefaultPaths returns the standard /jffs layout.
@@ -56,6 +58,7 @@ func DefaultPaths(base string) Paths {
 		Learnings: filepath.Join(base, "learnings.json"),
 		Socket:    "/var/run/snake.sock",
 		PID:       "/var/run/snake.pid",
+		Disabled:  filepath.Join(base, "disabled"),
 	}
 }
 
@@ -116,6 +119,7 @@ type Engine struct {
 	linkKey     string
 	kick        chan struct{}
 	daemon      bool
+	disabled    atomic.Bool // emergency disable: see disable.go
 }
 
 // New creates an engine.
@@ -132,6 +136,11 @@ func New(p Paths, r system.Runner) *Engine {
 		netHashes: map[string]string{},
 		started:   time.Now(),
 		kick:      make(chan struct{}, 1),
+	}
+	if p.Disabled != "" {
+		if _, err := os.Stat(p.Disabled); err == nil {
+			e.disabled.Store(true)
+		}
 	}
 	e.rtc.ServerRoute = e.serverRoute
 	e.rtc.OnServer = e.onServer
@@ -423,6 +432,10 @@ func setSpecs(cfg *config.Config, states []netfilter.PolicyState, v6 bool) []net
 func (e *Engine) Apply(reason string) error {
 	e.applyMu.Lock()
 	defer e.applyMu.Unlock()
+	if e.Disabled() {
+		logx.Infof("apply (%s) skipped: snake is disabled", reason)
+		return nil
+	}
 	e.mu.Lock()
 	cfg := e.rt
 	caps := e.caps

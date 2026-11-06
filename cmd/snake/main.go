@@ -49,6 +49,8 @@ Usage: snake <command> [args]
   install                 install hooks, web UI page and start the daemon
   uninstall [--purge]     remove everything (--purge also deletes config)
   start | stop | restart  control the daemon (stop --flush also removes rules)
+  disable | enable        emergency switch: remove all rules (traffic uses WAN,
+                          kill switches off) and stop applying / turn back on
   status                  show tunnels and policies
   apply [--dry-run]       re-apply rules (dry run prints the generated commands)
   reload                  reload config.json from disk and apply
@@ -86,6 +88,10 @@ func main() {
 		_ = stop(false)
 		time.Sleep(time.Second)
 		err = start()
+	case "disable":
+		err = disableCmd()
+	case "enable":
+		err = enableCmd()
 	case "status":
 		err = status()
 	case "apply":
@@ -289,6 +295,38 @@ func stop(flush bool) error {
 	return nil
 }
 
+// disableCmd is the emergency switch. Without a daemon it removes the rules
+// itself and leaves the flag file, which keeps a later start disabled.
+func disableCmd() error {
+	if pidAlive() {
+		if _, err := call("POST", "/api/disable?reason=cli", nil); err != nil {
+			return err
+		}
+	} else {
+		if err := os.WriteFile(paths().Disabled, []byte(time.Now().Format(time.RFC3339)+" cli\n"), 0o644); err != nil {
+			return err
+		}
+		teardown()
+	}
+	fmt.Println("snake DISABLED: rules, routes and sets removed; all traffic uses WAN. Turn back on with: snake enable")
+	return nil
+}
+
+func enableCmd() error {
+	if pidAlive() {
+		if _, err := call("POST", "/api/enable?reason=cli", nil); err != nil {
+			return err
+		}
+		fmt.Println("snake enabled")
+		return nil
+	}
+	if err := os.Remove(paths().Disabled); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	fmt.Println("snake enabled; daemon not running, start it with: snake start")
+	return nil
+}
+
 func teardown() {
 	r := system.Exec{}
 	ipv6 := system.Exists("ip6tables-restore")
@@ -403,6 +441,9 @@ func status() error {
 		return err
 	}
 	fmt.Printf("snake %s, up %s, WAN %s, last apply %s\n", st.Version, st.Uptime, st.WANIP, st.LastApply.Format(time.RFC3339))
+	if st.Disabled {
+		fmt.Println("*** DISABLED (emergency switch): no rules installed, all traffic uses WAN. Turn back on with: snake enable")
+	}
 	fmt.Printf("caps: ipv6=%v ipv6nat=%v nfqueue=%v conntrack=%v\n", st.Caps.IPv6, st.Caps.IPv6NAT, st.Caps.NFQueue, st.Caps.Conntrack)
 	if st.LastError != "" {
 		fmt.Println("LAST ERROR:", st.LastError)

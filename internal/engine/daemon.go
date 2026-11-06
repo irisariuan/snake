@@ -31,7 +31,9 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 	e.DetectCaps()
 	ips := e.ipset()
-	if _, err := os.Stat(e.P.IPSetSave); err == nil {
+	if e.Disabled() {
+		logx.Warnf("snake is DISABLED (emergency switch): not installing any rules; enable it in the web UI or with: snake enable")
+	} else if _, err := os.Stat(e.P.IPSetSave); err == nil {
 		if err := ips.RestoreFile(e.P.IPSetSave); err != nil {
 			logx.Warnf("restore saved ipsets: %v", err)
 		}
@@ -130,6 +132,12 @@ func (e *Engine) saveSets() {
 	if e.DryRun {
 		return
 	}
+	if e.Disabled() {
+		// The sets are gone; saving now would wipe what Enable restores.
+		e.saveLearnings()
+		e.saveDNSRecords()
+		return
+	}
 	ips := e.ipset()
 	var names []string
 	for _, n := range ips.Names() {
@@ -170,6 +178,8 @@ type PolicyStatus struct {
 // Status is the API status document.
 type Status struct {
 	Version    string                   `json:"version"`
+	Disabled   bool                     `json:"disabled"`
+	DisabledAt *time.Time               `json:"disabled_at,omitempty"`
 	Uptime     string                   `json:"uptime"`
 	Caps       Caps                     `json:"caps"`
 	LastApply  time.Time                `json:"last_apply"`
@@ -189,6 +199,7 @@ func (e *Engine) Status() Status {
 	caps := e.caps
 	st := Status{
 		Version:    Version,
+		Disabled:   e.disabled.Load(),
 		Uptime:     time.Since(e.started).Round(time.Second).String(),
 		Caps:       caps,
 		LastApply:  e.lastApply,
@@ -210,6 +221,11 @@ func (e *Engine) Status() Status {
 	}
 	dnsOn := e.dnsOn
 	e.mu.Unlock()
+	if st.Disabled {
+		if t := e.DisabledSince(); !t.IsZero() {
+			st.DisabledAt = &t
+		}
+	}
 	if dnsOn {
 		ds := e.dns.Stats()
 		st.DNS = &ds

@@ -29,6 +29,9 @@
 #snake .chk{display:flex;gap:6px;align-items:flex-start;margin:6px 0}
 #snake .chk input{margin-top:2px}
 #snake .banner{background:#6b4a12;border:1px solid var(--warn);padding:8px 10px;border-radius:4px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+#snake .banner.off{background:#6d2323;border-color:var(--bad)}
+#snake button.kill{background:#8b1e1e;border-color:var(--bad);color:#fff;font-weight:bold}
+#snake button.kill:hover{background:#a82424;border-color:#fff}
 #snake .err{background:#6d2323;border:1px solid var(--bad);padding:8px 10px;border-radius:4px;margin-bottom:10px;white-space:pre-wrap;word-break:break-word}
 #snake .toast{position:fixed;right:16px;bottom:16px;background:var(--panel2);border:1px solid var(--accent);padding:8px 12px;border-radius:4px;z-index:9999;max-width:80vw}
 #snake pre{background:#1d2629;border:1px solid var(--line);padding:8px;overflow:auto;max-height:360px;font:11px/1.4 Menlo,Consolas,monospace;white-space:pre}

@@ -91,7 +91,7 @@ func (e *Engine) serverRoute(addr string) (int, bool) {
 // sets and the tracker's routing table.
 func (e *Engine) syncLearnings(cfg *config.Config) error {
 	st := e.learn
-	if st == nil || cfg == nil {
+	if st == nil || cfg == nil || e.Disabled() {
 		return nil
 	}
 	e.learnMu.Lock()

@@ -90,6 +90,30 @@ func (s *Server) routes(authed bool) http.Handler {
 		}
 		writeJSON(w, map[string]string{"result": "reloaded"})
 	})
+	// Emergency switch: remove every rule snake installed / put them back.
+	mux.HandleFunc("POST /api/disable", func(w http.ResponseWriter, r *http.Request) {
+		reason := r.URL.Query().Get("reason")
+		if reason == "" {
+			reason = "web UI"
+		}
+		if err := s.E.Disable(reason); err != nil {
+			writeErr(w, 500, err)
+			return
+		}
+		writeJSON(w, map[string]any{"result": "disabled", "disabled": true})
+	})
+	mux.HandleFunc("POST /api/enable", func(w http.ResponseWriter, r *http.Request) {
+		reason := r.URL.Query().Get("reason")
+		if reason == "" {
+			reason = "web UI"
+		}
+		if err := s.E.Enable(reason); err != nil {
+			// Enabled, but the apply had errors: report them like /api/apply.
+			writeErr(w, 500, err)
+			return
+		}
+		writeJSON(w, map[string]any{"result": "enabled", "disabled": false})
+	})
 	mux.HandleFunc("POST /api/recheck", func(w http.ResponseWriter, r *http.Request) {
 		s.E.Kick()
 		writeJSON(w, map[string]string{"result": "scheduled"})

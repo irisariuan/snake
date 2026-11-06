@@ -108,7 +108,11 @@
   }
   function refreshStatus() {
     if (document.hidden) return;
-    api('GET', '/api/status').then(function (s) { state.status = s; if (state.tab === 'status') render(); }).catch(function () {});
+    api('GET', '/api/status').then(function (s) {
+      var flipped = !state.status || !!state.status.disabled !== !!s.disabled;
+      state.status = s;
+      if (state.tab === 'status' || flipped) render();
+    }).catch(function () {});
   }
   function save() {
     return api('PUT', '/api/config', state.cfg).then(function (c) {
@@ -124,7 +128,10 @@
   function render() {
     var scrollY = window.scrollY;
     root.innerHTML = '';
-    root.appendChild(el('h2', null, 'snake: split tunnelling ', el('span', { class: 'muted small' }, state.status ? state.status.version : '')));
+    var off = state.status && state.status.disabled;
+    root.appendChild(el('div', { class: 'row', style: 'justify-content:space-between;margin-bottom:10px' },
+      el('h2', { style: 'margin:0' }, 'snake: split tunnelling ', el('span', { class: 'muted small' }, state.status ? state.status.version : '')),
+      state.status && !off ? btn('Emergency disable', emergencyDisable, 'danger kill') : null));
     root.appendChild(el('div', { class: 'tabs' }, TABS.map(function (t) {
       return el('button', { type: 'button', class: 'tab' + (state.tab === t[0] ? ' on' : ''), onclick: function () {
         if (state.listEdit && state.listEdit.changed && !confirm('Discard unsaved changes to the rule list?')) return;
@@ -142,9 +149,31 @@
     ({ status: viewStatus, policies: viewPolicies, lists: viewLists, devices: viewDevices, learn: viewLearnings, diag: viewDiag, settings: viewSettings, import: viewImport })[state.tab](body);
     window.scrollTo(0, scrollY);
   }
+  // ---------- emergency switch ----------
+  var switching = false;
+  function emergencyDisable() {
+    if (switching) return;
+    if (!confirm('Disable snake now?\n\nEvery rule, route and set snake installed is removed: ALL traffic goes over the normal WAN connection, kill switches and leak protection stop working.\n\nYour configuration is kept. Use "Enable snake" (or "snake enable" over SSH) to turn it back on.')) return;
+    switching = true;
+    api('POST', '/api/disable').then(function () { toast('snake disabled: all traffic uses WAN'); })
+      .catch(function (e) { toast('Disable failed: ' + e.message); })
+      .then(function () { switching = false; return load(); });
+  }
+  function emergencyEnable() {
+    if (switching) return;
+    switching = true;
+    api('POST', '/api/enable').then(function () { toast('snake enabled: rules applied'); })
+      .catch(function (e) { toast('Enabled with errors: ' + e.message); })
+      .then(function () { switching = false; return load(); });
+  }
   function renderBanner() {
     if (!bannerBox) return;
     bannerBox.innerHTML = '';
+    var s = state.status;
+    if (s && s.disabled) bannerBox.appendChild(el('div', { class: 'banner off' },
+      el('span', null, el('b', null, 'snake is DISABLED'), s.disabled_at ? ' (since ' + ago(s.disabled_at) + ')' : '',
+        '. No rules are installed: all traffic uses the normal WAN connection, kill switches are off. Saved changes are stored but not applied.'),
+      btn('Enable snake', emergencyEnable, 'pri')));
     if (state.dirty) bannerBox.appendChild(el('div', { class: 'banner' }, 'You have unsaved changes.',
       el('span', { class: 'row' }, btn('Discard', function () { state.dirty = false; state.edit = null; load(); }), btn('Save & apply', save, 'pri'))));
   }
