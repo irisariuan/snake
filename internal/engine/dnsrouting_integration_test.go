@@ -165,6 +165,9 @@ func TestIntegrationSharedDNSResolver(t *testing.T) {
 			if err := m.Configure(specs); err != nil {
 				t.Fatal(err)
 			}
+			t.Logf("down tunnel rules: %s", sh(t, "ip -4 rule show"))
+			lookup, lookupErr := exec.Command("ip", "-4", "route", "get", "203.0.113.53", "mark", fmt.Sprintf("0x%x", s.ProbeMark("wgc1")), "oif", "wgc1").CombinedOutput()
+			t.Logf("down tunnel lookup: %s (%v), spec mark %#x iface %s", lookup, lookupErr, specs[0].Up.Mark, specs[0].Up.Iface)
 			if answer, err := dnsinspect.Query(m.Stats()[1].Listen, "test.example", 2*time.Second); err == nil && len(answer.IPs) > 0 {
 				t.Fatalf("down tunnel still answered DNS: %v; routes: %s", answer.IPs, sh(t, "ip -4 route show table 1301"))
 			}
