@@ -220,7 +220,7 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 			if ip == nil || (ip.To4() == nil) != v6 {
 				continue
 			}
-			mangle.add(ChainMain, "-m conntrack --ctstate ESTABLISHED,RELATED --ctrepldst", a, "-g", MarkChain(st.Policy.ID))
+			mangle.add(ChainMain, "-m connmark --mark 0/"+cmask, "-m conntrack --ctstate ESTABLISHED,RELATED --ctrepldst", a, "-g", MarkChain(st.Policy.ID))
 		}
 	}
 	for _, st := range states {

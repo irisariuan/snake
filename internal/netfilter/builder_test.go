@@ -228,7 +228,7 @@ func TestBuildTunnelConnectionRecovery(t *testing.T) {
 		"wgc1": {"10.66.0.2", "fd00::2"}, "wgc2": {"10.77.0.2"},
 	}})
 	m4, m6 := plan.Restore["4/mangle"], plan.Restore["6/mangle"]
-	rec := "-A SNAKE -m conntrack --ctstate ESTABLISHED,RELATED --ctrepldst 10.66.0.2 -g SNAKE_M1"
+	rec := "-A SNAKE -m connmark --mark 0/0x3fc00000 -m conntrack --ctstate ESTABLISHED,RELATED --ctrepldst 10.66.0.2 -g SNAKE_M1"
 	ret := "-A SNAKE -m conntrack ! --ctstate NEW -j RETURN"
 	mustContain(t, m4, rec, "--ctrepldst 10.77.0.2 -g SNAKE_M2", ret)
 	if strings.Index(m4, rec) > strings.Index(m4, ret) {

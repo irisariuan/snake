@@ -71,7 +71,9 @@ while True:
 	dir := t.TempDir()
 	c := config.Default()
 	c.Policies = []config.Policy{{Name: "p", Enabled: true, Tunnels: []string{"wgc1"}, KillSwitch: true, Domains: []string{"example.com"},
-		Leak: config.Leak{IPv6: "off", WebRTC: "off"}}}
+		Leak: config.Leak{IPv6: "off", WebRTC: "off"}},
+		{Name: "p2", Enabled: true, Tunnels: []string{"wgc1"}, KillSwitch: true, Domains: []string{"other.test"},
+			Leak: config.Leak{IPv6: "off", WebRTC: "off"}}}
 	c.Settings.PreResolve = false
 	c.Settings.LANInterfaces = "br0"
 	c.Normalize()
@@ -158,5 +160,13 @@ except Exception as e:
 	ct = sh(t, "conntrack -L -p tcp -s 192.168.77.2 -d 203.0.113.80 --mark 0x4042f003/0xffffffff")
 	if !strings.Contains(ct, fmt.Sprintf("mark=%d", c.Settings.ConnMark(1)|0x4002f003)) {
 		t.Fatalf("VPN connmark lost alternate QoS/Director bits: %s", ct)
+	}
+	// A valid policy identity takes precedence over the tunnel-address
+	// fallback when multiple policies use the same interface.
+	sh(t, "ipset del SNK_1_d4 203.0.113.80; ipset add SNK_2_d4 203.0.113.80")
+	runClient("second policy sharing the tunnel")
+	ct = sh(t, "conntrack -L -p tcp -s 192.168.77.2 -d 203.0.113.80 --mark 0x4082f003/0xffffffff")
+	if !strings.Contains(ct, fmt.Sprintf("mark=%d", c.Settings.ConnMark(2)|0x4002f003)) {
+		t.Fatalf("shared tunnel reassigned the second policy to the first: %s", ct)
 	}
 }
