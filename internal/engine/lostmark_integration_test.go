@@ -3,6 +3,7 @@
 package engine
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -129,7 +130,10 @@ except Exception as e:
 	sh(t, "iptables -t mangle -N TEST_QOS; iptables -t mangle -A TEST_QOS -j RETURN; iptables -t mangle -A POSTROUTING -o wgc1 -m mark --mark 0x80010002/0xc03fffff -j TEST_QOS")
 	defer exec.Command("sh", "-c", "iptables -t mangle -D POSTROUTING -o wgc1 -m mark --mark 0x80010002/0xc03fffff -j TEST_QOS; iptables -t mangle -F TEST_QOS; iptables -t mangle -X TEST_QOS").Run()
 	runClient("tunnel with QoS enabled")
-	sh(t, "conntrack -L -p tcp -s 192.168.77.2 -d 203.0.113.80 --mark 0x80410002/0xffffffff")
+	ct := sh(t, "conntrack -L -p tcp -s 192.168.77.2 -d 203.0.113.80 --mark 0x80410002/0xffffffff")
+	if !strings.Contains(ct, fmt.Sprintf("mark=%d", c.Settings.ConnMark(1)|0x80010002)) {
+		t.Fatalf("VPN connmark lost QoS classification or policy ownership: %s", ct)
+	}
 	counters := sh(t, "iptables -t mangle -nvxL TEST_QOS")
 	seen := false
 	for _, line := range strings.Split(counters, "\n") {
@@ -143,5 +147,8 @@ except Exception as e:
 	}
 	sh(t, "ipset del SNK_1_d4 203.0.113.80")
 	runClient("WAN with QoS enabled")
-	sh(t, "conntrack -L -p tcp -s 192.168.77.2 -d 203.0.113.80 --mark 0x80010002/0xffffffff")
+	ct = sh(t, "conntrack -L -p tcp -s 192.168.77.2 -d 203.0.113.80 --mark 0x80010002/0xffffffff")
+	if !strings.Contains(ct, fmt.Sprintf("mark=%d", uint32(0x80010002))) {
+		t.Fatalf("WAN connmark lost QoS classification or acquired policy ownership: %s", ct)
+	}
 }

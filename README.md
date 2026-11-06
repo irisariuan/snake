@@ -444,11 +444,11 @@ entries of the policy are flushed when the `conntrack` tool exists.
 
 ```
 LAN client ──► mangle PREROUTING -i br+ ─► SNAKE
-                 restore connmark │ private dst → RETURN
+                 WAN/tunnel NAT affinity, then isolated connection policy │ private dst → RETURN
                  SNAKE_P<id> (in policy order):
                    mac / ipset(dnsmasq-learned, ASN+CIDR, WebRTC peers/servers)  ─► SNAKE_M<id>: MARK id<<16, save connmark
                  SNAKE_RTC: NFQUEUE for session clients' new UDP flows
-            ─► ip rule  pref 5200+id  fwmark id<<16/0xff0000 → table 1000+id
+            ─► ip rule  pref 5200+id  fwmark id<<16/0xc0ff0000 → table 1000+id
                table 1000+id: default dev <active tunnel> | unreachable (kill switch) | empty (→ main/WAN)
             ─► nat POSTROUTING SNAKE_NAT: MASQUERADE marked traffic out of tunnels
 filter FORWARD SNAKE_FWD: DoT/DoH/QUIC/IPv6 rejects, then accept LAN⇄tunnel
@@ -463,8 +463,15 @@ mangle OUTPUT SNAKE_DNSO: dnsmasq's UDP answers → NFQUEUE → DNS inspector �
   meaning: bits 24-31 (egress port, WAN flag, IPsec, policy routing) break
   routed traffic and are rejected. A short-lived version used `0x3fc00000`;
   configs with it are moved back automatically.
-* Adaptive QoS also marks packets (`0xc03fffff`) and shares bits with snake.
-  The Status tab points this out when Adaptive QoS is on.
+* Connection policy ownership uses `0x3fc00000`, separate from Adaptive
+  QoS classification (`0xc03fffff`) and VPN Director (`0xf000`). Only these
+  owned connection bits are changed; firmware classification is preserved.
+  Packet routing requires the QoS direction bits clear, so QoS categories
+  cannot match VPN rules. After routing, classified VPN packets regain
+  their QoS packet mark for egress scheduling; NAT uses isolated connection
+  ownership. Overlapping custom connection masks are rejected even when
+  QoS is off, so enabling it later does not invalidate the configuration.
+  Other addons must not claim snake's documented masks, tables or priorities.
 * ip rule priorities 4980–5499, routing tables 1000–1310.
 * All chains are loaded with `iptables-restore --noflush`, so each table is
   updated atomically. Chains of removed policies are deleted in the same

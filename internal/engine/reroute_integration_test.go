@@ -108,7 +108,7 @@ except Exception as e:
 	// to a policy id. The NAT binding must win over both that connmark and
 	// a policy-looking packet mark. This reproduces GitHub downloads that
 	// connected normally and then stalled after a few response records.
-	sh(t, "conntrack -U -p tcp -s 192.168.77.2 -d 203.0.113.80 --mark 0x10000/0xff0000")
+	sh(t, "conntrack -U -p tcp -s 192.168.77.2 -d 203.0.113.80 --mark 0x410000/0x3fff0000")
 	foreign := "-t mangle -I PREROUTING 1 -i br0 -d 203.0.113.80 -p tcp --tcp-flags SYN,ACK ACK -j MARK --set-xmark 0x10000/0xff0000"
 	sh(t, "iptables "+foreign)
 	defer exec.Command("sh", "-c", "iptables "+strings.Replace(foreign, "-I PREROUTING 1", "-D PREROUTING", 1)).Run()

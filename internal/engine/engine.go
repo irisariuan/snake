@@ -852,9 +852,9 @@ func LocalResolver() *net.Resolver {
 	}
 }
 
-// migrateMarks saves a configuration whose mark mask Load moved and drops
-// connections still carrying marks in the old bits, so they do not keep
-// those bits and reconnect on the new marks.
+// migrateMarks saves the new connection-mask layout without interrupting
+// normal WAN sessions. Only the withdrawn Broadcom-unsafe layout needs
+// its old connections removed.
 func (e *Engine) migrateMarks(c *config.Config, old uint32) {
 	e.event("", "config", "connection policy marks now use isolated mask 0x%08x; retired mark mask 0x%08x", c.Settings.ConnMarkMask, old)
 	if e.DryRun {
