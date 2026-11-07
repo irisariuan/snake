@@ -178,3 +178,8 @@
 #snake .tun-row { @apply tw:py-1.5 tw:border-b tw:border-line; }
 #snake .tun-role { @apply tw:text-muted tw:w-[58px] tw:shrink-0; font-size: 11px; }
 #snake .tun-role.primary { @apply tw:text-accent tw:font-bold; }
+
+/* router page: link to the full page */
+#snake a.btn { @apply tw:inline-block tw:no-underline tw:bg-panel2 tw:text-fg tw:border tw:border-line tw:rounded-[3px] tw:px-2.75 tw:py-1.25; }
+#snake a.btn:hover { @apply tw:border-accent; }
+#snake .full-hint { @apply tw:flex tw:items-center tw:justify-between tw:gap-2 tw:mb-2.5 tw:px-2.5 tw:py-1.5 tw:rounded tw:bg-panel2 tw:border-l-2 tw:border-info; font-size: 12px; }

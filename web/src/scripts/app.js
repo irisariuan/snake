@@ -143,7 +143,8 @@ function render() {
   var off = state.status && state.status.disabled;
   root.appendChild(el('div', { class: 'row tw:justify-between tw:mb-2.5' },
     el('h2', { class: 'tw:m-0' }, 'snake: split tunnelling ', el('span', { class: 'muted small' }, state.status ? state.status.version : '')),
-    state.status && !off ? btn('Emergency disable', emergencyDisable, 'danger kill') : null));
+    el('span', { class: 'row' }, fullPageLink('Open full page ↗', 'btn'),
+      state.status && !off ? btn('Emergency disable', emergencyDisable, 'danger kill') : null)));
   root.appendChild(el('div', { class: 'tabs' }, TABS.map(function (t) {
     return el('button', { type: 'button', class: 'tab' + (state.tab === t[0] ? ' on' : ''), onclick: function () {
       if (state.listEdit && state.listEdit.changed && !confirm('Discard unsaved changes to the rule list?')) return;
@@ -151,6 +152,7 @@ function render() {
       if (t[0] === 'learn') loadLearnings();
     } }, t[1]);
   })));
+  add(root, fullPageHint());
   bannerBox = el('div');
   root.appendChild(bannerBox);
   renderBanner();
@@ -161,6 +163,37 @@ function render() {
   ({ status: viewStatus, policies: viewPolicies, tunnels: viewTunnels, lists: viewLists, devices: viewDevices, learn: viewLearnings, diag: viewDiag, settings: viewSettings, import: viewImport })[state.tab](body);
   window.scrollTo(0, scrollY);
 }
+// ---------- full page ----------
+// The router's Addons page is a fixed 760 px column inside the firmware's
+// layout, and it shows the UI it was mounted with. The daemon serves the
+// same UI on its own page at the API address; this opens it in a new tab.
+// The token travels in the URL fragment, which the browser does not send
+// to the server; the full page stores it and removes it from the address.
+function fullPageURL() {
+  return (CTX.apiBase || '') + '/' + (CTX.token ? '#token=' + encodeURIComponent(CTX.token) : '');
+}
+function fullPageLink(text, cls) {
+  if (CTX.mode !== 'asp') return null;
+  return el('a', { href: fullPageURL(), target: '_blank', rel: 'noopener', class: cls || '', title: 'snake on its own page (' + CTX.apiBase + '), with room for every control' }, text);
+}
+function fullPageHint() {
+  if (CTX.mode !== 'asp') return null;
+  try { if (localStorage.getItem('snake_hide_full_page_hint')) return null; } catch (e) {}
+  var box = el('div', { class: 'full-hint' },
+    el('span', null, 'The router\'s page is narrow and some controls are cramped. ', fullPageLink('Open snake on its own page ↗'),
+      el('span', { class: 'muted' }, ' (same settings; if it shows a certificate warning over HTTPS, accept the router\'s certificate once).')),
+    btn('×', function () { try { localStorage.setItem('snake_hide_full_page_hint', '1'); } catch (e) {} box.remove(); }, 'btn-sm'));
+  return box;
+}
+// A token handed over by the router page (#token=...).
+function takeTokenFromURL() {
+  var m = /(?:^#|&)token=([^&]+)/.exec(location.hash || '');
+  if (!m) return;
+  CTX.token = decodeURIComponent(m[1]);
+  try { localStorage.setItem('snake_token', CTX.token); } catch (e) {}
+  try { history.replaceState(null, '', location.pathname + location.search); } catch (e) { location.hash = ''; }
+}
+
 // ---------- emergency switch ----------
 var switching = false;
 function emergencyDisable() {
@@ -1401,6 +1434,7 @@ function viewImport(b) {
 function boot() {
   root = document.getElementById('snake');
   if (!root) return;
+  if (CTX.mode === 'standalone') takeTokenFromURL();
   if (CTX.mode === 'standalone' && !CTX.token) {
     try { CTX.token = localStorage.getItem('snake_token') || ''; } catch (e) {}
     if (!CTX.token) askToken();

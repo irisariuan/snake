@@ -758,6 +758,15 @@ that only the logged-in Addons page can read (it lives in
 `custom_settings.txt`). It listens on the LAN address only. The CLI uses a
 root-only unix socket.
 
+The Addons page is a narrow (760 px) column inside the firmware's layout.
+**Open full page ↗** at the top opens the same UI on the daemon's own page
+(`http://<lan-ip>:8444/`, or `https://...:8445/`), with room for every
+control. It hands over the token in the URL fragment, which is not sent to
+the server; the page stores it in the browser and removes it from the
+address. The Addons page holds a copy of the UI: snake rewrites it on
+install, at boot and after every update or rollback (`snake webui-mount`
+does it by hand).
+
 Diagnostics tab:
 * **Test a domain**: which policy matches, resolved addresses, and whether each
   one is in a set.
