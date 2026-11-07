@@ -53,7 +53,7 @@ type Policy struct {
 	// ExcludeMACs and ExcludeNets are clients the policy never applies to.
 	ExcludeMACs map[string]bool
 	ExcludeNets []netip.Prefix
-	Mark uint32 // fwmark of the policy's routing table
+	Mark        uint32 // fwmark of the policy's routing table
 	// Set4/Set6 learn the destination of a matched connection (the
 	// policy's domain sets), so later connections to it take the kernel
 	// path. "" skips a family.

@@ -33,6 +33,7 @@ armv7: web
 	GOARCH=arm GOARM=7 $(BUILD) -o dist/snake-armv7 ./cmd/snake
 
 test: web
+	@test -z "$$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
 	cd web && npm test
 	go vet ./...
 	SNAKE_REQUIRE_UI=1 go test ./...

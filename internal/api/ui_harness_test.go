@@ -44,7 +44,7 @@ func TestUIHarness(t *testing.T) {
 	_ = config.Save(filepath.Join(dir, "config.json"), &c)
 	rec := &system.Recorder{Responses: map[string]string{"nvram get wan0_ipaddr": "198.51.100.20",
 		// VPN server clients for the device picker: a WireGuard peer and an OpenVPN subnet.
-		"nvram show": "wgs1_enable=1\nwgs1_c1_enable=1\nwgs1_c1_name=Phone abroad\nwgs1_c1_addr=10.6.0.2/32\nvpn_server1_sn=10.8.0.0\nvpn_server1_nm=255.255.255.0\nvpn_server1_state=2\n",
+		"nvram show":          "wgs1_enable=1\nwgs1_c1_enable=1\nwgs1_c1_name=Phone abroad\nwgs1_c1_addr=10.6.0.2/32\nvpn_server1_sn=10.8.0.0\nvpn_server1_nm=255.255.255.0\nvpn_server1_state=2\n",
 		"ipset list SNK_1_d4": "Name: SNK_1_d4\nType: hash:net\nNumber of entries: 4\nMembers:\n54.155.178.5\n23.246.50.141\n52.31.4.200\n203.0.113.99\n",
 		"ipset list SNK_1_r4": "Name: SNK_1_r4\nNumber of entries: 2\nMembers:\n81.2.69.160 timeout 412\n81.2.69.161 timeout 75\n"}}
 	now0 := time.Now()

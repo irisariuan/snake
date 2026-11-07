@@ -152,8 +152,8 @@ type Policy struct {
 	// blocked by its drop: rules, not under its leak protection. With no
 	// Devices the policy covers every device but these.
 	ExcludeDevices []string `json:"exclude_devices"`
-	Lists           []string `json:"lists"`   // names of rule lists merged into this policy
-	Leak            Leak     `json:"leak"`
+	Lists          []string `json:"lists"` // names of rule lists merged into this policy
+	Leak           Leak     `json:"leak"`
 }
 
 // RuleList is a reusable, importable/exportable set of rules (a .rules file).
