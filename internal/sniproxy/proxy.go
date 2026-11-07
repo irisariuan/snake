@@ -71,10 +71,11 @@ type Policy struct {
 	// its destination is routed for that client only, not learned into
 	// Set4/Set6. nil: session: rules are treated as plain rules.
 	Session func(client, dst netip.Addr, rule, name string, opts match.Opts) error
-	// Route handles connections matching a route: rule's expression: a
-	// session for the client if the rule's if: condition holds for it
-	// (reported; otherwise the connection is not routed by this policy).
-	Route func(client, dst netip.Addr, rule, name string, opts match.Opts) (bool, error)
+	// Route handles connections matching a branch of an if: (or route:)
+	// rule: the client's condition picks the branch, whose action starts a
+	// route or drop session for it. It reports the action (match.ActRoute,
+	// match.ActDrop, or "": not routed by this policy).
+	Route func(client, dst netip.Addr, rule, name string) (string, error)
 	// Cond receives destinations of connections matching if: atoms.
 	Cond func(dst netip.Addr, hits []match.CondHit)
 	// DropSession blocks a connection matching a drop[...]: rule and its
@@ -483,16 +484,21 @@ func (p *Proxy) handle(c *net.TCPConn) {
 			}
 		}
 	}
+	routeDrop := false
 	if ok && res.Route {
-		routed := false
+		act := ""
 		if pol.Route != nil {
 			var err error
-			if routed, err = pol.Route(client, dst.Addr(), res.Rule, hello.ServerName, res.Opts); err != nil {
-				logx.Warnf("sni proxy: route for %s -> %s (%s): %v", client, dst, hello.ServerName, err)
+			if act, err = pol.Route(client, dst.Addr(), res.Rule, hello.ServerName); err != nil {
+				logx.Warnf("sni proxy: conditional rule for %s -> %s (%s): %v", client, dst, hello.ServerName, err)
 			}
 		}
-		if !routed {
-			ok = false // condition false: not routed by this policy
+		switch act {
+		case match.ActDrop:
+			res.Drop, routeDrop = true, true // drop session started by Route
+		case match.ActRoute:
+		default:
+			ok = false // no branch for this client: not routed by this policy
 		}
 	}
 	switch {
@@ -500,7 +506,9 @@ func (p *Proxy) handle(c *net.TCPConn) {
 		p.noSNI.Add(1)
 	case ok && res.Drop:
 		p.dropped.Add(1)
-		if !res.Opts.IsZero() && pol.DropSession != nil {
+		if routeDrop {
+			// Drop session started by Route above.
+		} else if !res.Opts.IsZero() && pol.DropSession != nil {
 			if err := pol.DropSession(client, dst.Addr(), res.Rule, hello.ServerName, res.Opts); err != nil {
 				logx.Warnf("sni proxy: drop session for %s -> %s (%s): %v", client, dst, hello.ServerName, err)
 			}

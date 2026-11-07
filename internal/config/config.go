@@ -1002,7 +1002,9 @@ func (c *Config) Validate() error {
 			opts = append(opts, sp.Opts)
 		}
 		for _, r := range set.Routes {
-			opts = append(opts, r.Opts)
+			for _, a := range r.Branches() {
+				opts = append(opts, a.Opts)
+			}
 		}
 		for _, dp := range set.Drop {
 			opts = append(opts, dp.Opts)

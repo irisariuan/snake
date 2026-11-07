@@ -13,7 +13,8 @@
 //	asn:2906                             autonomous system (AS prefix optional)
 //	cidr:23.246.0.0/18                   address range or single IP (ip: also accepted)
 //
-// On import, lines from common list formats are converted: AdBlock/AdGuard
+// On import, lines from common list formats are converted (and the old
+// route:EXPR;if:COND form becomes if:COND;then:route:EXPR): AdBlock/AdGuard
 // "||example.com^", hosts files "0.0.0.0 example.com", and dnsmasq
 // "server=/a/b/..." / "ipset=/a/b/..." / "address=/a/..." lines.
 package rulefile
@@ -80,6 +81,15 @@ func Parse(text string, convert bool) Result {
 			continue
 		}
 		if match.IsRoute(line) {
+			if conv, ok := match.ConvertLegacy(raw); ok {
+				// The old route:EXPR;if:COND form: converted on import,
+				// rejected (with the new form) in typed rules.
+				if !convert {
+					r.Errors = append(r.Errors, Issue{Line: n, Text: raw, Message: "the route:...;if:... form was replaced; write it as: " + strings.ReplaceAll(conv, "\n", " ")})
+					continue
+				}
+				r.Converted++
+			}
 			if _, err := match.ParseRoute(line); err != nil {
 				r.Errors = append(r.Errors, Issue{Line: n, Text: raw, Message: err.Error()})
 				continue

@@ -22,7 +22,7 @@
 //	                     session:); the addresses are not added to the
 //	                     policy's sets. Beats include rules; drop: and !
 //	                     beat it. Options: session[ttl=10m;onlookup=1]:
-//	route:EXPR;if:EXPR   conditional sessions, see route.go
+//	if:C;then:route:E    conditional rules (then:/else:/finally:), see route.go
 //
 // Names are compared lowercase without the trailing dot. With CNAME following
 // (the default) a rule also matches when any name in the answer's CNAME chain
@@ -195,7 +195,7 @@ func Parse(raw string) (Pattern, error) {
 		return parseSession(s)
 	}
 	if IsRoute(s) {
-		return p, fmt.Errorf("route: rules are compiled with the rule list (route:...;if:...)")
+		return p, fmt.Errorf("if: and route: rules are compiled with the rule list (if:...;then:...)")
 	}
 	switch {
 	case strings.HasPrefix(s, "re:") || strings.HasPrefix(s, "/"):
@@ -439,7 +439,7 @@ type Set struct {
 	Exclude            []Pattern
 	Drop               []Pattern // drop: domain rules
 	Session            []Pattern // session: domain rules
-	Routes             []*Route  // route:...;if:... rules
+	Routes             []*Route  // if:...;then:... and route: rules
 	DropASNs           []int     // drop:asn:
 	DropCIDRs          []string  // drop:cidr:
 }
@@ -562,8 +562,9 @@ func (s *Set) MatchAny(names ...string) Result {
 	}
 	for _, n := range names {
 		for _, r := range s.Routes {
-			if r.Route.MatchName(n) {
-				return Result{Matched: true, Route: true, Name: n, Rule: r.Raw, Opts: r.Opts}
+			if r.MatchName(n) {
+				// The device's condition picks the branch (see Route.Pick).
+				return Result{Matched: true, Route: true, Name: n, Rule: r.Raw}
 			}
 		}
 	}
@@ -717,6 +718,11 @@ func (s *Set) DropSuffixes(degraded bool) []string {
 // HasDropSessions reports whether some drop: rules have options (drop
 // sessions, blocked per device).
 func (s *Set) HasDropSessions() bool {
+	for _, r := range s.Routes {
+		if r.HasDrop() {
+			return true
+		}
+	}
 	for _, p := range s.Drop {
 		if !p.Opts.IsZero() {
 			return true
@@ -782,7 +788,13 @@ func (s *Set) Bases() []string {
 	var out []string
 	pats := append(append([]Pattern(nil), s.Include...), s.Session...)
 	for _, r := range s.Routes {
-		for _, x := range []*Expr{r.Route, r.If} {
+		xs := []*Expr{r.If}
+		for _, a := range r.Branches() {
+			if a.Kind == ActRoute {
+				xs = append(xs, a.Expr)
+			}
+		}
+		for _, x := range xs {
 			if x != nil {
 				for _, a := range x.Positive() {
 					pats = append(pats, *a.Atom)

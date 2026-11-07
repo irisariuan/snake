@@ -392,8 +392,9 @@ var SYNTAX = [
   ['session:rule', 'device session: what any domain rule after session: matches is routed only for the device that looked it up, until the session TTL after its last connection; not added to the policy\'s sets. Beats include rules; drop: and ! beat it'],
   ['session[ttl=10m;onlookup=1]:rule', 'options: ttl (seconds or 90s, 10m, 1h) overrides the session TTL; onlookup=1 counts it from the lookup (lookups renew it, connections do not)'],
   ['session[share=global,share=kids,share=10.6.0.2]:rule', 'share the session with other devices (repeatable): global = every device of the policy, a device group, or a device (IP, subnet, MAC); a connection from any of them keeps it alive'],
-  ['route:EXPR;if:EXPR', 'conditional sessions: if: names are routed for everyone; a device\'s lookup of a route: name starts sessions for it only while it has a live connection to an address of the if: names. Options as for session: route[ttl=…]:'],
-  ['not:X  and:(X, Y)  or:(X, Y)  (X, Y)', 'expressions in route: and if: (nestable; (X, Y) means and:); a rule may span lines: after a line ending in ;, before one starting with ;, and inside open ( )'],
+  ['if:COND;then:ACTION;else:ACTION;finally:ACTION', 'conditional rule (else: and finally: optional): if: names are routed for everyone. While a device has a live connection to an address of the if: names, its lookups of then: names get then:\'s action, otherwise else: names get else:\'s; finally: names get finally:\'s action either way (the branch wins for a name in both)'],
+  ['route[ttl=…]:EXPR / drop[ttl=…]:EXPR', 'actions of then:/else:/finally:: route sessions through the tunnel, or drop sessions blocking the addresses, for that device (options as for session: ttl, onlookup, share). A plain route:EXPR always starts sessions'],
+  ['not:X  and:(X, Y)  or:(X, Y)  (X, Y)', 'expressions in if: and actions (nestable; (X, Y) means and:); a rule may span lines: after a line ending in ;, before one starting with ; then: else: finally:, and inside open ( )'],
   ['asn:2906', 'autonomous system (all its announced prefixes)'],
   ['cidr:23.246.0.0/18', 'address range or single IP (ip: also works)'],
   ['@name / @description / @source', 'list metadata (rule lists)'],
@@ -418,12 +419,13 @@ function hlLine(line) {
   }
   var out = esc(lead);
   if (t[0] === '!') { out += span('neg', '!'); t = t.slice(1); }
-  if (/(^|[\s(,;])(route(\[[^\]]*\])?:|if:|and:|or:|not:)/i.test(t) || /^[();,]/.test(t)) {
-    // route: rules and their continuation lines: keywords and punctuation.
+  if (/(^|[\s(,;])(route(\[[^\]]*\])?:|if:|then:|else:|finally:|and:|or:|not:)/i.test(t) || /^[();,]/.test(t)) {
+    // if:/route: rules and their continuation lines: keywords and punctuation.
     var rc = splitComment(t);
-    return out + rc[0].split(/(route(?:\[[^\]]*\])?:|if:|and:|or:|not:|[(),;])/i).map(function (part) {
+    return out + rc[0].split(/((?:route|drop)(?:\[[^\]]*\])?:|if:|then:|else:|finally:|and:|or:|not:|[(),;])/i).map(function (part) {
       if (!part) return '';
-      if (/^(route(\[[^\]]*\])?:|if:|and:|or:|not:)$/i.test(part)) return span('sess', part);
+      if (/^drop(\[[^\]]*\])?:$/i.test(part)) return span('drop', part);
+      if (/^(route(\[[^\]]*\])?:|if:|then:|else:|finally:|and:|or:|not:)$/i.test(part)) return span('sess', part);
       if (/^[(),;]$/.test(part)) return span('op', part);
       return /^\s*\//.test(part) ? span('re', part) : span('dom', part);
     }).join('') + span('com', rc[1]);

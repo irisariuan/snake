@@ -132,6 +132,11 @@ func (e *Engine) AddSessions(policy int, client string, addrs []string, source, 
 			continue // the families must match
 		}
 		k := sessionKey{policy, client, ip.String()}
+		if se, ok := s.m[k]; ok && (se.Source == SessionDrop) != (source == SessionDrop) {
+			// Route after drop (or drop after route), e.g. the other
+			// branch of an if: rule: the latest decision replaces it.
+			delete(s.m, k)
+		}
 		if se, ok := s.m[k]; ok {
 			// A lookup renews every session, onlookup or not.
 			se.Seen = now

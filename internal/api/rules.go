@@ -46,7 +46,11 @@ func (s *Server) parseRuleFile(w http.ResponseWriter, r *http.Request) {
 	kinds := map[string]int{}
 	for _, d := range res.File.Domains {
 		if match.IsRoute(d) {
-			kinds["route"]++
+			if rt, err := match.ParseRoute(d); err == nil && rt.If != nil {
+				kinds["conditional"]++
+			} else {
+				kinds["route"]++
+			}
 			continue
 		}
 		if p, err := match.Parse(d); err == nil && match.StripComment(d) != "" {

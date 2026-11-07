@@ -11,15 +11,14 @@ import (
 	"time"
 
 	"github.com/irisariuan/snake/internal/config"
-	"github.com/irisariuan/snake/internal/match"
 )
 
 // TestIntegrationExcludedDevice: with real packets, an excluded device is
 // neither routed into the tunnel nor blocked by the policy's drop: rules,
 // while another device on the same LAN is.
 // TestIntegrationRouteCondition: with real packets and the kernel's
-// connection table, route:A;if:B starts a session for a device only while
-// it has a live connection to B's address.
+// connection table, if:B;then:route:A;else:drop:A routes A for a device
+// while it has a live connection to B's address, and blocks A otherwise.
 func TestIntegrationRouteCondition(t *testing.T) {
 	if os.Getuid() != 0 || os.Getenv("SNAKE_INTEGRATION") == "" {
 		t.Skip("set SNAKE_INTEGRATION=1 and run as root inside `unshare -n`")
@@ -64,7 +63,7 @@ while True:
 	}
 	defer srv.Process.Kill()
 
-	rule := "route:**.cdn.example;if:trigger.example"
+	rule := "if:trigger.example;then:route:**.cdn.example;else:drop:**.cdn.example"
 	dir := t.TempDir()
 	c := config.Default()
 	c.Policies = []config.Policy{{Name: "p", Enabled: true, Tunnels: []string{"wgc1"}, KillSwitch: true,
@@ -89,22 +88,37 @@ while True:
 		t.Fatal(err)
 	}
 	time.Sleep(300 * time.Millisecond)
-	get := func(ns, ip string) bool {
-		return exec.Command("ip", "netns", "exec", ns, "python3", "-c",
-			`import socket; c = socket.create_connection(("`+ip+`", 80), timeout=1.5); assert c.recv(2) == b"hi"`).Run() == nil
+	// get reports "ok", "refused" (a drop session's reset) or "timeout"
+	// (swallowed by the tunnel).
+	get := func(ns, ip string) string {
+		out, _ := exec.Command("ip", "netns", "exec", ns, "python3", "-c", `
+import socket
+try:
+    c = socket.create_connection(("`+ip+`", 80), timeout=1.5); assert c.recv(2) == b"hi"; print("ok")
+except ConnectionRefusedError:
+    print("refused")
+except Exception:
+    print("timeout")`).Output()
+		return strings.TrimSpace(string(out))
 	}
 	// The DNS inspector saw trigger.example answered with .81.
 	p := e.runtime().Policies[0]
 	e.recordCond(p.ID, []string{"203.0.113.81"}, e.domainSet(p).CondHits("www.trigger.example"))
-	route := func(client string) bool {
-		ok, err := e.RouteSessions(p.ID, client, []string{"203.0.113.80"}, rule, "a.cdn.example", match.Opts{})
+	route := func(client string) string {
+		act, err := e.RouteAction(p.ID, client, []string{"203.0.113.80"}, rule, "a.cdn.example", "a.cdn.example")
 		if err != nil {
 			t.Fatal(err)
 		}
-		return ok
+		return act
 	}
-	if route("192.168.77.2") {
-		t.Fatal("condition held before any connection to the trigger")
+	if g := get("snakea", "203.0.113.80"); g != "ok" {
+		t.Fatalf("before any lookup: %s", g)
+	}
+	if a := route("192.168.77.2"); a != "drop" {
+		t.Fatalf("before any connection to the trigger: %q, want the else: drop", a)
+	}
+	if g := get("snakea", "203.0.113.80"); g != "refused" {
+		t.Errorf("drop session: device A got %s", g)
 	}
 	// Device A keeps a connection to the trigger site open.
 	hold := exec.Command("ip", "netns", "exec", "snakea", "python3", "-c",
@@ -118,16 +132,19 @@ while True:
 	for i := 0; i < 30 && !strings.Contains(out.String(), "up"); i++ {
 		time.Sleep(100 * time.Millisecond)
 	}
-	if !route("192.168.77.2") {
-		t.Fatal("condition did not hold with a live connection to the trigger")
+	if a := route("192.168.77.2"); a != "route" {
+		t.Fatalf("with a live connection to the trigger: %q", a)
 	}
-	if route("192.168.77.3") {
-		t.Error("condition held for a device without a connection to the trigger")
+	if g := get("snakea", "203.0.113.80"); g != "timeout" {
+		t.Errorf("route session replacing the drop: device A got %s, want the tunnel", g)
 	}
-	if get("snakea", "203.0.113.80") {
-		t.Error("route session did not send device A into the tunnel")
+	if g := get("snakeb", "203.0.113.80"); g != "ok" {
+		t.Errorf("device B (no lookup yet) got %s", g)
 	}
-	if !get("snakeb", "203.0.113.80") {
-		t.Error("device B was routed")
+	if a := route("192.168.77.3"); a != "drop" {
+		t.Errorf("device without a connection to the trigger: %q", a)
+	}
+	if g := get("snakeb", "203.0.113.80"); g != "refused" {
+		t.Errorf("device B's drop session: %s", g)
 	}
 }

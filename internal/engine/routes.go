@@ -13,13 +13,13 @@ import (
 	"github.com/irisariuan/snake/internal/webrtc"
 )
 
-// Conditional rules (route:EXPR;if:EXPR, see package match): the if: part's
-// names are routed like plain rules, and the addresses they resolved to
-// are remembered here per atom. When a device looks up a name the route:
-// part matches, the condition is evaluated for that device from its live
-// connections at that moment: an atom holds if the device has a live
-// connection to one of the atom's addresses. If the condition holds, the
-// answer starts sessions for the device.
+// Conditional rules (if:COND;then:ACTION;else:ACTION;finally:ACTION, see
+// package match): the if: part's names are routed like plain rules, and
+// the addresses they resolved to are remembered here per atom. When a
+// device looks up a name of a branch, the condition is evaluated for that
+// device from its live connections at that moment: an atom holds if the
+// device has a live connection to one of the atom's addresses. The branch
+// it picks starts route or drop sessions for the device.
 
 // condAddrTTL is how long an address stays attributed to an if: atom
 // after the last answer that gave it.
@@ -119,7 +119,7 @@ func readLive(r io.Reader, client string, out map[string]bool) {
 	}
 }
 
-// condHolds evaluates a route: rule's if: part for a device.
+// condHolds evaluates a rule's if: part for a device.
 func (e *Engine) condHolds(policy int, rt *match.Route, client string) bool {
 	if rt.If == nil {
 		return true
@@ -138,13 +138,15 @@ func (e *Engine) condHolds(policy int, rt *match.Route, client string) bool {
 	})
 }
 
-// RouteSessions handles a lookup matching a route: rule: if its condition
-// holds for the device, the answer starts sessions for it. It reports
-// whether it did.
-func (e *Engine) RouteSessions(policy int, client string, addrs []string, rule, name string, opts match.Opts) (bool, error) {
+// RouteAction handles a lookup matching a branch of an if: (or route:)
+// rule: the device's condition picks the branch (then: or else:, then
+// finally:), whose action starts route or drop sessions for the device.
+// matched is the name the rule matched (name, or a CNAME of it). It
+// reports the action taken (match.ActRoute, match.ActDrop or "").
+func (e *Engine) RouteAction(policy int, client string, addrs []string, rule, name, matched string) (string, error) {
 	cfg := e.runtime()
 	if cfg == nil {
-		return false, nil
+		return "", nil
 	}
 	var rt *match.Route
 	for _, p := range cfg.Policies {
@@ -152,8 +154,16 @@ func (e *Engine) RouteSessions(policy int, client string, addrs []string, rule, 
 			rt = e.domainSet(p).Route(rule)
 		}
 	}
-	if rt == nil || !e.condHolds(policy, rt, client) {
-		return false, nil
+	if rt == nil {
+		return "", nil
 	}
-	return true, e.AddSessions(policy, client, addrs, SessionRule, rule, name, opts)
+	a := rt.Pick(e.condHolds(policy, rt, client), matched, name)
+	if a == nil {
+		return "", nil
+	}
+	source := SessionRule
+	if a.Kind == match.ActDrop {
+		source = SessionDrop
+	}
+	return a.Kind, e.AddSessions(policy, client, addrs, source, rule, name, a.Opts)
 }

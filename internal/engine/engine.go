@@ -821,8 +821,8 @@ func (e *Engine) sniPolicies(cfg *config.Config, states []netfilter.PolicyState,
 			sp.Session = func(client, dst netip.Addr, rule, name string, opts match.Opts) error {
 				return e.AddSessions(id, client.Unmap().String(), []string{dst.Unmap().String()}, SessionRule, rule, name, opts)
 			}
-			sp.Route = func(client, dst netip.Addr, rule, name string, opts match.Opts) (bool, error) {
-				return e.RouteSessions(id, client.Unmap().String(), []string{dst.Unmap().String()}, rule, name, opts)
+			sp.Route = func(client, dst netip.Addr, rule, name string) (string, error) {
+				return e.RouteAction(id, client.Unmap().String(), []string{dst.Unmap().String()}, rule, name, name)
 			}
 			sp.Cond = func(dst netip.Addr, hits []match.CondHit) {
 				e.recordCond(id, []string{dst.Unmap().String()}, hits)
@@ -940,8 +940,8 @@ func (e *Engine) dnsRules(states []netfilter.PolicyState, caps Caps) []dnsinspec
 			r.Session = func(client string, addrs []string, rule, name string, opts match.Opts) error {
 				return e.AddSessions(id, client, addrs, SessionRule, rule, name, opts)
 			}
-			r.Route = func(client string, addrs []string, rule, name string, opts match.Opts) (bool, error) {
-				return e.RouteSessions(id, client, addrs, rule, name, opts)
+			r.Route = func(client string, addrs []string, rule, name, matched string) (string, error) {
+				return e.RouteAction(id, client, addrs, rule, name, matched)
 			}
 			r.Cond = func(addrs []string, hits []match.CondHit) { e.recordCond(id, addrs, hits) }
 		}

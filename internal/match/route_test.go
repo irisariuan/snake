@@ -34,8 +34,13 @@ func TestRouteRules(t *testing.T) {
 		t.Fatalf("compiled %+v", s)
 	}
 	r0 := s.Routes[0]
-	if r0.Opts.TTL != 5*time.Minute || !r0.Opts.OnLookup || !strings.HasPrefix(r0.Raw, "route[ttl=5m;onlookup=1]:or:(") {
-		t.Fatalf("route options %+v %q", r0.Opts, r0.Raw)
+	// The old route:...;if:... form is read as if:...;then:route:....
+	if o := r0.Then.Opts; o.TTL != 5*time.Minute || !o.OnLookup || r0.Then.Kind != ActRoute ||
+		r0.Raw != "if:or:(disneyplus.com, and:(hulu.com, not:=help.hulu.com));\nthen:route[ttl=5m;onlookup=1]:or:(**.akamaized.net,/^ipv4-c\\d+\\.oca\\.example$/)" {
+		t.Fatalf("route options %+v %q", o, r0.Raw)
+	}
+	if r1 := s.Routes[1]; r1.Raw != "if:=trigger.example;then:route:(or:(a.example, b.example), not:=bad.a.example, and:(not:~ads, ~cdn))" {
+		t.Fatalf("converted %q", r1.Raw)
 	}
 	if s.Session[0].Opts.TTL != 90*time.Second || s.Session[0].Raw != "session[ttl=90s]:x.example" {
 		t.Fatalf("session options %+v %q", s.Session[0].Opts, s.Session[0].Raw)
@@ -108,7 +113,7 @@ func TestRouteErrors(t *testing.T) {
 	for want, rule := range map[string]string{
 		"expected , or )":   "route:or:(a.com, b.com;if:c.com",
 		"needs ( ... )":     "route:or:a.com",
-		"expected if:":      "route:a.com;c.com",
+		"unexpected":        "route:a.com;c.com",
 		"only domain rules": "route:drop:a.com",
 		"not negated":       "route:a.com;if:not:b.com",
 		"unknown option":    "route[foo=1]:a.com",
@@ -145,7 +150,7 @@ func TestShareOption(t *testing.T) {
 		t.Fatalf("raw %q", p.Raw)
 	}
 	r, err := ParseRoute("route[share=global]:a.example;if:b.example")
-	if err != nil || len(r.Opts.Share) != 1 || r.Opts.Share[0] != ShareGlobal {
+	if err != nil || len(r.Then.Opts.Share) != 1 || r.Then.Opts.Share[0] != ShareGlobal {
 		t.Fatalf("route share %+v %v", r, err)
 	}
 	if _, err := Parse("session[share=bad/name]:x.example"); err == nil {
@@ -178,5 +183,87 @@ func TestDropSessionRules(t *testing.T) {
 		if _, err := Parse(bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
+	}
+}
+
+func TestIfThenElse(t *testing.T) {
+	lines := []string{
+		"if:netflix.com;",
+		"then:route[ttl=10m]:or:(**.akamaized.net, **.nflxvideo.net);",
+		"else:drop:**.nflxvideo.net;",
+		"finally:route:=help.netflix.com",
+		"if:a.example",
+		"then:drop[share=kids]:b.example",
+		"finally:route:(c.example, not:=x.c.example)",
+		"plain.example",
+	}
+	g := Group(lines)
+	if len(g) != 3 || g[1].First != 4 {
+		t.Fatalf("grouping %+v", g)
+	}
+	s, errs := Compile(lines)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	r := s.Routes[0]
+	if r.Then.Kind != ActRoute || r.Then.Opts.TTL != 10*time.Minute || r.Else.Kind != ActDrop || r.Finally.Kind != ActRoute {
+		t.Fatalf("branches %+v %+v %+v", r.Then, r.Else, r.Finally)
+	}
+	if !s.HasDropSessions() || !s.HasConds() {
+		t.Fatal("drop branch / condition")
+	}
+	kind := func(a *Action) string {
+		if a == nil {
+			return "-"
+		}
+		return a.Kind
+	}
+	for _, c := range []struct {
+		name string
+		cond bool
+		want string
+	}{
+		{"e1.akamaized.net", true, "route"},
+		{"e1.akamaized.net", false, "-"},
+		{"x.nflxvideo.net", true, "route"},
+		{"x.nflxvideo.net", false, "drop"},
+		{"help.netflix.com", true, "route"}, // finally: either way
+		{"help.netflix.com", false, "route"},
+	} {
+		if got := kind(r.Pick(c.cond, c.name)); got != c.want {
+			t.Errorf("%s cond=%v: %s, want %s", c.name, c.cond, got, c.want)
+		}
+	}
+	// Names in the condition are routed for everyone; branch names go to the
+	// engine.
+	if m := s.MatchAny("www.netflix.com"); len(m.Cond) == 0 {
+		t.Errorf("netflix.com: %+v", m)
+	}
+	if m := s.MatchAny("x.nflxvideo.net"); !m.Route || m.Rule != r.Raw {
+		t.Errorf("nflxvideo: %+v", m)
+	}
+	r2 := s.Routes[1]
+	if r2.Else != nil || kind(r2.Pick(false, "b.example")) != "-" || kind(r2.Pick(true, "b.example")) != "drop" ||
+		kind(r2.Pick(false, "c.example")) != "route" || r2.Pick(true, "x.c.example") != nil {
+		t.Fatalf("second rule %+v", r2)
+	}
+	if b := strings.Join(s.Bases(), ","); strings.Contains(b, "b.example") || !strings.Contains(b, "c.example") {
+		t.Errorf("bases %s (drop branches need no tunnel DNS)", b)
+	}
+	for want, rule := range map[string]string{
+		"expected ;then:":       "if:a.com",
+		"needs an action":       "if:a.com;then:b.com",
+		"order if:":             "if:a.com;then:route:b.com;finally:route:c.com;else:drop:d.com",
+		"only domain rules":     "if:a.com;then:route:drop:b.com",
+		"not negated":           "if:not:a.com;then:route:b.com",
+		"unknown option":        "if:a.com;then:drop[x=1]:b.com",
+		"expected ;then:ACTION": "if:a.com;else:route:b.com",
+	} {
+		if _, err := ParseRoute(rule); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: want %q, got %v", rule, want, err)
+		}
+	}
+	if !IsLegacyRoute("route:a.com;if:b.com") || IsLegacyRoute("route:a.com") || IsLegacyRoute("if:b.com;then:route:a.com") {
+		t.Error("IsLegacyRoute")
 	}
 }

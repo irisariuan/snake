@@ -419,3 +419,25 @@ func TestECHModes(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// Saved rules in the old route:EXPR;if:COND form are rewritten on load.
+func TestLegacyRouteConverted(t *testing.T) {
+	c := Default()
+	c.Policies = []Policy{{Name: "p", Enabled: true, Tunnels: []string{"wgc1"},
+		Domains: []string{"route[ttl=5m]:**.akamaized.net;", "if:netflix.com", "plain.example"}}}
+	c.RuleLists = []RuleList{{Name: "L", Domains: []string{"route:a.example;if:b.example"}}}
+	c.ApplyDefaults()
+	c.Normalize()
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if d := c.Policies[0].Domains; len(d) != 2 || d[0] != "if:netflix.com;\nthen:route[ttl=5m]:**.akamaized.net" {
+		t.Fatalf("policy rules %q", d)
+	}
+	if d := c.RuleLists[0].Domains; len(d) != 1 || d[0] != "if:b.example;then:route:a.example" {
+		t.Fatalf("list rules %q", d)
+	}
+	if !c.Policies[0].HasSessions() {
+		t.Error("conditional rules start sessions")
+	}
+}

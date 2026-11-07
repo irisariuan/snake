@@ -11,7 +11,7 @@ import (
 // Command options: CMD[SETTING=VALUE;SETTING=VALUE;...]:rule
 //
 //	session[ttl=TIME;onlookup=0|1]:rule
-//	route[ttl=TIME;onlookup=0|1]:EXPR;if:EXPR
+//	if:COND;then:route[ttl=TIME]:EXPR;else:drop[ttl=TIME]:EXPR
 //
 // ttl overrides the session TTL (seconds, or 90s, 10m, 1h). onlookup=1
 // counts it from the lookup that started the session (a new lookup renews

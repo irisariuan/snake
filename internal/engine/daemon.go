@@ -483,10 +483,12 @@ func (e *Engine) TestDomain(name string) DomainTest {
 			res.Notes = append(res.Notes, "this match needs the DNS inspector, which is not running (kernel without NFQUEUE?)")
 		}
 		if mr.Route {
-			res.Notes = append(res.Notes, "route: rule: a device's lookup of this name starts sessions for it only while its if: condition holds for that device (a live connection to an address of the if: names); the addresses are not added to the policy's sets")
+			if rt := e.domainSet(p).Route(mr.Rule); rt != nil {
+				res.Notes = append(res.Notes, routeNotes(rt, mr.Name, e.sessionTTL())...)
+			}
 		}
 		if len(mr.Cond) > 0 {
-			res.Notes = append(res.Notes, "matches the if: part of a route: rule: routed for every device, and connections to these addresses make that rule's condition hold for the device")
+			res.Notes = append(res.Notes, "matches the if: part of a conditional rule: routed for every device, and connections to these addresses make that rule's condition hold for the device")
 		}
 		if mr.Session || mr.Route {
 			ttl := e.sessionTTL()
@@ -747,4 +749,38 @@ func (e *Engine) LeakChecks() []LeakCheck {
 		out = append(out, lc)
 	}
 	return out
+}
+
+// routeNotes explains what a conditional rule does with a name.
+func routeNotes(rt *match.Route, name string, defTTL time.Duration) []string {
+	what := func(a *match.Action) string {
+		if a == nil {
+			return "nothing (not routed by this policy)"
+		}
+		ttl := defTTL
+		if a.Opts.TTL > 0 {
+			ttl = a.Opts.TTL
+		}
+		verb := "routed through the tunnel"
+		if a.Kind == match.ActDrop {
+			verb = "blocked"
+		}
+		s := fmt.Sprintf("%s for that device (a %s session, %s", verb, a.Kind, match.FormatTTL(ttl))
+		if a.Opts.OnLookup {
+			s += " from the lookup"
+		} else {
+			s += " after its last connection"
+		}
+		if len(a.Opts.Share) > 0 {
+			s += "; shared with " + strings.Join(a.Opts.Share, ", ")
+		}
+		return s + ")"
+	}
+	if rt.If == nil {
+		return []string{"route: rule: a device's lookup of this name makes its addresses " + what(rt.Pick(true, name)) + "; they are not added to the policy's sets"}
+	}
+	return []string{
+		"conditional rule: when a device has a live connection to an address of the if: names, its lookup of this name makes the addresses " + what(rt.Pick(true, name)),
+		"otherwise: " + what(rt.Pick(false, name)) + "; the addresses are not added to the policy's sets",
+	}
 }

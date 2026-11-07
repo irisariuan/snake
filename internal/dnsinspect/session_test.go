@@ -52,15 +52,15 @@ func TestSessionAnswer(t *testing.T) {
 func TestRouteAnswer(t *testing.T) {
 	rec := &system.Recorder{}
 	var conds, routes []string
-	allow := false
+	act := ""
 	i := &Inspector{IPSet: netfilter.IPSet{R: rec}, CacheTTL: time.Hour}
-	i.SetRules([]Rules{{ID: 1, Name: "p", Set: match.MustCompile([]string{"route:**.akamaized.net;if:and:(netflix.com, not:=help.netflix.com)"}), FollowCNAME: true, Set4: "SNK_1_d4",
+	i.SetRules([]Rules{{ID: 1, Name: "p", Set: match.MustCompile([]string{"if:and:(netflix.com, not:=help.netflix.com);then:route:**.akamaized.net"}), FollowCNAME: true, Set4: "SNK_1_d4",
 		Cond: func(addrs []string, hits []match.CondHit) {
 			conds = append(conds, fmt.Sprintf("%s %d", strings.Join(addrs, ","), hits[0].Atom))
 		},
-		Route: func(client string, addrs []string, rule, name string, _ match.Opts) (bool, error) {
-			routes = append(routes, client+" "+strings.Join(addrs, ",")+" "+name)
-			return allow, nil
+		Route: func(client string, addrs []string, rule, name, matched string) (string, error) {
+			routes = append(routes, client+" "+strings.Join(addrs, ",")+" "+name+" "+matched)
+			return act, nil
 		}}})
 	// if: name: recorded and routed like a plain rule.
 	if w := i.handle(answerPacket("www.netflix.com", net.IPv4(198, 51, 100, 10))); w != nil {
@@ -83,8 +83,17 @@ func TestRouteAnswer(t *testing.T) {
 		t.Fatal("route answer released before the condition was checked")
 	}
 	w()
-	if len(routes) != 1 || routes[0] != "192.168.50.10 203.0.113.80 e1.akamaized.net" || i.Stats().Added != added {
+	if len(routes) != 1 || routes[0] != "192.168.50.10 203.0.113.80 e1.akamaized.net e1.akamaized.net" || i.Stats().Added != added {
 		t.Fatalf("route %q, added %d -> %d", routes, added, i.Stats().Added)
+	}
+	// The branch's action is counted.
+	dropped := i.Stats().Dropped
+	act = match.ActDrop
+	if w := i.handle(answerPacket("e2.akamaized.net", net.IPv4(203, 0, 113, 81))); w != nil {
+		w()
+	}
+	if i.Stats().Dropped != dropped+1 || i.Stats().Added != added {
+		t.Fatalf("drop branch: stats %+v", i.Stats())
 	}
 }
 

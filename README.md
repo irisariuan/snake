@@ -229,7 +229,7 @@ One rule per line:
 | `session:**.akamaized.net` | **device session**: any domain rule after `session:`; its answers are routed only for the device that looked the name up ([below](#device-sessions)) |
 | `session[ttl=10m;onlookup=1]:x.example` | session with [options](#session-options) |
 | `drop[share=kids]:ads.example.com` | **drop session**: blocked only for the device that looked the name up, plus the `share=` devices ([options](#session-options)) |
-| `route:**.akamaized.net;if:netflix.com` | **conditional sessions** ([below](#conditional-rules-route-if)) |
+| `if:netflix.com;then:route:**.akamaized.net;else:drop:**.akamaized.net` | **conditional rule**: route or drop sessions per device ([below](#conditional-rules-if-then-else-finally)) |
 | `com` | rejected: a bare top-level domain would route everything (`**.com` if you really mean it) |
 | `# comment` | ignored; a trailing ` # comment` is allowed too (except in regexes) |
 
@@ -596,22 +596,34 @@ route[ttl=30m]:**.akamaized.net;if:netflix.com
 route[share=living-room,share=10.6.0.2]:**.nflxvideo.net;if:netflix.com
 ```
 
-### Conditional rules (`route:`, `if:`)
+### Conditional rules (`if:`, `then:`, `else:`, `finally:`)
 
 ```
-route:EXPR;if:EXPR
+if:COND;then:ACTION;else:ACTION;finally:ACTION
 ```
 
-* Names matching the **`if:`** part are routed like plain rules, for every
-  device, and snake remembers which addresses they resolved to.
-* When a device looks up a name the **`route:`** part matches, the
-  condition is evaluated **for that device, at that moment**: an `if:` name
-  counts when the device has a **live connection** to one of its addresses
-  (from the kernel's connection table). If the condition holds, the answer
-  starts [sessions](#device-sessions) for that device; otherwise this rule
-  does not route it.
-* Without `;if:...`, `route:` always starts sessions: `session:` with
-  expressions.
+`else:` and `finally:` are optional. Each **ACTION** is `route[options]:EXPR`
+(the names' answers start [sessions](#device-sessions) through the tunnel
+for the device) or `drop[options]:EXPR` (they start [drop
+sessions](#session-options): blocked for that device). Options are those of
+`session[...]`: `ttl`, `onlookup`, `share`.
+
+* Names matching the **`if:`** condition are routed like plain rules, for
+  every device, and snake remembers which addresses they resolved to.
+* When a device looks up a name of a branch, the condition is evaluated
+  **for that device, at that moment**: an `if:` name counts when the device
+  has a **live connection** to one of its addresses (from the kernel's
+  connection table).
+  * Condition holds: `then:` names get `then:`'s action.
+  * Condition does not hold: `else:` names get `else:`'s action.
+  * Either way, `finally:` names get `finally:`'s action, checked after the
+    branch: a name in both uses the branch.
+  * A name no applicable part has is not routed by this rule.
+* The latest decision for a device and address wins: a route session
+  replaces a drop session for the same address and vice versa (e.g. when the
+  device opens the `if:` site after a blocked lookup).
+* A plain `route[options]:EXPR` (no `if:`) always starts sessions: `session:`
+  with expressions.
 
 Expressions combine domain rules (`example.com`, `.sub`, `=exact`, globs,
 `~keyword`, `/regex/`) with modifiers, nested freely:
@@ -623,28 +635,39 @@ Expressions combine domain rules (`example.com`, `.sub`, `=exact`, globs,
 | `or:(X, Y, ...)` | any holds |
 | `(X, Y, ...)` | same as `and:` (`(X)` just groups) |
 
-In `route:` an expression tests the looked-up name; in `if:` each domain
+In an action an expression tests the looked-up name; in `if:` each domain
 rule stands for "the device has a live connection to an address of a name it
 matches". Only the non-negated `if:` rules are routed; negated ones are
 still watched. A rule may span lines: it continues after a line ending in
-`;`, before a line starting with `;`, and while parentheses are open.
+`;`, before a line starting with `;`, `then:`, `else:` or `finally:`, and
+while parentheses are open.
 
 ```
-# Akamai and Netflix video addresses, per device, while it is on Disney+ or Hulu
-route[ttl=5m]:(or:(**.akamaized.net, **.nflxvideo.net), not:=ads.akamaized.net,
-  and:(not:~ads, ~cdn));
+# Netflix video through the tunnel while the device is on netflix.com,
+# blocked otherwise; the help site is routed either way.
+if:netflix.com;
+then:route[ttl=10m]:or:(**.akamaized.net, **.nflxvideo.net);
+else:drop:**.nflxvideo.net;
+finally:route:=help.netflix.com
+
+# Akamai addresses, per device, while it is on Disney+ or Hulu
 if:or:(disneyplus.com, and:(hulu.com, not:=help.hulu.com))
+then:route[ttl=5m]:(**.akamaized.net, not:=ads.akamaized.net, and:(not:~ads, ~cdn))
 ```
 
 * Precedence within a policy: `!` exclusions, `drop:`, `session:`, `if:`
-  names, `route:` names, then plain rules.
-* The condition is checked when the `route:` name is looked up. If a page
+  names, branch names, then plain rules.
+* The condition is checked when the branch name is looked up. If a page
   looks it up at the same moment as the `if:` site, before any connection
-  to that site exists, that lookup is not routed; the next one after the
-  connection opened is.
+  to that site exists, that lookup gets the `else:` branch; the next one
+  after the connection opened gets `then:`.
 * Addresses count for an `if:` rule for 24 h after the last answer that gave
   them. Conditional rules need the DNS inspector; the SNI proxy applies them
   to connections by server name too.
+* **Older form.** `route[options]:EXPR;if:COND` was replaced. Saved
+  configurations and imported rule files are rewritten on load to
+  `if:COND;then:route[options]:EXPR` (same behaviour); typing the old form in
+  a new rule is rejected with the new form in the message.
 
 ## WebRTC
 

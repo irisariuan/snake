@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,6 +22,7 @@ import (
 	"github.com/irisariuan/snake/internal/engine"
 	"github.com/irisariuan/snake/internal/importdvr"
 	"github.com/irisariuan/snake/internal/logx"
+	"github.com/irisariuan/snake/internal/match"
 	"github.com/irisariuan/snake/internal/update"
 	"github.com/irisariuan/snake/internal/webui"
 )
@@ -225,6 +227,12 @@ func (s *Server) putConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
+	// Saved configurations are converted on load; new rules must use the
+	// new form.
+	if err := legacyRoutes(&c); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
 	if err := s.E.SetConfig(&c); err != nil {
 		writeErr(w, 400, err)
 		return
@@ -313,5 +321,29 @@ func (s *Server) Serve(ctx context.Context, socket, lanIP string, port int) erro
 		_ = srv.Shutdown(sctx)
 	}
 	_ = os.Remove(socket)
+	return nil
+}
+
+// legacyRoutes rejects rules in the old route:EXPR;if:COND form, naming
+// the new one.
+func legacyRoutes(c *config.Config) error {
+	check := func(where string, rules []string) error {
+		for _, r := range match.Lines(rules) {
+			if conv, ok := match.ConvertLegacy(r); ok {
+				return fmt.Errorf("%s: rule %q: the route:...;if:... form was replaced; write it as: %s", where, r, strings.ReplaceAll(conv, "\n", " "))
+			}
+		}
+		return nil
+	}
+	for _, p := range c.Policies {
+		if err := check("policy "+p.Name, p.Domains); err != nil {
+			return err
+		}
+	}
+	for _, l := range c.RuleLists {
+		if err := check("list "+l.Name, l.Domains); err != nil {
+			return err
+		}
+	}
 	return nil
 }

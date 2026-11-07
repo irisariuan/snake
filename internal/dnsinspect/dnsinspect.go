@@ -40,10 +40,12 @@ type Rules struct {
 	// addresses are routed for the device that asked only, not added to
 	// the sets. nil: session: rules are treated as plain rules.
 	Session func(client string, addrs []string, rule, name string, opts match.Opts) error
-	// Route handles answers matching a route: rule's expression: sessions
-	// for the device if the rule's if: condition holds for it (reported).
-	// nil: route: rules are not routed.
-	Route func(client string, addrs []string, rule, name string, opts match.Opts) (bool, error)
+	// Route handles answers matching a branch of an if: (or route:) rule:
+	// the device's condition picks the branch, whose action starts route
+	// or drop sessions for it. It reports the action taken (match.ActRoute,
+	// match.ActDrop or ""). matched is the name the rule matched (the
+	// question or a CNAME). nil: such rules are not routed.
+	Route func(client string, addrs []string, rule, name, matched string) (string, error)
 	// Cond receives the addresses of answers matching if: atoms (which are
 	// routed like plain rules too).
 	Cond func(addrs []string, hits []match.CondHit)
@@ -405,8 +407,8 @@ func (i *Inspector) handle(raw []byte) func() {
 		return nil
 	}
 	if res.Route {
-		// Sessions for the asking device if its condition holds; never the
-		// sets.
+		// Route or drop sessions for the asking device, by its condition;
+		// never the sets.
 		if r.Route == nil || pk.Dst.IsLoopback() {
 			return nil
 		}
@@ -416,14 +418,18 @@ func (i *Inspector) handle(raw []byte) func() {
 			addrs = append(addrs, ip.String())
 		}
 		return func() {
-			ok, err := r.Route(client, addrs, res.Rule, ans.Question, res.Opts)
+			act, err := r.Route(client, addrs, res.Rule, ans.Question, res.Name)
 			if err != nil {
 				atomic.AddUint64(&i.stats.Errors, 1)
-				logx.Warnf("dns inspector: route: %v", err)
+				logx.Warnf("dns inspector: conditional rule: %v", err)
 			}
-			if ok {
+			switch act {
+			case match.ActRoute:
 				atomic.AddUint64(&i.stats.Matched, 1)
 				atomic.AddUint64(&i.stats.Sessions, 1)
+			case match.ActDrop:
+				atomic.AddUint64(&i.stats.Matched, 1)
+				atomic.AddUint64(&i.stats.Dropped, 1)
 			}
 		}
 	}
