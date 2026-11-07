@@ -13,6 +13,7 @@
 @import "tailwindcss/utilities.css" layer(utilities) important prefix(tw);
 
 @source "../scripts";
+@source "../components";
 
 @theme {
   /* Fixed pixel spacing: the router page's root font size is not ours. */
@@ -141,3 +142,39 @@
 #snake .t-op { @apply tw:font-bold; color: #89ddff; }
 #snake .t-wild { @apply tw:font-bold; color: #ff9cac; }
 #snake .t-dom { @apply tw:text-fg; }
+
+/* ---- React components (src/components) ---- */
+#snake button.btn-sm { @apply tw:px-2 tw:py-0.5; font-size: 12px; }
+#snake .picker { @apply tw:my-1; }
+#snake .picker-summary { @apply tw:mt-0 tw:mb-2 tw:px-2 tw:py-1.5 tw:rounded tw:bg-panel2 tw:border-l-2 tw:border-accent; font-size: 12px; }
+#snake .clear-x { @apply tw:absolute tw:right-1 tw:bg-transparent tw:border-0 tw:text-muted tw:cursor-pointer tw:px-1; font-size: 15px; line-height: 1; }
+#snake .clear-x:hover { @apply tw:text-fg; }
+/* filter chips */
+#snake .chip { @apply tw:bg-transparent tw:border tw:border-line tw:rounded-full tw:text-muted tw:px-2.5 tw:py-0.5 tw:cursor-pointer tw:inline-flex tw:items-center tw:gap-1.5; font: inherit; font-size: 12px; }
+#snake .chip:hover { @apply tw:border-accent; }
+#snake .chip.on { @apply tw:text-fg tw:border-accent tw:bg-panel2; }
+#snake .chip-n { @apply tw:bg-field tw:rounded-full tw:px-1.5; font-size: 11px; }
+/* lists of choices */
+#snake .pick-list { @apply tw:max-h-[300px] tw:overflow-y-auto tw:border tw:border-line tw:rounded tw:bg-field tw:mt-1.5; }
+#snake .pick-row { @apply tw:flex tw:items-center tw:gap-2 tw:px-2 tw:py-1.5 tw:border-b tw:border-line tw:cursor-default; }
+#snake .pick-row:last-child { @apply tw:border-b-0; }
+#snake label.pick-row { @apply tw:cursor-pointer; }
+#snake .pick-row.st-include { box-shadow: inset 3px 0 0 var(--tw-color-ok); }
+#snake .pick-row.st-exclude { box-shadow: inset 3px 0 0 var(--tw-color-bad); }
+#snake .kind { @apply tw:rounded tw:px-1.5 tw:text-muted tw:bg-panel2 tw:whitespace-nowrap; font-size: 10px; }
+#snake .kind-group { color: #cfe7ff; background: #1c4466; }
+#snake .kind-vpn { color: #e4d2ff; background: #3f2a63; }
+/* include / - / exclude switch */
+#snake .seg { @apply tw:inline-flex tw:border tw:border-line tw:rounded tw:overflow-hidden tw:shrink-0; }
+#snake .seg-b { @apply tw:bg-panel tw:text-muted tw:border-0 tw:border-r tw:border-line tw:px-2 tw:py-0.5 tw:cursor-pointer; font: inherit; font-size: 11px; }
+#snake .seg-b:last-child { @apply tw:border-r-0; }
+#snake .seg-b:hover { @apply tw:text-fg; }
+#snake .seg-b:focus-visible { outline: 2px solid var(--tw-color-accent); outline-offset: -2px; }
+#snake .seg-include.on { @apply tw:text-white; background: #1f5a3a; }
+#snake .seg-none.on { @apply tw:text-fg tw:bg-panel2; }
+#snake .seg-exclude.on { @apply tw:text-white; background: #6d2323; }
+/* tunnel failover order */
+#snake .tun-order { @apply tw:list-none tw:p-0 tw:my-1; }
+#snake .tun-row { @apply tw:py-1.5 tw:border-b tw:border-line; }
+#snake .tun-role { @apply tw:text-muted tw:w-[58px] tw:shrink-0; font-size: 11px; }
+#snake .tun-role.primary { @apply tw:text-accent tw:font-bold; }

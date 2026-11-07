@@ -16,7 +16,7 @@ WEB_DEPS := web/node_modules/.package-lock.json
 web: $(WEB_OUT)
 
 $(WEB_OUT): $(WEB_SRC) $(WEB_DEPS)
-	cd web && npm run build
+	cd web && ASTRO_TELEMETRY_DISABLED=1 npm run build
 
 # npm ci only when the lockfile changed.
 $(WEB_DEPS): web/package-lock.json
@@ -33,6 +33,7 @@ armv7: web
 	GOARCH=arm GOARM=7 $(BUILD) -o dist/snake-armv7 ./cmd/snake
 
 test: web
+	cd web && npm test
 	go vet ./...
 	SNAKE_REQUIRE_UI=1 go test ./...
 

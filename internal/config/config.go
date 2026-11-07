@@ -148,6 +148,10 @@ type Policy struct {
 	ASNs            []int    `json:"asns"`
 	CIDRs           []string `json:"cidrs"`
 	Devices         []string `json:"devices"` // MAC addresses or "group:<name>"
+	// ExcludeDevices are never handled by this policy: not routed, not
+	// blocked by its drop: rules, not under its leak protection. With no
+	// Devices the policy covers every device but these.
+	ExcludeDevices []string `json:"exclude_devices"`
 	Lists           []string `json:"lists"`   // names of rule lists merged into this policy
 	Leak            Leak     `json:"leak"`
 }
@@ -399,7 +403,7 @@ func (c *Config) DoHBlockedLANWide() bool {
 		return false
 	}
 	for _, p := range c.Policies {
-		if p.Enabled && p.Leak.BlockDoH && len(c.ResolveDevices(p)) == 0 {
+		if p.Enabled && p.Leak.BlockDoH && len(c.ResolveDevices(p)) == 0 && len(p.ExcludeDevices) == 0 {
 			return true
 		}
 	}
@@ -735,16 +739,8 @@ func (c *Config) Normalize() {
 		p.Name = strings.TrimSpace(p.Name)
 		p.Domains = dedupKeepComments(mapStr(p.Domains, normalizeRule))
 		p.CIDRs = dedup(mapStr(p.CIDRs, strings.TrimSpace))
-		p.Devices = dedup(mapStr(p.Devices, func(s string) string {
-			s = strings.TrimSpace(s)
-			if strings.HasPrefix(s, "group:") {
-				return s
-			}
-			if m, err := NormalizeClient(s); err == nil {
-				return m
-			}
-			return s
-		}))
+		p.Devices = dedup(mapStr(p.Devices, normalizeDevice))
+		p.ExcludeDevices = dedup(mapStr(p.ExcludeDevices, normalizeDevice))
 		p.Tunnels = dedup(mapStr(p.Tunnels, func(s string) string { return strings.ToLower(strings.TrimSpace(s)) }))
 		p.ExpectedCountry = strings.ToUpper(strings.TrimSpace(p.ExpectedCountry))
 		sort.Ints(p.ASNs)
@@ -806,6 +802,17 @@ func (c *Config) Normalize() {
 			c.Devices[i].MAC = m
 		}
 	}
+}
+
+func normalizeDevice(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "group:") {
+		return s
+	}
+	if m, err := NormalizeClient(s); err == nil {
+		return m
+	}
+	return s
 }
 
 func countID(ps []Policy, id int) int {
@@ -966,13 +973,22 @@ func (c *Config) Validate() error {
 				add(pre+"invalid CIDR %q", cidr)
 			}
 		}
+		inc := map[string]bool{}
 		for _, d := range p.Devices {
+			inc[d] = true
+		}
+		for _, d := range append(append([]string(nil), p.Devices...), p.ExcludeDevices...) {
 			if strings.HasPrefix(d, "group:") {
 				if !groups[strings.TrimPrefix(d, "group:")] {
 					add(pre+"unknown group %q", d)
 				}
 			} else if _, err := NormalizeClient(d); err != nil {
 				add(pre+"%v", err)
+			}
+		}
+		for _, d := range p.ExcludeDevices {
+			if inc[d] {
+				add(pre+"%s is both included and excluded", d)
 			}
 		}
 		if ep := c.Expand(p); !ep.HasDomains() && !ep.HasDrops() && len(ep.ASNs)+len(ep.CIDRs)+len(p.Devices) == 0 {
@@ -1022,9 +1038,14 @@ func compileErrs(rules []string) []match.LineError {
 
 // ResolveDevices expands groups into device entries: MAC addresses, IP
 // addresses and subnets.
-func (c *Config) ResolveDevices(p Policy) []string {
+func (c *Config) ResolveDevices(p Policy) []string { return c.resolve(p.Devices) }
+
+// ResolveExcluded expands the policy's excluded devices.
+func (c *Config) ResolveExcluded(p Policy) []string { return c.resolve(p.ExcludeDevices) }
+
+func (c *Config) resolve(devices []string) []string {
 	var out []string
-	for _, d := range p.Devices {
+	for _, d := range devices {
 		if strings.HasPrefix(d, "group:") {
 			name := strings.TrimPrefix(d, "group:")
 			for _, g := range c.Groups {
@@ -1083,6 +1104,9 @@ func (p Policy) HasDestinations() bool {
 
 // Scope describes the policy match mode for display.
 func (p Policy) Scope() string {
+	if len(p.ExcludeDevices) > 0 && len(p.Devices) == 0 && p.HasDestinations() {
+		return "destinations, some devices excluded"
+	}
 	switch {
 	case len(p.Devices) > 0 && p.HasDestinations():
 		return "devices+destinations"

@@ -3,6 +3,11 @@
  * page (token from custom_settings) or standalone on the API port.
  * Styling: component classes from src/styles/global.css plus Tailwind
  * utilities, prefixed tw: so they never match the router page's classes. */
+import { mount, mountState, unmountAll } from './react-bridge.js';
+import DeviceSelector from '../components/DeviceSelector.jsx';
+import TunnelPicker from '../components/TunnelPicker.jsx';
+import ChecklistPicker from '../components/ChecklistPicker.jsx';
+
 var CTX = window.SNAKE_CTX || {};
 var TUNNELS = ['wgc1', 'wgc2', 'wgc3', 'wgc4', 'wgc5', 'ovpnc1', 'ovpnc2', 'ovpnc3', 'ovpnc4', 'ovpnc5'];
 var MAX_WG = 20, MAX_OVPN = 20; // snake's saved tunnels: wgx1-20, ovx1-20
@@ -94,7 +99,7 @@ function fixCfg(c) {
   c.wireguard = c.wireguard || []; c.openvpn = c.openvpn || [];
   c.rule_lists.forEach(function (l) { ['domains', 'asns', 'cidrs'].forEach(function (k) { l[k] = l[k] || []; }); });
   c.policies.forEach(function (p) {
-    ['tunnels', 'domains', 'asns', 'cidrs', 'devices', 'lists'].forEach(function (k) { p[k] = p[k] || []; });
+    ['tunnels', 'domains', 'asns', 'cidrs', 'devices', 'exclude_devices', 'lists'].forEach(function (k) { p[k] = p[k] || []; });
     p.leak = p.leak || {};
   });
   c.groups.forEach(function (g) { g.macs = g.macs || []; });
@@ -133,6 +138,7 @@ var TABS = [['status', 'Status'], ['policies', 'Policies'], ['tunnels', 'Tunnels
 var bannerBox;
 function render() {
   var scrollY = window.scrollY;
+  unmountAll();
   root.innerHTML = '';
   var off = state.status && state.status.disabled;
   root.appendChild(el('div', { class: 'row tw:justify-between tw:mb-2.5' },
@@ -630,7 +636,7 @@ function stripMeta(text) { return text.split('\n').filter(function (l) { return 
 
 // ---------- policies ----------
 function defaultPolicy() {
-  return { id: 0, name: '', enabled: true, tunnels: [], kill_switch: true, expected_country: '', domains: [], lists: [], ignore_cname: false, asns: [], cidrs: [], devices: [],
+  return { id: 0, name: '', enabled: true, tunnels: [], kill_switch: true, expected_country: '', domains: [], lists: [], ignore_cname: false, asns: [], cidrs: [], devices: [], exclude_devices: [],
     leak: { dns_via_tunnel: true, dns_server: '9.9.9.9', dns_protocol: 'udp', hijack_dns: true, block_dot: true, block_doh: true, block_quic: false, sniff_sni: false, refuse_ech: false, ipv6: 'tunnel', webrtc: 'track' } };
 }
 function viewPolicies(b) {
@@ -649,6 +655,7 @@ function viewPolicies(b) {
       if (p.asns.length) m.push(p.asns.length + ' ASNs');
       if (p.cidrs.length) m.push(p.cidrs.length + ' CIDRs');
       if (p.devices.length) m.push(p.devices.length + ' devices/groups');
+      if (p.exclude_devices.length) m.push(p.exclude_devices.length + ' excluded');
       if (p.lists.length) m.push('lists: ' + p.lists.join(', '));
       var prot = [];
       if (p.kill_switch) prot.push('kill');
@@ -683,29 +690,31 @@ function chk(obj, key, label, help) {
 function viewEditor(b) {
   var ed = state.edit, p = ed.p;
   b.appendChild(el('h3', null, ed.idx < 0 ? 'New policy' : 'Edit policy ' + p.name));
-  var tunBox = el('ul', { class: 'tun-list' });
-  function drawTunnels() {
-    tunBox.innerHTML = '';
-    p.tunnels.forEach(function (t, i) {
-      var h = state.status && state.status.tunnels[t];
-      tunBox.appendChild(el('li', null, el('b', null, (i + 1) + '. ' + tunLabel(t)), h ? tunnelBadge(h) : badge('not monitored yet'),
-        btn('↑', function () { if (i > 0) { p.tunnels.splice(i - 1, 0, p.tunnels.splice(i, 1)[0]); drawTunnels(); } }),
-        btn('✕', function () { p.tunnels.splice(i, 1); drawTunnels(); })));
-    });
-    if (!p.tunnels.length) tunBox.appendChild(el('li', { class: 'muted' }, 'Add at least one tunnel. Extra tunnels are failover backups, in order.'));
-  }
-  drawTunnels();
-  var tunSel = el('select', null, allTunnels().map(function (t) { var w = snakeTunnel(t); return el('option', { value: t }, tunLabel(t) + (w && !w.enabled ? ' (disabled)' : '')); }));
-
-  var devSel = el('select', { multiple: true, size: 8, class: 'tw:w-full' },
-    (state.cfg.groups || []).map(function (g) { var v = 'group:' + g.name; return el('option', { value: v, selected: p.devices.indexOf(v) >= 0 }, 'Group: ' + g.name); }),
-    knownDevices().map(function (d) { return el('option', { value: d.mac, selected: p.devices.indexOf(d.mac) >= 0 }, (d.name || '?') + ' (' + d.mac + (d.ip ? ', ' + d.ip : '') + ')'); }));
-  var extraMacs = p.devices.filter(function (d) { return d.indexOf('group:') !== 0 && !knownDevices().some(function (k) { return k.mac === d; }); });
-  var macTA = el('textarea', { class: 'tw:min-h-[40px]', placeholder: 'aa:bb:cc:dd:ee:ff\n10.6.0.2\n10.8.0.0/24' }, extraMacs.join('\n'));
+  var tunBox = el('div');
+  mountState(tunBox, TunnelPicker, {
+    initial: p.tunnels.slice(),
+    onChange: function (v) { p.tunnels = v; },
+    props: { options: tunnelOptions(), status: (state.status && state.status.tunnels) || {} },
+  });
+  var devBox = el('div');
+  mountState(devBox, DeviceSelector, {
+    initial: { include: p.devices.slice(), exclude: p.exclude_devices.slice() },
+    bind: function (v) { return v; },
+    onChange: function (v) { p.devices = v.include; p.exclude_devices = v.exclude; },
+    props: { devices: deviceOptions(), groups: groupOptions(), emptyMeaning: 'every device on the LAN', noun: 'This policy' },
+  });
   var rulesEd = ruleEditor({ value: policyRulesText(p), height: 240,
     placeholder: 'netflix.com\n**.nflxvideo.net\n/^ipv4-c\\d+-.*\\.oca\\.nflxvideo\\.net$/\n!=ads.netflix.com\nasn:2906\ncidr:23.246.0.0/18' });
-  var listSel = el('select', { multiple: true, size: Math.min(6, Math.max(2, state.cfg.rule_lists.length)), class: 'tw:w-full' },
-    state.cfg.rule_lists.map(function (l) { return el('option', { value: l.name, selected: p.lists.indexOf(l.name) >= 0 }, l.name + ' (' + ruleCount(l) + ' rules, ' + l.asns.length + ' ASNs, ' + l.cidrs.length + ' CIDRs)'); }));
+  var listBox = el('div');
+  mountState(listBox, ChecklistPicker, {
+    initial: p.lists.slice(),
+    onChange: function (v) { p.lists = v; },
+    props: {
+      label: 'rule lists',
+      empty: 'No rule lists yet: create or import them in the Rule lists tab.',
+      items: state.cfg.rule_lists.map(function (l) { return { id: l.name, label: l.name, detail: ruleCount(l) + ' rules, ' + l.asns.length + ' ASNs, ' + l.cidrs.length + ' CIDRs' + (l.description ? ' · ' + l.description : '') }; }),
+    },
+  });
   var rulesCard = el('div', { class: 'card tw:col-span-full' },
     el('div', { class: 'row tw:justify-between' }, el('b', null, 'Rules'),
       el('span', { class: 'row' },
@@ -716,25 +725,19 @@ function viewEditor(b) {
     syntaxHelp(), rulesEd.el,
     el('label', { class: 'chk' }, el('input', { type: 'checkbox', checked: !p.ignore_cname, onchange: function (e) { p.ignore_cname = !e.target.checked; } }),
       el('span', null, 'Match CNAME chains', el('div', { class: 'small muted' }, 'Also match when the queried name is an alias (CNAME) of a matching name.'))),
-    el('label', { class: 'f' }, 'Include rule lists (Ctrl/Cmd-click for several)'),
-    state.cfg.rule_lists.length ? listSel : el('div', { class: 'small muted' }, 'No rule lists yet: create or import them in the Rule lists tab.'));
+    el('label', { class: 'f' }, 'Include rule lists'), listBox);
   var L = p.leak;
 
   b.appendChild(el('div', { class: 'cols' },
     el('div', { class: 'card' },
       el('label', { class: 'f' }, 'Name'), el('input', { type: 'text', value: p.name, oninput: function (e) { p.name = e.target.value; } }),
       chk(p, 'enabled', 'Enabled'),
-      el('label', { class: 'f' }, 'Tunnels (priority order)'), tunBox,
-      el('div', { class: 'row' }, tunSel, btn('Add tunnel', function () { if (p.tunnels.indexOf(tunSel.value) < 0) p.tunnels.push(tunSel.value); drawTunnels(); })),
+      el('label', { class: 'f' }, 'Tunnels (failover order)'), tunBox,
       el('div', { class: 'small muted' }, 'Need more than the router\'s ten VPN clients? Save WireGuard or OpenVPN configurations in the Tunnels tab; they run only while a policy uses them.'),
       chk(p, 'kill_switch', 'Kill switch', 'When no tunnel is healthy, block this traffic instead of sending it via WAN.'),
       el('label', { class: 'f' }, 'Expected exit country (ISO code, optional)'),
       el('input', { type: 'text', value: p.expected_country, maxlength: 2, size: 4, placeholder: 'US', oninput: function (e) { p.expected_country = e.target.value.toUpperCase(); } }),
       el('div', { class: 'small muted' }, 'A tunnel whose exit country differs is treated as failed for this policy.')),
-    el('div', { class: 'card' },
-      el('label', { class: 'f' }, 'Devices (none = whole LAN). Ctrl/Cmd-click to select several.'), devSel,
-      el('label', { class: 'f' }, 'Other devices: MAC addresses, or IP addresses / subnets for VPN server clients'), macTA,
-      el('div', { class: 'small muted' }, 'Devices only → the whole device goes through the tunnel. Devices + destinations → only those destinations, only for those devices.')),
     el('div', { class: 'card' },
       el('b', null, 'Leak protection'),
       chk(L, 'dns_via_tunnel', 'Resolve policy domains through the tunnel', 'CDNs choose servers by resolver location; this makes them pick ones near the VPN exit.'),
@@ -752,6 +755,10 @@ function viewEditor(b) {
       el('select', { onchange: function (e) { L.webrtc = e.target.value; } },
         [['track', 'Track: route this service\'s WebRTC peers via the tunnel'], ['off', 'Off']].map(function (o) { return el('option', { value: o[0], selected: L.webrtc === o[0] }, o[1]); })),
       el('div', { class: 'small muted' }, 'While a device talks to this policy\'s destinations, STUN it sends reveals the peers/relays of its calls; those are routed through the tunnel too. Other apps\' WebRTC stays on WAN.')),
+    el('div', { class: 'card tw:col-span-full' },
+      el('b', null, 'Devices'),
+      el('div', { class: 'small muted tw:mb-1.5' }, 'Include nothing to cover every device. Included devices only (no rules) → those whole devices go through the tunnel; with rules → only the matching destinations, only for them. Excluded devices are never handled by this policy: not routed, not blocked by its drop: rules, not under its leak protection.'),
+      devBox),
     rulesCard));
 
   b.appendChild(el('div', { class: 'row tw:mt-2.5' },
@@ -762,14 +769,29 @@ function viewEditor(b) {
       rulesEd.check().then(function (r) {
         if (!r || (r.errors || []).length) { toast('Fix the rule errors first'); return; }
         p.domains = r.file.domains; p.asns = r.file.asns; p.cidrs = r.file.cidrs;
-        var sel = Array.prototype.filter.call(devSel.options, function (o) { return o.selected; }).map(function (o) { return o.value; });
-        p.devices = sel.concat(lines(macTA.value));
-        p.lists = Array.prototype.filter.call(listSel.options, function (o) { return o.selected; }).map(function (o) { return o.value; });
         if (ed.idx < 0) state.cfg.policies.push(p); else state.cfg.policies[ed.idx] = p;
         state.edit = null; markDirty(); render();
       });
     }, 'pri'),
     el('span', { class: 'muted small' }, 'Changes are applied when you press "Save & apply".')));
+}
+// Data for the React components.
+function deviceOptions() {
+  return knownDevices().map(function (d) { return { id: d.mac, name: d.name, ip: d.ip }; });
+}
+function groupOptions() {
+  return (state.cfg.groups || []).map(function (g) { return { name: g.name, members: g.macs || [] }; });
+}
+function tunnelOptions() {
+  var opts = TUNNELS.map(function (t) {
+    return { id: t, label: t + (t.indexOf('ovpnc') === 0 ? ' (tun1' + t.slice(5) + ')' : ''), group: t.indexOf('wgc') === 0 ? 'Router WireGuard clients' : 'Router OpenVPN clients' };
+  });
+  [['wireguard', 'Saved WireGuard tunnels'], ['openvpn', 'Saved OpenVPN tunnels']].forEach(function (k) {
+    (state.cfg[k[0]] || []).forEach(function (w) {
+      opts.push({ id: w.id, label: tunLabel(w.id), group: k[1], disabled: !w.enabled, note: w.enabled ? '' : 'disabled' });
+    });
+  });
+  return opts;
 }
 function knownDevices() {
   var map = {};
@@ -784,14 +806,28 @@ function viewDevices(b) {
   cfg.groups = cfg.groups || []; cfg.devices = cfg.devices || [];
   b.appendChild(el('h3', null, 'Groups'));
   cfg.groups.forEach(function (g, i) {
-    var ta = el('textarea', { class: 'tw:min-h-[50px]', onchange: function (e) { g.macs = lines(e.target.value); markDirty(); } }, g.macs.join('\n'));
+    var members = el('div');
+    mountState(members, DeviceSelector, {
+      initial: { include: g.macs.slice(), exclude: [] },
+      bind: function (v) { return v; },
+      onChange: function (v) { g.macs = v.include; markDirty(); },
+      props: { devices: deviceOptions(), groups: [], allowExclude: false, emptyMeaning: 'no devices yet', noun: 'This group' },
+    });
+    var users = cfg.policies.filter(function (p) { return p.devices.concat(p.exclude_devices).indexOf('group:' + g.name) >= 0; }).map(function (p) { return p.name; });
     b.appendChild(el('div', { class: 'card' },
-      el('div', { class: 'row' }, el('input', { type: 'text', value: g.name, onchange: function (e) {
+      el('div', { class: 'row' }, el('input', { type: 'text', value: g.name, 'aria-label': 'Group name', onchange: function (e) {
         var old = 'group:' + g.name; g.name = e.target.value.trim();
-        cfg.policies.forEach(function (p) { p.devices = p.devices.map(function (d) { return d === old ? 'group:' + g.name : d; }); });
+        var swap = function (d) { return d === old ? 'group:' + g.name : d; };
+        cfg.policies.forEach(function (p) { p.devices = p.devices.map(swap); p.exclude_devices = p.exclude_devices.map(swap); });
         markDirty();
-      } }), btn('Delete group', function () { cfg.groups.splice(i, 1); markDirty(); render(); }, 'danger')),
-      el('label', { class: 'f' }, 'MAC addresses'), ta));
+      } }), btn('Delete group', function () {
+        if (users.length && !confirm('Group ' + g.name + ' is used by: ' + users.join(', ') + '.\n\nDelete it and remove it from those policies?')) return;
+        var ref = 'group:' + g.name;
+        var drop = function (d) { return d !== ref; };
+        cfg.policies.forEach(function (p) { p.devices = p.devices.filter(drop); p.exclude_devices = p.exclude_devices.filter(drop); });
+        cfg.groups.splice(i, 1); markDirty(); render();
+      }, 'danger'), users.length ? el('span', { class: 'small muted' }, 'used by ' + users.join(', ')) : null),
+      members));
   });
   b.appendChild(btn('+ New group', function () { cfg.groups.push({ name: 'group' + (cfg.groups.length + 1), macs: [] }); markDirty(); render(); }));
 

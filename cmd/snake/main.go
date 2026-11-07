@@ -496,6 +496,13 @@ func status() error {
 	return tw.Flush()
 }
 
+func devicesSummary(p config.Policy) string {
+	if len(p.ExcludeDevices) == 0 {
+		return strconv.Itoa(len(p.Devices))
+	}
+	return fmt.Sprintf("%d (-%d)", len(p.Devices), len(p.ExcludeDevices))
+}
+
 func policyList() error {
 	cfg, err := config.Load(paths().Config)
 	if err != nil {
@@ -504,7 +511,7 @@ func policyList() error {
 	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "ID\tNAME\tENABLED\tTUNNELS\tKILL\tSCOPE\tDOMAINS\tASNS\tCIDRS\tDEVICES")
 	for _, p := range cfg.Policies {
-		fmt.Fprintf(tw, "%d\t%s\t%v\t%s\t%v\t%s\t%d\t%d\t%d\t%d\n", p.ID, p.Name, p.Enabled, strings.Join(p.Tunnels, ">"), p.KillSwitch, p.Scope(), len(p.Domains), len(p.ASNs), len(p.CIDRs), len(p.Devices))
+		fmt.Fprintf(tw, "%d\t%s\t%v\t%s\t%v\t%s\t%d\t%d\t%d\t%s\n", p.ID, p.Name, p.Enabled, strings.Join(p.Tunnels, ">"), p.KillSwitch, p.Scope(), len(p.Domains), len(p.ASNs), len(p.CIDRs), devicesSummary(p))
 	}
 	return tw.Flush()
 }

@@ -475,6 +475,9 @@ func (e *Engine) TestDomain(name string) DomainTest {
 		if len(p.Devices) > 0 {
 			res.Notes = append(res.Notes, "policy is limited to selected devices")
 		}
+		if n := len(p.ExcludeDevices); n > 0 {
+			res.Notes = append(res.Notes, fmt.Sprintf("%d excluded device(s) or group(s) are never routed by this policy", n))
+		}
 	} else if len(res.Others) == 0 {
 		res.Notes = append(res.Notes, "no policy matches: traffic goes via WAN")
 	}

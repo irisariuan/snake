@@ -375,7 +375,7 @@ func (e *Engine) states(cfg *config.Config, caps Caps) []netfilter.PolicyState {
 		if !p.Enabled {
 			continue
 		}
-		st := netfilter.PolicyState{Policy: p, Clients: cfg.ResolveDevices(p), ActiveTunnel: e.active[p.ID]}
+		st := netfilter.PolicyState{Policy: p, Clients: cfg.ResolveDevices(p), Excluded: cfg.ResolveExcluded(p), ActiveTunnel: e.active[p.ID]}
 		switch {
 		case !caps.IPv6 || p.Leak.IPv6 == config.IPv6Off:
 			st.IPv6Mode = netfilter.V6Off
@@ -786,24 +786,33 @@ func (e *Engine) sniPolicies(cfg *config.Config, states []netfilter.PolicyState,
 				sp.Session6 = netfilter.SetName(p.ID, netfilter.KindSession, true)
 			}
 		}
-		for _, c := range st.Clients {
-			if config.ClientMAC(c) {
-				if sp.MACs == nil {
-					sp.MACs = map[string]bool{}
-				}
-				sp.MACs[c] = true
-			} else if pf, err := netip.ParsePrefix(c); err == nil {
-				sp.Nets = append(sp.Nets, pf)
-			} else if a, err := netip.ParseAddr(c); err == nil {
-				sp.Nets = append(sp.Nets, netip.PrefixFrom(a, a.BitLen()))
-			}
-		}
+		sp.MACs, sp.Nets = splitClients(st.Clients)
+		sp.ExcludeMACs, sp.ExcludeNets = splitClients(st.Excluded)
 		if len(st.Clients) > 0 && len(sp.MACs)+len(sp.Nets) == 0 {
 			continue // no usable device entry: the policy applies to no one here
 		}
 		out = append(out, sp)
 	}
 	return out
+}
+
+// splitClients separates device entries into MAC addresses and networks.
+func splitClients(clients []string) (map[string]bool, []netip.Prefix) {
+	var macs map[string]bool
+	var nets []netip.Prefix
+	for _, c := range clients {
+		if config.ClientMAC(c) {
+			if macs == nil {
+				macs = map[string]bool{}
+			}
+			macs[c] = true
+		} else if pf, err := netip.ParsePrefix(c); err == nil {
+			nets = append(nets, pf)
+		} else if a, err := netip.ParseAddr(c); err == nil {
+			nets = append(nets, netip.PrefixFrom(a, a.BitLen()))
+		}
+	}
+	return macs, nets
 }
 
 // configureSNI starts, updates or stops the SNI proxy and returns the port

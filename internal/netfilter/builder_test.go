@@ -388,3 +388,60 @@ func TestDeviceOnlyInOtherFamily(t *testing.T) {
 		t.Error("QUIC block for an IPv4-only device leaked to every IPv6 client")
 	}
 }
+
+// Excluded devices return from the policy's chains before anything
+// matches: routing, WebRTC session refresh, drop: rules and its leak
+// protection. Other policies' merged leak protection is untouched.
+func TestExcludedDevices(t *testing.T) {
+	c, st := states(t)
+	st[0].Excluded = []string{"aa:bb:cc:00:00:99", "192.168.50.77", "fd00::77"}
+	st[0].Drops = true
+	st[0].Policy.Leak.SniffSNI = true
+	plan := Build(c.Settings, st, Options{IPv6: true, IPv6NAT: true, SNIPort: 5340})
+	m4, n4, f4, m6 := plan.Restore["4/mangle"], plan.Restore["4/nat"], plan.Restore["4/filter"], plan.Restore["6/mangle"]
+
+	// Policy chain: excluded first, then the session refresh, then the
+	// claimed-already check and the matches.
+	p1 := regexp.MustCompile(`(?m)^-A SNAKE_P1 .*$`).FindAllString(m4, -1)
+	if len(p1) < 4 || p1[0] != "-A SNAKE_P1 -m mac --mac-source aa:bb:cc:00:00:99 -j RETURN" || p1[1] != "-A SNAKE_P1 -s 192.168.50.77 -j RETURN" {
+		t.Fatalf("policy chain does not start with the exclusions:\n%s", strings.Join(p1, "\n"))
+	}
+	mustContain(t, m4, "-A SNAKE_P1 -m conntrack --ctstate NEW -m set --match-set SNK_1_d4 dst -j SET --add-set SNK_1_s4 src --exist")
+	if strings.Contains(m4, "-A SNAKE -m conntrack --ctstate NEW -m set --match-set SNK_1_d4 dst -j SET") {
+		t.Error("session refresh still before the exclusions")
+	}
+	if strings.Contains(m4, "fd00::77") || !strings.Contains(m6, "-A SNAKE_P1 -s fd00::77 -j RETURN") {
+		t.Error("exclusions in the wrong family")
+	}
+	// drop: rules and leak protection in guarded chains.
+	mustContain(t, f4,
+		"-A SNAKE_FWD -j SNAKE_X1_DROP",
+		"-A SNAKE_X1_DROP -m mac --mac-source aa:bb:cc:00:00:99 -j RETURN",
+		"-A SNAKE_X1_DROP -i br+ -p tcp -m set --match-set SNK_1_x4 dst -j REJECT --reject-with tcp-reset",
+		"-A SNAKE_FWD -j SNAKE_X1_DOT",
+		"-A SNAKE_X1_DOT -s 192.168.50.77 -j RETURN",
+		"-A SNAKE_X1_DOT -i br+ -p tcp --dport 853 -j REJECT --reject-with tcp-reset",
+		"-A SNAKE_FWD -j SNAKE_X1_SNIQ",
+	)
+	mustContain(t, n4,
+		"-A SNAKE_DNS -j SNAKE_X1_DNS",
+		"-A SNAKE_X1_DNS -m mac --mac-source aa:bb:cc:00:00:99 -j RETURN",
+		"-A SNAKE_X1_DNS -i br+ -p udp --dport 53 -j REDIRECT --to-ports 53",
+		"-A SNAKE_DNS -j SNAKE_X1_SNI",
+		"-A SNAKE_X1_SNI -i br+ -p tcp --dport 443 -j SNAKE_SNI",
+	)
+	// The policy no longer joins the merged LAN-wide scope.
+	if strings.Contains(f4, "-A SNAKE_FWD -i br+ -p tcp --dport 853") {
+		t.Error("excluded policy still in the merged DoT scope")
+	}
+	// Router-wide "always block" covers excluded devices too.
+	c.Settings.BlockDoT = config.BlockAlways
+	f4 = Build(c.Settings, st, Options{}).Restore["4/filter"]
+	if strings.Contains(f4, "SNAKE_X1_DOT") || !strings.Contains(f4, "-A SNAKE_FWD -i br+ -p tcp --dport 853") {
+		t.Errorf("block_dot=always not router-wide:\n%s", f4)
+	}
+	// Removing the exclusions deletes the guard chains.
+	st[0].Excluded = nil
+	plan = Build(c.Settings, st, Options{Existing: map[string][]string{"4/filter": {"SNAKE_FWD", "SNAKE_X1_DROP"}}})
+	mustContain(t, plan.Restore["4/filter"], "-X SNAKE_X1_DROP")
+}

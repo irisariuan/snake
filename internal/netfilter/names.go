@@ -1,7 +1,10 @@
 // Package netfilter builds and applies iptables/ipset state for snake.
 package netfilter
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Set kinds.
 const (
@@ -50,6 +53,12 @@ const (
 
 // PolicyChain is the per-policy match chain.
 func PolicyChain(id int) string { return fmt.Sprintf("%s%d", chainPolicy, id) }
+
+// GuardChain is a policy's chain for one feature (drop, dns, dot, doh,
+// quic, sni, sniq) when it excludes devices: it returns for them first.
+func GuardChain(id int, feature string) string {
+	return fmt.Sprintf("SNAKE_X%d_%s", id, strings.ToUpper(feature))
+}
 
 // MarkChain is the per-policy mark chain.
 func MarkChain(id int) string { return fmt.Sprintf("%s%d", chainMark, id) }

@@ -1,0 +1,99 @@
+//go:build integration
+
+package engine
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/irisariuan/snake/internal/config"
+)
+
+// TestIntegrationExcludedDevice: with real packets, an excluded device is
+// neither routed into the tunnel nor blocked by the policy's drop: rules,
+// while another device on the same LAN is.
+func TestIntegrationExcludedDevice(t *testing.T) {
+	if os.Getuid() != 0 || os.Getenv("SNAKE_INTEGRATION") == "" {
+		t.Skip("set SNAKE_INTEGRATION=1 and run as root inside `unshare -n`")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 needed for the test clients/server")
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("sh", "-c", "ip netns del snakea; ip netns del snakeb; ip netns del snakesrv; ip link del lanva; ip link del lanvb; ip link del wanv; ip link del br0; ip link del wgc1; "+
+			"iptables -t nat -D POSTROUTING -o wanv -j MASQUERADE; for s in $(ipset list -n | grep ^SNK_); do ipset flush $s; done").Run()
+	})
+	for _, ns := range []string{"snakea", "snakeb", "snakesrv"} {
+		if exec.Command("ip", "netns", "add", ns).Run() != nil {
+			t.Skip("cannot create network namespaces")
+		}
+	}
+	sh(t, "ip link set lo up; sysctl -qw net.ipv4.ip_forward=1")
+	sh(t, "ip link add br0 type bridge; ip link set br0 up; ip addr add 192.168.77.1/24 dev br0")
+	sh(t, "ip tuntap add mode tun dev wgc1; ip link set wgc1 up") // the tunnel swallows everything
+	for i, ns := range []string{"snakea", "snakeb"} {
+		v, c, ip := "lanv"+ns[5:], "lanc", []string{"192.168.77.2", "192.168.77.3"}[i]
+		sh(t, "ip link add "+v+" type veth peer name "+c+"; ip link set "+c+" netns "+ns+"; ip link set "+v+" master br0; ip link set "+v+" up")
+		sh(t, "ip netns exec "+ns+" sh -c 'ip link set lo up; ip addr add "+ip+"/24 dev lanc; ip link set lanc up; ip route add default via 192.168.77.1'")
+	}
+	sh(t, "ip link add wanv type veth peer name wans; ip link set wans netns snakesrv; ip addr add 198.18.0.1/30 dev wanv; ip link set wanv up")
+	sh(t, "ip netns exec snakesrv sh -c 'ip link set lo up; ip addr add 198.18.0.2/30 dev wans; ip addr add 203.0.113.80/32 dev lo; ip addr add 203.0.113.81/32 dev lo; ip link set wans up; ip route add default via 198.18.0.1'")
+	sh(t, "ip route add 203.0.113.80 via 198.18.0.2; ip route add 203.0.113.81 via 198.18.0.2; iptables -t nat -A POSTROUTING -o wanv -j MASQUERADE")
+	srv := exec.Command("ip", "netns", "exec", "snakesrv", "python3", "-c", `
+import socket, threading
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("0.0.0.0", 80)); s.listen()
+while True:
+    c, _ = s.accept(); c.sendall(b"hi"); c.close()
+`)
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Process.Kill()
+
+	// .80 is routed by the policy, .81 is blocked by it; device A is excluded.
+	dir := t.TempDir()
+	c := config.Default()
+	c.Policies = []config.Policy{{Name: "p", Enabled: true, Tunnels: []string{"wgc1"}, KillSwitch: true,
+		Domains: []string{"drop:cidr:203.0.113.81"}, CIDRs: []string{"203.0.113.80/32"},
+		ExcludeDevices: []string{"192.168.77.2"}, Leak: config.Leak{IPv6: "off", WebRTC: "off"}}}
+	c.Settings.PreResolve = false
+	c.Settings.LANInterfaces = "br0"
+	c.Normalize()
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Save(filepath.Join(dir, "config.json"), c); err != nil {
+		t.Fatal(err)
+	}
+	e := New(DefaultPaths(dir), fakeMerlin{})
+	if err := e.Load(); err != nil {
+		t.Fatal(err)
+	}
+	e.DetectCaps()
+	e.SeedHealth()
+	e.decide()
+	if err := e.Apply("exclude test"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	get := func(ns, ip string) bool {
+		return exec.Command("ip", "netns", "exec", ns, "python3", "-c",
+			`import socket; c = socket.create_connection(("`+ip+`", 80), timeout=1.5); assert c.recv(2) == b"hi"`).Run() == nil
+	}
+	if !get("snakea", "203.0.113.80") {
+		t.Error("excluded device was routed into the tunnel")
+	}
+	if get("snakeb", "203.0.113.80") {
+		t.Error("included device reached the policy destination over WAN instead of the tunnel")
+	}
+	if !get("snakea", "203.0.113.81") {
+		t.Error("excluded device was blocked by the policy's drop: rule")
+	}
+	if get("snakeb", "203.0.113.81") {
+		t.Error("drop: rule did not block the included device")
+	}
+}

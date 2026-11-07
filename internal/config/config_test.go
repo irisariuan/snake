@@ -356,3 +356,41 @@ func TestMigrateLANInterfaces(t *testing.T) {
 		}
 	}
 }
+
+func TestExcludeDevices(t *testing.T) {
+	c := load(t)
+	p := &c.Policies[0] // destinations only
+	p.ExcludeDevices = []string{" AA:BB:CC:00:00:09 ", "group:living-room", "10.8.0.0/24", "aa:bb:cc:00:00:09"}
+	c.Normalize()
+	if got := strings.Join(p.ExcludeDevices, ","); got != "aa:bb:cc:00:00:09,group:living-room,10.8.0.0/24" {
+		t.Fatalf("normalized %s", got)
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.ResolveExcluded(*p); len(got) < 3 || p.Scope() != "destinations, some devices excluded" {
+		t.Fatalf("resolved %v, scope %q", got, p.Scope())
+	}
+	// DoH blocking is no longer LAN-wide in DNS when devices are excluded.
+	for i := range c.Policies {
+		c.Policies[i].Leak.BlockDoH = false
+	}
+	p.Leak.BlockDoH = true
+	if c.DoHBlockedLANWide() {
+		t.Error("DoH blocked LAN-wide despite excluded devices")
+	}
+	p.ExcludeDevices, p.Leak.BlockDoH = nil, true
+	if !c.DoHBlockedLANWide() {
+		t.Error("destination-only policy without exclusions should block DoH LAN-wide")
+	}
+	p.ExcludeDevices = []string{"aa:bb:cc:00:00:09"}
+	p.ExcludeDevices = append(p.ExcludeDevices, "group:nope", "not-a-device")
+	q := &c.Policies[1]
+	q.ExcludeDevices = append([]string(nil), q.Devices[0])
+	err := c.Validate()
+	for _, s := range []string{`unknown group "group:nope"`, `invalid device "not-a-device"`, "both included and excluded"} {
+		if err == nil || !strings.Contains(err.Error(), s) {
+			t.Errorf("missing %q in %v", s, err)
+		}
+	}
+}

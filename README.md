@@ -193,6 +193,14 @@ A policy is:
   * destinations only → those destinations, for every device
   * devices only → the **whole device** (most reliable for TV apps)
   * both → those destinations, only for those devices
+* **Excluded devices** (optional): devices or groups the policy never
+  handles, also when they belong to an included group or subnet. With
+  destinations only, this means "every device except these". An excluded
+  device is not routed into the policy's tunnel (nor by its WebRTC tracking
+  or SNI proxy), not blocked by its `drop:` rules, and not under its leak
+  protection; other policies still apply to it. DNS for policy domains is
+  resolved the same way for every device, because the router's DNS does
+  not know which device will connect.
 * **Kill switch**: if no tunnel is usable, block instead of falling back to WAN.
 * **Expected exit country**: a tunnel whose exit country differs (for example,
   the VPN reconnected to another server) counts as failed for this policy.
@@ -791,12 +799,21 @@ hand and run `snake reload`. See `testdata/config.json` for an example.
 Building needs Go 1.26 or newer (with the default `GOTOOLCHAIN=auto`, an
 older `go` downloads it) and, for the web UI, Node.js 22.
 
-The web UI is an [Astro](https://astro.build) + [Tailwind CSS](https://tailwindcss.com)
+The web UI is an [Astro](https://astro.build) + [React](https://react.dev) + [Tailwind CSS](https://tailwindcss.com)
 project in `web/`:
 
 * `web/src/pages/index.astro`: the page shell;
 * `web/src/scripts/app.js`: the app, which renders the UI from the daemon's
   JSON API;
+* `web/src/components/`: React components the app mounts in place
+  (`src/scripts/react-bridge.js`): `DeviceSelector` (include/exclude
+  devices, used for policies and for groups), `TunnelPicker` (failover
+  order), `ChecklistPicker` (rule lists), and shared controls in
+  `components/controls/` (`Button`, `Badge`/`TunnelHealth`, `SearchBox`,
+  `FilterChips`, `SelectionToolbar`, `TriState`). React is compiled by
+  Vite's React plugin; Astro's React integration is not used because its
+  island runtime would add a second script, and the router page needs
+  one. `npm test` runs the components' logic tests (`*.test.js`);
 * `web/src/styles/global.css`: Tailwind theme and the UI's component
   classes. Utilities are prefixed (`tw:mt-2`, `tw:text-warn`) and there is no
   preflight reset, because the same CSS runs inside the router's own WebUI
@@ -817,7 +834,7 @@ the binaries and the static page as artifacts.
 
 ```
 make web           # build the web UI (npm ci when web/package-lock.json changed)
-make test          # web UI + unit tests (fails if the UI is missing)
+make test          # web UI build, JS + Go unit tests (fails if the UI is missing)
 make integration   # real iptables/ipset/ip and OpenVPN in a throwaway netns (root)
 make ui-dev        # UI against a fake engine at http://127.0.0.1:18444 (token "testtoken")
 ```

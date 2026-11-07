@@ -50,6 +50,9 @@ type Policy struct {
 	// are matched by address.
 	MACs map[string]bool
 	Nets []netip.Prefix
+	// ExcludeMACs and ExcludeNets are clients the policy never applies to.
+	ExcludeMACs map[string]bool
+	ExcludeNets []netip.Prefix
 	Mark uint32 // fwmark of the policy's routing table
 	// Set4/Set6 learn the destination of a matched connection (the
 	// policy's domain sets), so later connections to it take the kernel
@@ -312,8 +315,17 @@ func (p *Proxy) applicable(client netip.Addr) []Policy {
 		return nil
 	}
 	mac, looked := "", false
+	lookup := func() string {
+		if !looked {
+			mac, looked = p.neigh.mac(client), true
+		}
+		return mac
+	}
 	var out []Policy
 	for _, pol := range *pols {
+		if inNets(pol.ExcludeNets, client) || (len(pol.ExcludeMACs) > 0 && pol.ExcludeMACs[lookup()]) {
+			continue
+		}
 		if len(pol.MACs)+len(pol.Nets) == 0 || inNets(pol.Nets, client) {
 			out = append(out, pol)
 			continue
@@ -321,10 +333,7 @@ func (p *Proxy) applicable(client netip.Addr) []Policy {
 		if len(pol.MACs) == 0 {
 			continue
 		}
-		if !looked {
-			mac, looked = p.neigh.mac(client), true
-		}
-		if pol.MACs[mac] {
+		if pol.MACs[lookup()] {
 			out = append(out, pol)
 		}
 	}
