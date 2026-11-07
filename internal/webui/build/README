@@ -1,0 +1,2 @@
+The web UI is built into site/ here by `make web` (web/, Astro + Tailwind).
+Go embeds this directory; site/ is not committed.

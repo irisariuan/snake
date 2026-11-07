@@ -1,0 +1,143 @@
+/* snake web UI styles: Tailwind theme + utilities, and the component
+ * classes the app script uses (card, btn, badge, ...) built from them.
+ *
+ * The same CSS runs inside the router's own WebUI page (Addons menu), so:
+ * - no preflight: Tailwind's global reset would restyle the router's menus;
+ * - utilities are prefixed (tw:flex, tw:mt-2) so they never match the
+ *   router page's class names, and !important so the router's unlayered
+ *   styles cannot override them;
+ * - component rules are scoped to #snake and left unlayered, for the same
+ *   reason. */
+@layer theme, utilities;
+@import "tailwindcss/theme.css" layer(theme) prefix(tw);
+@import "tailwindcss/utilities.css" layer(utilities) important prefix(tw);
+
+@source "../scripts";
+
+@theme {
+  /* Fixed pixel spacing: the router page's root font size is not ours. */
+  --spacing: 4px;
+  --color-bg: #2b373b;
+  --color-panel: #334247;
+  --color-panel2: #3b4c52;
+  --color-line: #4f6168;
+  --color-fg: #e8eef0;
+  --color-muted: #a9b9be;
+  --color-accent: #ffcc00;
+  --color-ok: #5fd38d;
+  --color-warn: #ffb74d;
+  --color-bad: #ff6b6b;
+  --color-info: #64b5f6;
+  --color-field: #222d30;
+  --color-code: #1d2629;
+  --color-gutter: #182023;
+  --font-sans: Verdana, Arial, sans-serif;
+  --font-mono: Menlo, Consolas, "DejaVu Sans Mono", monospace;
+}
+
+#snake {
+  @apply tw:font-sans tw:text-fg tw:bg-bg tw:p-3 tw:rounded tw:box-border tw:max-w-full;
+  font-size: 13px;
+  line-height: 1.45;
+}
+#snake * { @apply tw:box-border; }
+#snake h2 { @apply tw:text-accent tw:mt-0 tw:mb-2.5; font-size: 16px; }
+#snake h3 { @apply tw:text-fg tw:mt-3.5 tw:mb-2; font-size: 14px; }
+#snake a { @apply tw:text-info; }
+
+/* tabs */
+#snake .tabs { @apply tw:flex tw:flex-wrap tw:gap-1 tw:border-b tw:border-line tw:mb-3; }
+#snake .tab { @apply tw:bg-transparent tw:border-0 tw:border-b-2 tw:border-transparent tw:text-muted tw:px-3 tw:py-1.75 tw:cursor-pointer; font: inherit; }
+#snake .tab.on { @apply tw:text-accent tw:border-accent; }
+
+/* layout */
+#snake .card { @apply tw:bg-panel tw:border tw:border-line tw:rounded tw:p-2.5 tw:mb-2.5; }
+#snake .grid { @apply tw:grid tw:gap-2.5; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+#snake .cols { @apply tw:grid tw:gap-3; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+#snake .row { @apply tw:flex tw:flex-wrap tw:gap-2 tw:items-center; }
+#snake .row > * { @apply tw:m-0; }
+#snake .scroll { @apply tw:overflow-x-auto; }
+#snake .kv { @apply tw:grid tw:gap-x-2.5 tw:gap-y-0.5; grid-template-columns: max-content 1fr; font-size: 12px; }
+#snake .kv span:nth-child(odd) { @apply tw:text-muted; }
+#snake ul { @apply tw:pl-4.5 tw:my-1; }
+#snake .tun-list li { @apply tw:flex tw:gap-1.5 tw:items-center tw:my-0.75; }
+
+/* tables */
+#snake table { @apply tw:w-full tw:border-collapse; }
+#snake th, #snake td { @apply tw:text-left tw:px-1.5 tw:py-1.25 tw:border-b tw:border-line tw:align-top; 
+  /* the router page styles td globally */
+  color: inherit; font-size: inherit; font-family: inherit; }
+#snake th { @apply tw:text-muted tw:font-normal; font-size: 12px; }
+
+/* text */
+#snake .muted { @apply tw:text-muted; }
+#snake .small { font-size: 11px; }
+#snake .mono { @apply tw:font-mono; font-size: 11px; }
+
+/* badges */
+#snake .badge { @apply tw:inline-block tw:px-1.75 tw:py-px tw:rounded-[9px] tw:bg-panel2 tw:text-fg tw:whitespace-nowrap; font-size: 11px; }
+#snake .b-ok { background: #1f5a3a; color: #c8f7da; }
+#snake .b-warn { background: #6b4a12; color: #ffe1b0; }
+#snake .b-bad { background: #6d2323; color: #ffd0d0; }
+#snake .b-info { background: #1c4466; color: #cfe7ff; }
+
+/* buttons */
+#snake button.btn { @apply tw:bg-panel2 tw:text-fg tw:border tw:border-line tw:rounded-[3px] tw:px-2.75 tw:py-1.25 tw:cursor-pointer; font: inherit; }
+#snake button.btn:hover { @apply tw:border-accent; }
+#snake button.pri { @apply tw:border-accent tw:text-white; background: #8a6d00; }
+#snake button.danger { @apply tw:border-bad; color: #ffd0d0; }
+#snake button:disabled { @apply tw:opacity-50 tw:cursor-default; }
+#snake button.kill { @apply tw:border-bad tw:text-white tw:font-bold; background: #8b1e1e; }
+#snake button.kill:hover { @apply tw:border-white; background: #a82424; }
+
+/* form fields */
+#snake input[type=text], #snake input[type=password], #snake input[type=number], #snake select, #snake textarea {
+  @apply tw:bg-field tw:text-fg tw:border tw:border-line tw:rounded-[3px] tw:px-1.75 tw:py-1.25 tw:max-w-full;
+  font: 12px/1.4 var(--tw-font-mono);
+}
+#snake textarea { @apply tw:w-full tw:min-h-[90px] tw:resize-y; }
+#snake .card > select { @apply tw:w-full; }
+#snake label.f { @apply tw:block tw:mt-2 tw:mb-0.75 tw:text-muted; font-size: 12px; }
+#snake .chk { @apply tw:flex tw:gap-1.5 tw:items-start tw:my-1.5; }
+#snake .chk input { @apply tw:mt-0.5; }
+
+/* banners, errors, toasts */
+#snake .banner { @apply tw:border tw:border-warn tw:px-2.5 tw:py-2 tw:rounded tw:mb-2.5 tw:flex tw:justify-between tw:items-center tw:gap-2 tw:flex-wrap; background: #6b4a12; }
+#snake .banner.off { @apply tw:border-bad; background: #6d2323; }
+#snake .err { @apply tw:border tw:border-bad tw:px-2.5 tw:py-2 tw:rounded tw:mb-2.5 tw:whitespace-pre-wrap tw:break-words; background: #6d2323; }
+#snake .toast { @apply tw:fixed tw:right-4 tw:bottom-4 tw:bg-panel2 tw:border tw:border-accent tw:px-3 tw:py-2 tw:rounded tw:z-[9999] tw:max-w-[80vw]; }
+#snake pre { @apply tw:bg-code tw:border tw:border-line tw:p-2 tw:overflow-auto tw:max-h-[360px] tw:whitespace-pre; font: 11px/1.4 var(--tw-font-mono); }
+
+@media (max-width: 640px) {
+  #snake { @apply tw:p-2; }
+  #snake th, #snake td { @apply tw:p-1; }
+}
+
+/* rule editor: a transparent textarea over a highlighted copy, with a gutter */
+#snake .redit { @apply tw:relative tw:border tw:border-line tw:rounded-[3px] tw:bg-code tw:overflow-hidden tw:resize-y tw:min-h-[120px]; }
+#snake .redit-gut, #snake .redit-hl, #snake .redit-ta { @apply tw:m-0 tw:py-1.5 tw:px-0 tw:box-border; font: 12px/18px var(--tw-font-mono); tab-size: 2; }
+#snake .redit-gut { @apply tw:absolute tw:left-0 tw:top-0 tw:bottom-0 tw:w-11 tw:overflow-hidden tw:text-right tw:bg-gutter tw:border-r tw:border-line tw:select-none; color: #6f858b; }
+#snake .redit-gut div { @apply tw:pr-1.5 tw:h-4.5; }
+#snake .redit-gut .g-err { @apply tw:text-white; background: #6d2323; }
+#snake .redit-gut .g-warn { @apply tw:text-white; background: #6b4a12; }
+#snake .redit-hl { @apply tw:absolute tw:left-11 tw:right-0 tw:top-0 tw:bottom-0 tw:overflow-hidden tw:whitespace-pre tw:px-2 tw:text-fg tw:pointer-events-none tw:bg-transparent tw:border-0 tw:max-h-none; }
+#snake .redit-hl div { @apply tw:h-4.5; }
+#snake .redit-hl .l-err { background: rgba(255, 107, 107, .18); text-decoration: underline wavy #ff6b6b; text-decoration-skip-ink: none; }
+#snake .redit-hl .l-warn { background: rgba(255, 183, 77, .14); }
+#snake textarea.redit-ta { @apply tw:absolute tw:left-11 tw:right-0 tw:top-0 tw:bottom-0 tw:h-full tw:min-h-0 tw:resize-none tw:border-0 tw:rounded-none tw:bg-transparent tw:text-transparent tw:px-2 tw:whitespace-pre tw:overflow-auto tw:outline-none; width: calc(100% - 44px); caret-color: var(--tw-color-fg); }
+#snake textarea.redit-ta::selection { background: rgba(100, 181, 246, .35); color: transparent; }
+#snake textarea.redit-ta::placeholder { color: #5d7177; }
+#snake .redit-status { @apply tw:mt-1; }
+#snake .redit-issue { @apply tw:cursor-pointer; }
+#snake .redit-issue:hover { @apply tw:underline; }
+/* rule syntax highlighting */
+#snake .t-com { @apply tw:italic; color: #7f9499; }
+#snake .t-dir { color: #c792ea; }
+#snake .t-str { color: #c3e88d; }
+#snake .t-kw { color: #82aaff; }
+#snake .t-num { color: #f78c6c; }
+#snake .t-neg, #snake .t-drop { @apply tw:text-bad tw:font-bold; }
+#snake .t-re { color: #ffcb6b; }
+#snake .t-op { @apply tw:font-bold; color: #89ddff; }
+#snake .t-wild { @apply tw:font-bold; color: #ff9cac; }
+#snake .t-dom { @apply tw:text-fg; }

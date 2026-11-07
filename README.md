@@ -789,15 +789,35 @@ hand and run `snake reload`. See `testdata/config.json` for an example.
 ## Development
 
 Building needs Go 1.26 or newer (with the default `GOTOOLCHAIN=auto`, an
-older `go` downloads it).
+older `go` downloads it) and, for the web UI, Node.js 22.
+
+The web UI is an [Astro](https://astro.build) + [Tailwind CSS](https://tailwindcss.com)
+project in `web/`:
+
+* `web/src/pages/index.astro`: the page shell;
+* `web/src/scripts/app.js`: the app, which renders the UI from the daemon's
+  JSON API;
+* `web/src/styles/global.css`: Tailwind theme and the UI's component
+  classes. Utilities are prefixed (`tw:mt-2`, `tw:text-warn`) and there is no
+  preflight reset, because the same CSS runs inside the router's own WebUI
+  page.
+
+`make web` builds it to a static page in `internal/webui/build/site` (not
+committed), which the Go binary embeds. Its CSS and JS are inlined into the
+standalone page and into the router's Addons page, which must be a single
+file. `make arm64`, `make armv7` and `make test` build the UI first. A plain
+`go build` without it still works; the binary then shows a "web UI not built"
+notice instead of the UI.
 
 Releases are built by GitHub Actions: push a tag like `v1.2.3` and
-`.github/workflows/release.yml` tests, builds `snake-arm64` and `snake-armv7`,
-and publishes them with `SHA256SUMS` as a GitHub release. Every push also runs
-tests and builds (`ci.yml`).
+`.github/workflows/release.yml` builds the web UI, tests, builds `snake-arm64`
+and `snake-armv7`, and publishes them with `SHA256SUMS` as a GitHub release.
+Every push also builds the UI, runs tests and builds (`ci.yml`), and uploads
+the binaries and the static page as artifacts.
 
 ```
-make test          # unit tests
-make integration   # real iptables/ipset/ip in a throwaway netns (root)
+make web           # build the web UI (npm ci when web/package-lock.json changed)
+make test          # web UI + unit tests (fails if the UI is missing)
+make integration   # real iptables/ipset/ip and OpenVPN in a throwaway netns (root)
 make ui-dev        # UI against a fake engine at http://127.0.0.1:18444 (token "testtoken")
 ```

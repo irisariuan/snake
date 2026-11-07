@@ -17,8 +17,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go vet ./...
-      - run: go test ./...
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build web UI (Astro + Tailwind → static page)
+        run: make web
+      - run: make test
       - name: Integration test (real iptables/ipset in a netns)
         run: |
           sudo apt-get install -y ipset conntrack python3 dnsmasq-base

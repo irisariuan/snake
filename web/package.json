@@ -1,0 +1,16 @@
+{
+  "name": "snake-webui",
+  "private": true,
+  "type": "module",
+  "description": "snake's web UI: built to a static page that the Go binary embeds",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "check": "node --check src/scripts/app.js"
+  },
+  "dependencies": {
+    "@tailwindcss/vite": "4.3.3",
+    "astro": "7.4.2",
+    "tailwindcss": "4.3.3"
+  }
+}

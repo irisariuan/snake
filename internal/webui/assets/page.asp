@@ -61,6 +61,6 @@ function initial() { show_menu(); }
 </tr>
 </table>
 <div id="footer"></div>
-<script>{{JS}}</script>
+<script type="module">{{JS}}</script>
 </body>
 </html>
