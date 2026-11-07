@@ -28,6 +28,7 @@ import (
 	"github.com/irisariuan/snake/internal/logx"
 	"github.com/irisariuan/snake/internal/match"
 	"github.com/irisariuan/snake/internal/netfilter"
+	"github.com/irisariuan/snake/internal/openvpn"
 	"github.com/irisariuan/snake/internal/routing"
 	"github.com/irisariuan/snake/internal/sniproxy"
 	"github.com/irisariuan/snake/internal/system"
@@ -115,6 +116,7 @@ type Engine struct {
 	fwd         dnsfwd.Manager     // DoT/DoH forwarders for resolve-via-tunnel
 	sni         *sniproxy.Proxy    // transparent SNI proxy (sniff_sni)
 	wg          *wireguard.Manager // snake's own WireGuard tunnels (wgx1...)
+	ovpn        *openvpn.Manager   // snake's own OpenVPN clients (ovx1...)
 	sniErr      string             // why the SNI proxy is not running
 	asnCache    *asn.Cache
 	active      map[int]string
@@ -144,6 +146,7 @@ func New(p Paths, r system.Runner) *Engine {
 		dns:       &dnsinspect.Inspector{IPSet: netfilter.IPSet{R: r}},
 		sni:       &sniproxy.Proxy{Sets: netfilter.IPSet{R: r}},
 		wg:        NewWireGuard(r),
+		ovpn:      NewOpenVPN(r),
 		active:    map[int]string{},
 		cands:     map[int][]Candidate{},
 		asnErrors: map[int]string{},
@@ -291,18 +294,11 @@ func (e *Engine) ipset() netfilter.IPSet {
 	return netfilter.IPSet{R: e.R, NL: e.nl}
 }
 
-// usedTunnels lists the tunnels that are monitored: those referenced by
-// enabled policies, and snake's own enabled WireGuard tunnels (so a new
-// one shows its health before a policy uses it).
+// usedTunnels lists tunnels referenced by enabled policies: they are
+// monitored, and snake's own among them are running.
 func usedTunnels(c *config.Config) []string {
 	seen := map[string]bool{}
 	var out []string
-	for _, w := range c.WireGuard {
-		if w.Enabled && !seen[w.ID] {
-			seen[w.ID] = true
-			out = append(out, w.ID)
-		}
-	}
 	for _, p := range c.Policies {
 		if !p.Enabled {
 			continue
@@ -479,11 +475,9 @@ func (e *Engine) Apply(reason string) error {
 	rt := routing.Manager{R: e.R}
 	var errs []string
 
-	// 0. snake's own WireGuard interfaces: the routes below point at them.
+	// 0. snake's own tunnels that policies use: the routes below point at them.
 	if !e.DryRun {
-		if err := e.wg.Sync(wireGuardTunnels(cfg)); err != nil {
-			errs = append(errs, err.Error())
-		}
+		errs = append(errs, e.syncSnakeTunnels(cfg)...)
 	}
 
 	// 1. ipsets

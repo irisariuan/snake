@@ -18,9 +18,11 @@ test:
 	go vet ./...
 	go test ./...
 
-# Applies real rules in a throwaway network namespace (root, needs ipset + iproute2).
+# Applies real rules and runs a real OpenVPN client in a throwaway network
+# namespace (root, needs ipset + iproute2; openvpn + openssl for the client).
 integration:
 	SNAKE_INTEGRATION=1 unshare -n go test -count=1 -tags integration ./internal/engine -run Integration -v
+	SNAKE_INTEGRATION=1 unshare -n go test -count=1 -tags integration ./internal/openvpn -run Integration -v  # needs openvpn, openssl
 
 # Serves the UI with a fake engine on http://127.0.0.1:18444 (token: testtoken).
 ui-dev:

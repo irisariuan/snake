@@ -755,7 +755,8 @@ func install() error {
 
 func uninstall(purge bool) error {
 	_ = stop(true)
-	engine.NewWireGuard(system.Exec{}).RemoveAll() // snake's own WireGuard interfaces
+	engine.NewWireGuard(system.Exec{}).RemoveAll() // snake's own tunnels
+	engine.NewOpenVPN(system.Exec{}).StopAll()
 	for _, h := range hookFiles() {
 		removeHook(h)
 	}

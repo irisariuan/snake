@@ -19,7 +19,7 @@
 #snake button.pri{background:#8a6d00;border-color:var(--accent);color:#fff}
 #snake button.danger{border-color:var(--bad);color:#ffd0d0}
 #snake button:disabled{opacity:.5;cursor:default}
-#snake input[type=text],#snake input[type=number],#snake select,#snake textarea{background:#222d30;color:var(--fg);border:1px solid var(--line);border-radius:3px;padding:5px 7px;font:12px/1.4 Menlo,Consolas,monospace;max-width:100%}
+#snake input[type=text],#snake input[type=password],#snake input[type=number],#snake select,#snake textarea{background:#222d30;color:var(--fg);border:1px solid var(--line);border-radius:3px;padding:5px 7px;font:12px/1.4 Menlo,Consolas,monospace;max-width:100%}
 #snake textarea{width:100%;min-height:90px;resize:vertical}
 #snake .card>select{width:100%}
 #snake label.f{display:block;margin:8px 0 3px;color:var(--muted);font-size:12px}

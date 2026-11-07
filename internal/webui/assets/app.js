@@ -4,7 +4,7 @@
   'use strict';
   var CTX = window.SNAKE_CTX || {};
   var TUNNELS = ['wgc1', 'wgc2', 'wgc3', 'wgc4', 'wgc5', 'ovpnc1', 'ovpnc2', 'ovpnc3', 'ovpnc4', 'ovpnc5'];
-  var MAX_WG = 20; // snake's own WireGuard tunnels: wgx1 ... wgx20
+  var MAX_WG = 20, MAX_OVPN = 20; // snake's saved tunnels: wgx1-20, ovx1-20
   var state = { tab: 'status', cfg: null, dirty: false, status: null, clients: [], edit: null, error: '' };
   var root;
 
@@ -90,7 +90,7 @@
   // ---------- data ----------
   function fixCfg(c) {
     c.policies = c.policies || []; c.groups = c.groups || []; c.devices = c.devices || []; c.rule_lists = c.rule_lists || [];
-    c.wireguard = c.wireguard || [];
+    c.wireguard = c.wireguard || []; c.openvpn = c.openvpn || [];
     c.rule_lists.forEach(function (l) { ['domains', 'asns', 'cidrs'].forEach(function (k) { l[k] = l[k] || []; }); });
     c.policies.forEach(function (p) {
       ['tunnels', 'domains', 'asns', 'cidrs', 'devices', 'lists'].forEach(function (k) { p[k] = p[k] || []; });
@@ -184,56 +184,86 @@
   }
 
   // ---------- tunnels ----------
+  // snake's own tunnels are saved configurations: one runs only while an
+  // enabled policy lists it (main tunnel or failover backup).
+  var KINDS = {
+    wireguard: { prefix: 'wgx', max: MAX_WG, label: 'WireGuard', file: '.conf', placeholder: '[Interface]\nPrivateKey = …\nAddress = 10.2.0.2/32, fd00::2/128\n\n[Peer]\nPublicKey = …\nEndpoint = vpn.example.com:51820\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25' },
+    openvpn: { prefix: 'ovx', max: MAX_OVPN, label: 'OpenVPN', file: '.ovpn', placeholder: 'client\ndev tun\nproto udp\nremote nl1.example.net 1194\nauth-user-pass\n<ca>\n-----BEGIN CERTIFICATE-----\n…\n</ca>' }
+  };
   function isWG(t) { return t.indexOf('wgc') === 0 || /^wgx\d+$/.test(t); }
-  function wgTunnel(t) { return ((state.cfg && state.cfg.wireguard) || []).filter(function (w) { return w.id === t; })[0]; }
-  function tunLabel(t) { var w = wgTunnel(t); return w && w.name ? t + ' (' + w.name + ')' : t; }
-  function allTunnels() { return TUNNELS.concat(((state.cfg && state.cfg.wireguard) || []).map(function (w) { return w.id; })); }
-  function nextWGId() {
-    var used = {};
-    state.cfg.wireguard.forEach(function (w) { used[w.id] = true; });
-    for (var n = 1; n <= MAX_WG; n++) if (!used['wgx' + n]) return 'wgx' + n;
+  function snakeTunnel(t) {
+    var c = state.cfg || {};
+    return (c.wireguard || []).concat(c.openvpn || []).filter(function (w) { return w.id === t; })[0];
+  }
+  function tunLabel(t) { var w = snakeTunnel(t); return w && w.name ? t + ' (' + w.name + ')' : t; }
+  function allTunnels() {
+    var c = state.cfg || {};
+    return TUNNELS.concat((c.wireguard || []).concat(c.openvpn || []).map(function (w) { return w.id; }));
+  }
+  function nextId(kind) {
+    var k = KINDS[kind], used = {};
+    state.cfg[kind].forEach(function (w) { used[w.id] = true; });
+    for (var n = 1; n <= k.max; n++) if (!used[k.prefix + n]) return k.prefix + n;
     return '';
   }
-  function wgUsers(id) { return state.cfg.policies.filter(function (p) { return p.tunnels.indexOf(id) >= 0; }).map(function (p) { return p.name; }); }
-  var WG_PLACEHOLDER = '[Interface]\nPrivateKey = …\nAddress = 10.2.0.2/32, fd00::2/128\n\n[Peer]\nPublicKey = …\nEndpoint = vpn.example.com:51820\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25';
+  function tunUsers(id, enabledOnly) {
+    return state.cfg.policies.filter(function (p) { return p.tunnels.indexOf(id) >= 0 && (!enabledOnly || p.enabled); }).map(function (p) { return p.name; });
+  }
   function viewTunnels(b) {
-    var cfg = state.cfg, st = state.status || {};
+    var cfg = state.cfg;
     b.appendChild(el('h3', null, 'Router VPN clients'));
-    b.appendChild(el('p', { class: 'muted small' }, 'wgc1-5 (WireGuard) and ovpnc1-5 (OpenVPN) are the firmware\'s VPN clients: set them up in VPN → VPN Client, with "Redirect Internet traffic through tunnel" set to "VPN Director" and no VPN Director rules. The firmware has no more than these ten.'));
-    b.appendChild(el('h3', null, 'snake WireGuard tunnels (' + cfg.wireguard.length + ' of ' + MAX_WG + ')'));
-    b.appendChild(el('p', { class: 'muted small' }, 'For more VPNs than the firmware allows: paste the WireGuard configuration file your VPN provider gives you (the same file you would import into a WireGuard app). snake creates the interface, keeps it up and checks its health; use it in policies like a router VPN client. snake routes traffic itself, so the file\'s DNS line is ignored (each policy chooses its resolver) and AllowedIPs only limits what the tunnel accepts: keep 0.0.0.0/0, ::/0. Changes take effect on "Save & apply".'));
-    cfg.wireguard.forEach(function (w, i) {
+    b.appendChild(el('p', { class: 'muted small' }, 'wgc1-5 (WireGuard) and ovpnc1-5 (OpenVPN) are the firmware\'s VPN clients: set them up in VPN → VPN Client, with "Redirect Internet traffic through tunnel" set to "VPN Director" and no VPN Director rules. The firmware has no more than these ten, and snake never starts or stops them.'));
+    b.appendChild(el('h3', null, 'Saved tunnels'));
+    b.appendChild(el('p', { class: 'muted small' }, 'More VPNs than the firmware allows, from the files your VPN provider gives you for its WireGuard or OpenVPN apps. ' +
+      'A saved tunnel runs only while an enabled policy uses it (as its main tunnel or a failover backup); the others stay stopped. ' +
+      'snake routes traffic itself: the file\'s routes and DNS settings are ignored (each policy chooses its resolver) and its scripts are not run. Changes take effect on "Save & apply".'));
+    tunnelSection(b, 'wireguard');
+    tunnelSection(b, 'openvpn');
+  }
+  function tunnelSection(b, kind) {
+    var k = KINDS[kind], list = state.cfg[kind], st = state.status || {};
+    b.appendChild(el('h3', null, k.label + ' (' + list.length + ' of ' + k.max + ')'));
+    if (kind === 'wireguard') b.appendChild(el('p', { class: 'muted small' }, 'Keep AllowedIPs = 0.0.0.0/0, ::/0: it limits what the tunnel accepts. PersistentKeepalive defaults to 25 seconds.'));
+    else b.appendChild(el('p', { class: 'muted small' }, 'Certificates and keys must be inline (<ca>…</ca>, <tls-auth>…</tls-auth>), as in the files most providers hand out; only tun (routed) servers work.'));
+    list.forEach(function (w, i) {
       var h = st.tunnels && st.tunnels[w.id];
-      var users = wgUsers(w.id);
-      var ta = el('textarea', { style: 'min-height:170px', spellcheck: 'false', placeholder: WG_PLACEHOLDER, oninput: function (e) { w.conf = e.target.value; markDirty(); } }, w.conf || '');
+      var users = tunUsers(w.id), active = tunUsers(w.id, true);
+      var stateBadge = !w.enabled ? badge('disabled') : !active.length ? badge('stopped: no enabled policy uses it') : h ? tunnelBadge(h) : badge('starting');
+      var ta = el('textarea', { style: 'min-height:170px', spellcheck: 'false', placeholder: k.placeholder, oninput: function (e) { w.conf = e.target.value; markDirty(); } }, w.conf || '');
       b.appendChild(el('div', { class: 'card' },
         el('div', { class: 'row', style: 'justify-content:space-between' },
           el('span', { class: 'row' }, el('b', null, w.id),
             el('input', { type: 'text', value: w.name, placeholder: 'Name, e.g. Tokyo', size: 24, maxlength: 40, onchange: function (e) { w.name = e.target.value.trim(); markDirty(); } }),
             el('label', { class: 'chk' }, el('input', { type: 'checkbox', checked: w.enabled, onchange: function (e) { w.enabled = e.target.checked; markDirty(); render(); } }), el('span', null, 'Enabled'))),
-          !w.enabled ? badge('disabled') : h ? tunnelBadge(h) : badge('not running yet')),
-        el('div', { class: 'small muted', style: 'margin:4px 0' }, users.length ? 'Used by: ' + users.join(', ') : 'Not used by any policy yet: add it to a policy\'s tunnels.'),
-        h && w.enabled ? el('div', { class: 'small muted', style: 'margin:4px 0' }, 'Handshake ' + ago(h.handshake) + ' · exit ' + (h.exit_ip || '?') + ' ' + (h.country || '') + (h.has_ipv6 ? ' · IPv6' : '')) : null,
+          stateBadge),
+        el('div', { class: 'small muted', style: 'margin:4px 0' }, users.length ? 'Used by: ' + users.join(', ') + (active.length < users.length ? ' (disabled policies do not start it)' : '') : 'Saved, not used: add it to a policy\'s tunnels to start it.'),
+        h && w.enabled && active.length ? el('div', { class: 'small muted', style: 'margin:4px 0' }, (kind === 'wireguard' ? 'Handshake ' + ago(h.handshake) + ' · ' : '') + 'exit ' + (h.exit_ip || '?') + ' ' + (h.country || '') + (h.has_ipv6 ? ' · IPv6' : '')) : null,
+        kind === 'openvpn' ? el('div', { class: 'row', style: 'margin:6px 0' },
+          el('span', { class: 'small muted' }, 'Username'), el('input', { type: 'text', value: w.username || '', size: 20, autocomplete: 'off', onchange: function (e) { w.username = e.target.value.trim(); markDirty(); } }),
+          el('span', { class: 'small muted' }, 'Password'), el('input', { type: 'password', value: w.password || '', size: 20, autocomplete: 'new-password', onchange: function (e) { w.password = e.target.value; markDirty(); } }),
+          el('span', { class: 'small muted' }, 'for servers that ask for them (auth-user-pass)')) : null,
         ta,
         el('div', { class: 'row', style: 'margin-top:6px' },
-          btn('Load .conf file…', function () { pickFile(function (text, name) {
+          btn('Load ' + k.file + ' file…', function () { pickFile(function (text, name) {
             w.conf = text; ta.value = text;
-            if (!w.name && name) w.name = name.replace(/\.conf$/i, '').replace(/[^A-Za-z0-9 _.\-+]/g, ' ').trim().slice(0, 40);
+            if (!w.name && name) w.name = name.replace(/\.(conf|ovpn)$/i, '').replace(/[^A-Za-z0-9 _.\-+]/g, ' ').trim().slice(0, 40);
             markDirty(); render();
           }); }),
           btn('Delete', function () {
             if (users.length) { toast('Remove ' + w.id + ' from these policies first: ' + users.join(', ')); return; }
-            if (!confirm('Delete WireGuard tunnel ' + tunLabel(w.id) + '? Its interface is removed on "Save & apply".')) return;
-            cfg.wireguard.splice(i, 1); markDirty(); render();
+            if (!confirm('Delete ' + k.label + ' tunnel ' + tunLabel(w.id) + '?')) return;
+            list.splice(i, 1); markDirty(); render();
           }, 'danger'))));
     });
-    var id = nextWGId();
-    b.appendChild(el('div', { class: 'row' },
-      btn('+ Add WireGuard tunnel', function () {
+    var id = nextId(kind);
+    b.appendChild(el('div', { class: 'row', style: 'margin-bottom:10px' },
+      btn('+ Add ' + k.label + ' tunnel', function () {
         if (!id) return;
-        cfg.wireguard.push({ id: id, name: '', enabled: true, conf: '' }); markDirty(); render();
+        var t = { id: id, name: '', enabled: true, conf: '' };
+        if (kind === 'openvpn') { t.username = ''; t.password = ''; }
+        list.push(t); markDirty(); render();
       }, 'pri'),
-      !id ? el('span', { class: 'muted small' }, 'All ' + MAX_WG + ' slots are in use.') : null));
+      !id ? el('span', { class: 'muted small' }, 'All ' + k.max + ' slots are in use.') : null));
   }
 
   // ---------- status ----------
@@ -264,11 +294,11 @@
     b.appendChild(el('div', { class: 'grid' }, tn.map(function (k) {
       var t = s.tunnels[k];
       return el('div', { class: 'card' },
-        el('div', { class: 'row', style: 'justify-content:space-between' }, el('b', null, (wgTunnel(k) ? tunLabel(k) : k + ' (' + t.iface + ')')), tunnelBadge(t)),
+        el('div', { class: 'row', style: 'justify-content:space-between' }, el('b', null, (snakeTunnel(k) ? tunLabel(k) : k + ' (' + t.iface + ')')), tunnelBadge(t)),
         el('div', { class: 'kv', style: 'margin-top:6px' },
           el('span', null, 'Exit'), el('span', null, (t.exit_ip || '?') + ' ' + (t.country || '')),
           el('span', null, 'Probe'), el('span', null, t.probe_ok ? ('ok ' + (t.probe_rtt || '')) : ('failing (' + t.probe_fails + ')')),
-          isWG(k) ? [el('span', null, 'Handshake'), el('span', null, ago(t.handshake))] : [el('span', null, 'State'), el('span', null, t.client_state === '2' ? 'connected' : (t.client_state || '?'))],
+          isWG(k) ? [el('span', null, 'Handshake'), el('span', null, ago(t.handshake))] : k.indexOf('ovpnc') === 0 ? [el('span', null, 'State'), el('span', null, t.client_state === '2' ? 'connected' : (t.client_state || '?'))] : null,
           el('span', null, 'IPv6'), el('span', null, t.has_ipv6 ? 'yes' : 'no'),
           el('span', null, 'Geo'), el('span', null, t.geo_error ? t.geo_error : ago(t.geo_checked))));
     })));
@@ -664,7 +694,7 @@
       if (!p.tunnels.length) tunBox.appendChild(el('li', { class: 'muted' }, 'Add at least one tunnel. Extra tunnels are failover backups, in order.'));
     }
     drawTunnels();
-    var tunSel = el('select', null, allTunnels().map(function (t) { var w = wgTunnel(t); return el('option', { value: t }, tunLabel(t) + (w && !w.enabled ? ' (disabled)' : '')); }));
+    var tunSel = el('select', null, allTunnels().map(function (t) { var w = snakeTunnel(t); return el('option', { value: t }, tunLabel(t) + (w && !w.enabled ? ' (disabled)' : '')); }));
 
     var devSel = el('select', { multiple: true, size: 8, style: 'width:100%' },
       (state.cfg.groups || []).map(function (g) { var v = 'group:' + g.name; return el('option', { value: v, selected: p.devices.indexOf(v) >= 0 }, 'Group: ' + g.name); }),
@@ -695,7 +725,7 @@
         chk(p, 'enabled', 'Enabled'),
         el('label', { class: 'f' }, 'Tunnels (priority order)'), tunBox,
         el('div', { class: 'row' }, tunSel, btn('Add tunnel', function () { if (p.tunnels.indexOf(tunSel.value) < 0) p.tunnels.push(tunSel.value); drawTunnels(); })),
-        el('div', { class: 'small muted' }, 'Need more than the router\'s ten VPN clients? Add WireGuard tunnels in the Tunnels tab.'),
+        el('div', { class: 'small muted' }, 'Need more than the router\'s ten VPN clients? Save WireGuard or OpenVPN configurations in the Tunnels tab; they run only while a policy uses them.'),
         chk(p, 'kill_switch', 'Kill switch', 'When no tunnel is healthy, block this traffic instead of sending it via WAN.'),
         el('label', { class: 'f' }, 'Expected exit country (ISO code, optional)'),
         el('input', { type: 'text', value: p.expected_country, maxlength: 2, size: 4, placeholder: 'US', oninput: function (e) { p.expected_country = e.target.value.toUpperCase(); } }),

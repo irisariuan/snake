@@ -31,6 +31,9 @@ func TestWireGuardSlots(t *testing.T) {
 	for n := 1; n <= MaxWireGuard; n++ {
 		all = append(all, WireGuardName(n))
 	}
+	for n := 1; n <= MaxOpenVPN; n++ {
+		all = append(all, OpenVPNName(n))
+	}
 	idx := map[int]bool{}
 	for _, tn := range all {
 		m := s.ProbeMark(tn)
@@ -70,7 +73,7 @@ func TestWireGuardConfig(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected errors")
 	}
-	for _, s := range []string{`tunnel "wgx3" is not set up`, `duplicate wireguard tunnel "wgx2"`, "needs a PrivateKey", `"wgx99" invalid`} {
+	for _, s := range []string{`tunnel "wgx3" is not set up`, `duplicate WireGuard tunnel "wgx2"`, "needs a PrivateKey", `"wgx99" invalid`} {
 		if !strings.Contains(err.Error(), s) {
 			t.Errorf("missing %q in %v", s, err)
 		}
@@ -99,5 +102,34 @@ func TestWireGuardNeedsMarkBits(t *testing.T) {
 	c.Normalize()
 	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "too few bits") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestOpenVPNConfig(t *testing.T) {
+	c := load(t)
+	ovpn := "client\nremote vpn.example.net 1194\nauth-user-pass\n<ca>\nX\n</ca>\n"
+	c.OpenVPN = []OpenVPN{{Name: "Paris", Enabled: true, Conf: ovpn, Username: " me ", Password: "pw"}}
+	c.Policies[0].Tunnels = []string{"ovx1", "wgc1"}
+	c.Normalize()
+	if o := c.OpenVPN[0]; o.ID != "ovx1" || o.Username != "me" {
+		t.Fatalf("normalize: %+v", o)
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if TunnelIndex("ovx1") != 31 || TunnelIndex("ovx20") != 50 || TunnelIndex("ovx21") != 0 || c.TunnelLabel("ovx1") != "ovx1 (Paris)" {
+		t.Fatal("slots")
+	}
+	c.OpenVPN[0].Username = ""
+	c.OpenVPN = append(c.OpenVPN, OpenVPN{ID: "ovx2", Conf: "client\nremote a\nca ca.crt\n"})
+	c.Policies[0].Tunnels = []string{"ovx3"}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected errors")
+	}
+	for _, s := range []string{"OpenVPN ovx1: the server asks for a username", "OpenVPN ovx2: line 3: ca refers to the file", `tunnel "ovx3" is not set up`} {
+		if !strings.Contains(err.Error(), s) {
+			t.Errorf("missing %q in %v", s, err)
+		}
 	}
 }

@@ -27,6 +27,9 @@ func TestUIHarness(t *testing.T) {
 	c.ApplyDefaults()
 	// snake's own WireGuard tunnel (dummy keys).
 	c.WireGuard = []config.WireGuard{{ID: "wgx1", Name: "Tokyo", Enabled: true, Conf: "[Interface]\nPrivateKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nAddress = 10.64.1.2/32\nDNS = 10.64.0.1\n\n[Peer]\nPublicKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=\nEndpoint = jp-tyo.example.net:51820\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n"}}
+	c.OpenVPN = []config.OpenVPN{{ID: "ovx1", Name: "Paris", Enabled: true, Username: "alice", Password: "pw",
+		Conf: "client\ndev tun\nproto udp\nremote fr1.example.net 1194\nauth-user-pass\n<ca>\n-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n</ca>\n"}}
+	c.Policies[0].Tunnels = append(c.Policies[0].Tunnels, "ovx1")
 	c.Normalize()
 	_ = config.Save(filepath.Join(dir, "config.json"), &c)
 	rec := &system.Recorder{Responses: map[string]string{"nvram get wan0_ipaddr": "198.51.100.20",
@@ -47,6 +50,7 @@ func TestUIHarness(t *testing.T) {
 	e.DetectCaps()
 	e.Monitor().Set(health.Status{Tunnel: "wgc1", Iface: "wgc1", Exists: true, Up: true, LinkOK: true, ProbeOK: true, Healthy: true, ExitIP: "203.0.113.9", Country: "US", ProbeRTT: "38ms", Handshake: time.Now().Add(-40 * time.Second), GeoChecked: time.Now()})
 	e.Monitor().Set(health.Status{Tunnel: "wgx1", Iface: "wgx1", Exists: true, Up: true, LinkOK: true, ProbeOK: true, Healthy: true, ExitIP: "198.51.100.61", Country: "JP", ProbeRTT: "121ms", Handshake: time.Now().Add(-70 * time.Second), GeoChecked: time.Now()})
+	e.Monitor().Set(health.Status{Tunnel: "ovx1", Iface: "ovx1", Exists: true, Up: true, LinkOK: true, ProbeOK: true, Healthy: true, ExitIP: "192.0.2.80", Country: "FR", ProbeRTT: "30ms", GeoChecked: time.Now()})
 	e.Monitor().Set(health.Status{Tunnel: "ovpnc2", Iface: "tun12", Exists: true, Reason: "interface down"})
 	e.Monitor().Set(health.Status{Tunnel: "wgc2", Iface: "wgc2", Exists: true, Up: true, LinkOK: true, ProbeOK: true, Healthy: true, ExitIP: "192.0.2.44", Country: "GB"})
 	e.Decide()

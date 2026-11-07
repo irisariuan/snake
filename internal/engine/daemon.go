@@ -95,6 +95,9 @@ func (e *Engine) Run(ctx context.Context) error {
 // when needed.
 func (e *Engine) checkHealth(geo bool) {
 	cfg := e.runtime()
+	if !e.DryRun && !e.Disabled() {
+		e.restartOpenVPN(cfg) // clients that exited (server down, network change)
+	}
 	tunnels := usedTunnels(cfg)
 	e.mon.Prune(tunnels)
 	var wg sync.WaitGroup

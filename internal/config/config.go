@@ -15,7 +15,6 @@ import (
 	"strings"
 
 	"github.com/irisariuan/snake/internal/match"
-	"github.com/irisariuan/snake/internal/wireguard"
 )
 
 // Tunnel names supported by Asuswrt-Merlin.
@@ -32,22 +31,40 @@ const WireGuardPrefix = "wgx"
 // MaxWireGuard is the number of WireGuard tunnels snake can run itself.
 const MaxWireGuard = 20
 
+// OpenVPNPrefix names the OpenVPN clients snake runs itself: ovx1 ...
+// ovx<MaxOpenVPN>, also the interface name.
+const OpenVPNPrefix = "ovx"
+
+// MaxOpenVPN is the number of OpenVPN clients snake can run itself.
+const MaxOpenVPN = 20
+
 // MaxTunnels is the number of tunnel slots (firmware clients + snake's
-// own WireGuard tunnels): probe marks, probe tables and rule priorities
-// are reserved for each.
-var MaxTunnels = len(TunnelNames) + MaxWireGuard
+// own WireGuard and OpenVPN tunnels): probe marks, probe tables and rule
+// priorities are reserved for each.
+var MaxTunnels = len(TunnelNames) + MaxWireGuard + MaxOpenVPN
 
 // WireGuardName returns the tunnel name of snake's own WireGuard slot n.
 func WireGuardName(n int) string { return WireGuardPrefix + strconv.Itoa(n) }
 
 // WireGuardSlot returns n for "wgx<n>", or 0.
-func WireGuardSlot(name string) int {
-	if !strings.HasPrefix(name, WireGuardPrefix) {
+func WireGuardSlot(name string) int { return slot(name, WireGuardPrefix, MaxWireGuard) }
+
+// OpenVPNName returns the tunnel name of snake's own OpenVPN slot n.
+func OpenVPNName(n int) string { return OpenVPNPrefix + strconv.Itoa(n) }
+
+// OpenVPNSlot returns n for "ovx<n>", or 0.
+func OpenVPNSlot(name string) int { return slot(name, OpenVPNPrefix, MaxOpenVPN) }
+
+// SnakeTunnel reports whether snake runs the tunnel itself (wgx, ovx).
+func SnakeTunnel(name string) bool { return WireGuardSlot(name) > 0 || OpenVPNSlot(name) > 0 }
+
+func slot(name, prefix string, max int) int {
+	if !strings.HasPrefix(name, prefix) {
 		return 0
 	}
-	d := strings.TrimPrefix(name, WireGuardPrefix)
+	d := strings.TrimPrefix(name, prefix)
 	n, err := strconv.Atoi(d)
-	if err != nil || n < 1 || n > MaxWireGuard || strconv.Itoa(n) != d {
+	if err != nil || n < 1 || n > max || strconv.Itoa(n) != d {
 		return 0
 	}
 	return n
@@ -59,7 +76,8 @@ func IsWireGuard(name string) bool {
 }
 
 // TunnelIndex returns a stable 1-based index for a tunnel name, or 0.
-// Firmware clients are 1-10, snake's WireGuard tunnels 11-30.
+// Firmware clients are 1-10, snake's WireGuard tunnels 11-30, its
+// OpenVPN clients 31-50.
 func TunnelIndex(name string) int {
 	for i, n := range TunnelNames {
 		if n == name {
@@ -68,6 +86,9 @@ func TunnelIndex(name string) int {
 	}
 	if n := WireGuardSlot(name); n > 0 {
 		return len(TunnelNames) + n
+	}
+	if n := OpenVPNSlot(name); n > 0 {
+		return len(TunnelNames) + MaxWireGuard + n
 	}
 	return 0
 }
@@ -396,6 +417,8 @@ type Config struct {
 	// WireGuard are tunnels snake creates and runs itself (wgx1...),
 	// for more VPNs than the firmware's ten clients.
 	WireGuard []WireGuard `json:"wireguard"`
+	// OpenVPN are OpenVPN clients snake runs itself (ovx1...).
+	OpenVPN []OpenVPN `json:"openvpn"`
 
 	migratedMask uint32 // set by Load, see MigratedMarkMask
 }
@@ -603,8 +626,8 @@ func (s Settings) PolicyMark(id int) uint32 {
 
 // ProbeMark returns the fwmark used by health probes for a tunnel. Probe marks
 // occupy the top of the mark range so they never collide with policy ids:
-// the firmware clients the top ten values, snake's own WireGuard tunnels
-// the values below them.
+// the firmware clients the top ten values, snake's own tunnels the values
+// below them.
 func (s Settings) ProbeMark(tunnel string) uint32 {
 	return s.probeValue(TunnelIndex(tunnel)) << s.MarkShift() & s.MarkMask
 }
@@ -765,10 +788,7 @@ func (c *Config) Normalize() {
 	if c.Groups == nil {
 		c.Groups = []Group{}
 	}
-	if c.WireGuard == nil {
-		c.WireGuard = []WireGuard{}
-	}
-	c.normalizeWireGuard()
+	c.normalizeSnakeTunnels()
 	if c.Devices == nil {
 		c.Devices = []Device{}
 	}
@@ -900,32 +920,7 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
-	wgIDs := map[string]bool{}
-	for _, w := range c.WireGuard {
-		pre := "wireguard " + w.ID + ": "
-		n := WireGuardSlot(w.ID)
-		if w.ID == "" {
-			add("at most %d WireGuard tunnels", MaxWireGuard)
-			continue
-		}
-		if n == 0 {
-			add("wireguard tunnel id %q invalid (%s1-%s%d)", w.ID, WireGuardPrefix, WireGuardPrefix, MaxWireGuard)
-			continue
-		}
-		if wgIDs[w.ID] {
-			add("duplicate wireguard tunnel %q", w.ID)
-		}
-		wgIDs[w.ID] = true
-		if w.Name != "" && !nameRe.MatchString(w.Name) {
-			add(pre+"name %q invalid (1-40 chars: letters, digits, space, _.-+)", w.Name)
-		}
-		if _, err := wireguard.Parse(w.Conf); err != nil {
-			add(pre+"%v", err)
-		}
-		if s.probeValue(TunnelIndex(w.ID)) <= uint32(s.MaxPolicyID()) {
-			add(pre+"mark_mask has too few bits for snake's own WireGuard tunnels; use 0x%08x", DefaultMarkMask)
-		}
-	}
+	snakeIDs := c.validateSnakeTunnels(add)
 	names := map[string]bool{}
 	ids := map[int]bool{}
 	for _, p := range c.Policies {
@@ -951,7 +946,7 @@ func (c *Config) Validate() error {
 			switch {
 			case TunnelIndex(t) == 0:
 				add(pre+"unknown tunnel %q", t)
-			case WireGuardSlot(t) > 0 && !wgIDs[t]:
+			case SnakeTunnel(t) && !snakeIDs[t]:
 				add(pre+"tunnel %q is not set up (add it under Tunnels)", t)
 			}
 		}

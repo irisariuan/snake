@@ -34,8 +34,8 @@ Inspired by and able to import from Ranger802004's
 * Asuswrt-Merlin 386.x or newer (Addons API, `ipset`, `dnsmasq` with ipset support)
 * One or more VPN clients configured in *VPN → VPN Client* (WireGuard `wgc1-5`
   and/or OpenVPN `ovpnc1-5`; mixing types in one failover list is fine), and/or
-  up to 20 more WireGuard tunnels that snake runs itself
-  ([below](#more-than-ten-vpns-snakes-own-wireguard-tunnels))
+  saved WireGuard and OpenVPN configurations that snake runs itself
+  ([below](#more-than-ten-vpns-saved-tunnels))
 * JFFS custom scripts (the installer turns them on)
 
 In each VPN client you want snake to use, set **"Redirect Internet traffic
@@ -85,19 +85,32 @@ created an Addons menu, the page is under **Tools → snake**.
 Uninstall with `snake uninstall`. This removes rules, routes, sets, hooks and
 the page; add `--purge` to delete the config too.
 
-## More than ten VPNs: snake's own WireGuard tunnels
+## More than ten VPNs: saved tunnels
 
-The firmware has five WireGuard and five OpenVPN clients. For more, snake
-creates and runs up to 20 extra WireGuard tunnels itself, `wgx1`–`wgx20`, from
-the configuration files VPN providers hand out for WireGuard apps:
+The firmware has five WireGuard and five OpenVPN clients. For more, save the
+files VPN providers hand out for their WireGuard or OpenVPN apps in snake: up
+to 20 WireGuard tunnels (`wgx1`–`wgx20`) and 20 OpenVPN clients
+(`ovx1`–`ovx20`), which snake runs itself.
 
-1. Web UI → **Tunnels** → **+ Add WireGuard tunnel**.
-2. Paste the `.conf` file (or **Load .conf file…**), give it a name, and
-   **Save & apply**. snake creates the interface (named like the tunnel),
-   configures it with `wg`, and checks its health like a firmware client, even
-   before a policy uses it.
-3. Add it to a policy's tunnels. It can be mixed with `wgc`/`ovpnc` clients in
-   a failover list.
+**A saved tunnel runs only while an enabled policy uses it**, as its main
+tunnel or as a failover backup (backups are kept connected so failover is
+instant and their health is known). Saved tunnels no enabled policy lists
+stay stopped. snake never starts or stops the firmware's own clients.
+
+1. Web UI → **Tunnels** → **+ Add WireGuard tunnel** or **+ Add OpenVPN
+   tunnel**.
+2. Paste the file (or **Load .conf/.ovpn file…**), give it a name, and
+   **Save & apply**.
+3. Add it to a policy's tunnels. It can be mixed with `wgc`/`ovpnc` clients
+   in a failover list. On **Save & apply** snake starts it; it is used once
+   its health check passes, a few seconds later.
+
+Either way, snake routes traffic itself: the tunnel gets no routes of its
+own, and like a firmware client in VPN Director mode it carries only what
+snake's policies send into it. DNS settings in the files are ignored (each
+policy chooses its resolver) and their scripts are never run.
+
+### WireGuard
 
 ```ini
 [Interface]
@@ -116,20 +129,44 @@ PersistentKeepalive = 25
   `AllowedIPs` are required; `ListenPort`, `MTU` (default 1420),
   `PresharedKey` and `PersistentKeepalive` are optional. Keepalive defaults
   to 25 seconds: a tunnel only counts as healthy after a recent handshake,
-  and without keepalives an idle tunnel never handshakes. wg-quick's `Table`,
-  `FwMark`, `SaveConfig` and `PreUp`/`PostUp`/`PreDown`/`PostDown` are
-  accepted and ignored: no scripts are run.
-* The interface gets no routes of its own: like a firmware client in VPN
-  Director mode, it carries only what snake's policies send into it.
-* The config is kept in `config.json` (mode 0600) and the private key is
-  shown in the web UI, which needs the API token.
-* Changing a tunnel's peers reconfigures it with `wg syncconf`, which keeps
-  the session when it can. Disabling or deleting a tunnel removes its
-  interface on **Save & apply**; *Emergency disable* leaves the tunnels up but
-  sends no traffic into them. `snake uninstall` removes them.
-* Needs the firmware's WireGuard support (kernel module and `wg`, present
-  on any model that offers WireGuard clients) and the default 8-bit
-  `mark_mask`.
+  and without keepalives an idle tunnel never handshakes.
+* wg-quick's `Table`, `FwMark`, `SaveConfig` and
+  `PreUp`/`PostUp`/`PreDown`/`PostDown` are accepted and ignored.
+* snake creates the interface with `ip` and configures it with `wg`.
+  Changing a tunnel's peers reconfigures it with `wg syncconf`, which keeps
+  the session when it can.
+
+### OpenVPN
+
+* A client configuration (`client`, one or more `remote` lines) for a
+  routed (`dev tun`) server. Certificates and keys must be inline
+  (`<ca>…</ca>`, `<cert>`, `<key>`, `<tls-auth>`, `<tls-crypt>`), as in the
+  files most providers hand out: the router has no copy of separate files.
+* If the file has `auth-user-pass`, enter the username and password in the
+  fields next to it.
+* snake runs the router's `openvpn` with the provider's options plus its
+  own, which win: the interface (`dev ovxN`), `route-nopull` (pushed routes,
+  redirect-gateway and DNS are ignored), `script-security 1` (no scripts) and
+  `persist-tun`. Directives for routes, DNS, scripts, logging, management and
+  privileges are removed from the file. The client logs to the system log
+  as `snake-ovxN`.
+* Generated files, including the credentials, live in `/tmp/snake-openvpn`
+  (mode 0600; nothing is written to flash) and are removed when the client
+  stops. A client that exits (wrong password, server unreachable) is started
+  again at most every 30 seconds; changing its file or credentials
+  restarts it at once.
+
+### Notes
+
+* Saved tunnels are kept in `config.json` (mode 0600); private keys and
+  passwords are shown in the web UI, which needs the API token.
+* Disabling a saved tunnel, or deleting it, stops it on **Save & apply**.
+  *Emergency disable* leaves running tunnels up but sends no traffic into
+  them. Running tunnels stay up across snake restarts and updates.
+  `snake uninstall` stops them all.
+* Needs the firmware's WireGuard support (kernel module and `wg`) for
+  WireGuard and its `openvpn` for OpenVPN; both are on any model that offers
+  those VPN clients. Also needs the default 8-bit `mark_mask`.
 
 ## Policies
 
@@ -578,11 +615,13 @@ and `POST /api/learned/{policy}/forget`
 
 ## Failover
 
-Each tunnel used by an enabled policy, and each enabled snake WireGuard
-tunnel, is checked every `health_interval` seconds (default 15):
+Each tunnel used by an enabled policy is checked every `health_interval`
+seconds (default 15):
 
 * Interface exists and is up. For WireGuard, the latest handshake is newer than
-  `handshake_max_age`. For OpenVPN, `vpn_clientN_state` is 2 (connected).
+  `handshake_max_age`. For the firmware's OpenVPN clients,
+  `vpn_clientN_state` is 2 (connected); snake's own (`ovxN`) rely on the
+  probes below.
 * TCP connects to `probe_targets` **through the tunnel**. The sockets carry a
   per-tunnel probe fwmark routed by a table with an unreachable fallback, so a
   dead tunnel can never look healthy via WAN. After `probe_failures`
@@ -630,9 +669,10 @@ mangle OUTPUT SNAKE_DNSO: dnsmasq's UDP answers → NFQUEUE → DNS inspector �
   ownership. Overlapping custom connection masks are rejected even when
   QoS is off, so enabling it later does not invalidate the configuration.
   Other addons must not claim snake's documented masks, tables or priorities.
-* ip rule priorities 4980–5499, routing tables 1000–1330 (probe tables
-  1301–1310 for the firmware clients, 1311–1330 for `wgx1`–`wgx20`, whose
-  probe rules use priorities 5401–5420).
+* ip rule priorities 4980–5499, routing tables 1000–1350 (probe tables
+  1301–1310 for the firmware clients, 1311–1330 for `wgx1`–`wgx20` and
+  1331–1350 for `ovx1`–`ovx20`, whose probe rules use priorities
+  5401–5440).
 * All chains are loaded with `iptables-restore --noflush`, so each table is
   updated atomically. Chains of removed policies are deleted in the same
   transaction.
