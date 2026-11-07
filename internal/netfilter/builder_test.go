@@ -455,9 +455,9 @@ func TestSessionChain(t *testing.T) {
 	st[1].Excluded = []string{"aa:bb:cc:00:00:02"}
 	pairs := func(id int, v6 bool) [][2]string {
 		if v6 {
-			return [][2]string{{"fd00::23", "2001:db8::80"}}
+			return [][2]string{{"-s fd00::23", "2001:db8::80"}}
 		}
-		return [][2]string{{"192.168.50.23", "203.0.113.80"}, {"192.168.50.40", "198.51.100.9"}}
+		return [][2]string{{"-s 192.168.50.23", "203.0.113.80"}, {"-s 192.168.50.40", "198.51.100.9"}, {"", "198.51.100.10"}, {"-m mac --mac-source aa:bb:cc:00:00:31", "198.51.100.11"}}
 	}
 	plan := Build(c.Settings, st, Options{IPv6: true, IPv6NAT: true, SessionPairs: pairs})
 	m4, m6 := plan.Restore["4/mangle"], plan.Restore["6/mangle"]
@@ -465,6 +465,8 @@ func TestSessionChain(t *testing.T) {
 		":SNAKE_Q1 - [0:0]",
 		"-A SNAKE_Q1 -s 192.168.50.23 -d 203.0.113.80 -g SNAKE_M1",
 		"-A SNAKE_Q1 -s 192.168.50.40 -d 198.51.100.9 -g SNAKE_M1",
+		"-A SNAKE_Q1 -d 198.51.100.10 -g SNAKE_M1", // shared with every device
+		"-A SNAKE_Q1 -m mac --mac-source aa:bb:cc:00:00:31 -d 198.51.100.11 -g SNAKE_M1",
 		"-A SNAKE_P1 -j SNAKE_Q1",
 		"-A SNAKE_P2 -m mac --mac-source aa:bb:cc:00:00:01 -j SNAKE_Q2",
 	)

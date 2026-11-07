@@ -486,6 +486,9 @@ func (e *Engine) TestDomain(name string) DomainTest {
 			if mr.Opts.TTL > 0 {
 				ttl = mr.Opts.TTL
 			}
+			if len(mr.Opts.Share) > 0 {
+				res.Notes = append(res.Notes, "sessions are shared with: "+strings.Join(mr.Opts.Share, ", "))
+			}
 			if mr.Opts.OnLookup {
 				res.Notes = append(res.Notes, fmt.Sprintf("sessions last %s from the lookup (onlookup=1)", ttl))
 			}

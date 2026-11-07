@@ -573,10 +573,15 @@ renews it. After it ends, the device's next lookup starts a new one.
 |---|---|
 | `ttl=TIME` | this rule's session lifetime instead of `session_ttl`: seconds, or `90s`, `10m`, `1h` (10 s to 7 days) |
 | `onlookup=0\|1` | `0` (default): the TTL counts from the device's last connection to the address. `1`: it counts from the lookup that started the session; a new lookup renews it, open connections do not |
+| `share=VALUE` | also route the session for other devices; repeat it for a list (`share=A,share=B`). `global`: every device the policy covers; a **device group** name (`kids`, or `group:kids`); or a **device**: IP address, subnet or MAC. The shared copies start, renew and end with the session, and a live connection from a shared device (one given by address; `global` counts any device) keeps it alive |
+
+Options are separated by `;` or `,`.
 
 ```
 session[ttl=2m;onlookup=1]:**.example.org
 route[ttl=30m]:**.akamaized.net;if:netflix.com
+# the whole living room gets the CDN once one device starts Netflix
+route[share=living-room,share=10.6.0.2]:**.nflxvideo.net;if:netflix.com
 ```
 
 ### Conditional rules (`route:`, `if:`)

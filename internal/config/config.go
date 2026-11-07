@@ -995,6 +995,22 @@ func (c *Config) Validate() error {
 		for _, le := range compileErrs(p.Domains) {
 			add(pre+"rule %q: %s", le.Rule, le.Error)
 		}
+		// share= options name groups that must exist.
+		set := match.MustCompile(c.Expand(p).Domains)
+		var opts []match.Opts
+		for _, sp := range set.Session {
+			opts = append(opts, sp.Opts)
+		}
+		for _, r := range set.Routes {
+			opts = append(opts, r.Opts)
+		}
+		for _, o := range opts {
+			for _, sh := range o.Share {
+				if sh != match.ShareGlobal && !match.ShareDevice(sh) && !groups[sh] {
+					add(pre+"share=%s: no device group with that name", sh)
+				}
+			}
+		}
 		for _, n := range p.Lists {
 			if !lists[n] {
 				add(pre+"unknown rule list %q", n)

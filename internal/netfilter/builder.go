@@ -64,8 +64,9 @@ type Options struct {
 	// connections of sniffing policies' clients that no policy claimed are
 	// redirected to it. 0 installs no redirect (proxy not running).
 	SNIPort int
-	// SessionPairs returns the policy's current sessions in a family:
-	// [device, address] pairs routed for that device only.
+	// SessionPairs returns the policy's current session rules in a family:
+	// [source match ("-s IP", "-m mac --mac-source MAC", "" = any device
+	// of the policy), address].
 	SessionPairs func(id int, v6 bool) [][2]string
 	// LANAddr is the router's LAN IPv4 address. DNS hijacking on routed
 	// client interfaces (VPN servers) DNATs to it: dnsmasq may not listen
@@ -419,7 +420,11 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 			mangle.chain(qc)
 			if opt.SessionPairs != nil {
 				for _, pr := range opt.SessionPairs(id, v6) {
-					mangle.add(qc, "-s", pr[0], "-d", pr[1], "-g", mc)
+					if pr[0] == "" { // shared with every device of the policy
+						mangle.add(qc, "-d", pr[1], "-g", mc)
+					} else {
+						mangle.add(qc, pr[0], "-d", pr[1], "-g", mc)
+					}
 				}
 			}
 			if len(st.Clients) == 0 {

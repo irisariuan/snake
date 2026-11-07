@@ -61,6 +61,9 @@ type Session struct {
 	// from the last lookup instead of the last connection.
 	TTL      time.Duration `json:"ttl,omitempty"`
 	OnLookup bool          `json:"onlookup,omitempty"`
+	// Share: other devices the session is routed for (share= option):
+	// "global", group names, devices.
+	Share []string `json:"share,omitempty"`
 }
 
 func (se *Session) ttl(def time.Duration) time.Duration {
@@ -126,11 +129,15 @@ func (e *Engine) AddSessions(policy int, client string, addrs []string, source, 
 			}
 			if rule != "" {
 				se.Rule, se.Name, se.TTL, se.OnLookup = rule, name, opts.TTL, opts.OnLookup
+				if !sameStrings(se.Share, opts.Share) {
+					se.Share = append([]string(nil), opts.Share...)
+					added = true // the chain changes
+				}
 			}
 			continue
 		}
 		s.m[k] = &Session{Policy: policy, Client: client, Addr: k.Addr, Source: source, Rule: rule, Name: name, Created: now, Seen: now, Expires: exp,
-			TTL: opts.TTL, OnLookup: opts.OnLookup}
+			TTL: opts.TTL, OnLookup: opts.OnLookup, Share: append([]string(nil), opts.Share...)}
 		added = true
 	}
 	if added {
@@ -160,19 +167,125 @@ func (s *sessionStore) trim(policy int) {
 	}
 }
 
-// sessionPairs lists a policy's sessions in a family, in a stable order.
+// sessionPairs lists the rules of a policy's session chain in a family,
+// in a stable order: [source match, address]. The source match is the
+// device that started the session ("-s IP"), and the devices it is shared
+// with ("-s IP/subnet", "-m mac --mac-source MAC", or "" for every device
+// of the policy).
 func (e *Engine) sessionPairs(id int, v6 bool) [][2]string {
+	groups := e.groupMembers()
 	s := &e.sess
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	seen := map[[2]string]bool{}
 	var out [][2]string
-	for k := range s.m {
-		if k.Policy == id && isV6(k.Addr) == v6 {
-			out = append(out, [2]string{k.Client, k.Addr})
+	for k, se := range s.m {
+		if k.Policy != id || isV6(k.Addr) != v6 {
+			continue
+		}
+		for _, spec := range shareSpecs(se, v6, groups) {
+			pr := [2]string{spec, k.Addr}
+			if !seen[pr] {
+				seen[pr] = true
+				out = append(out, pr)
+			}
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i][0]+" "+out[i][1] < out[j][0]+" "+out[j][1] })
+	sort.Slice(out, func(i, j int) bool { return out[i][1]+" "+out[i][0] < out[j][1]+" "+out[j][0] })
 	return out
+}
+
+// shareSpecs lists the source matches of a session's chain rules.
+func shareSpecs(se *Session, v6 bool, groups map[string][]string) []string {
+	specs := []string{"-s " + se.Client}
+	var devices []string
+	for _, sh := range se.Share {
+		switch {
+		case sh == match.ShareGlobal:
+			return []string{""} // every device of the policy covers the rest
+		case match.ShareDevice(sh):
+			devices = append(devices, sh)
+		default:
+			devices = append(devices, groups[sh]...)
+		}
+	}
+	for _, d := range devices {
+		if hw, err := net.ParseMAC(d); err == nil && len(hw) == 6 {
+			specs = append(specs, "-m mac --mac-source "+hw.String())
+			continue
+		}
+		ip := net.ParseIP(d)
+		if ip == nil {
+			if pip, _, err := net.ParseCIDR(d); err == nil {
+				ip = pip
+			}
+		}
+		if ip != nil && (ip.To4() == nil) == v6 {
+			specs = append(specs, "-s "+d)
+		}
+	}
+	return specs
+}
+
+// groupMembers maps group names to their devices (current config).
+func (e *Engine) groupMembers() map[string][]string {
+	out := map[string][]string{}
+	if cfg := e.runtime(); cfg != nil {
+		for _, g := range cfg.Groups {
+			out[g.Name] = g.MACs
+		}
+	}
+	return out
+}
+
+// sharedLive reports whether a device the session is shared with (by
+// address) has a live connection to its address. Devices given by MAC are
+// not matched against the connection table.
+func sharedLive(se *Session, srcs []string, groups map[string][]string) bool {
+	var nets []string
+	for _, sh := range se.Share {
+		switch {
+		case sh == match.ShareGlobal:
+			return len(srcs) > 0
+		case match.ShareDevice(sh):
+			nets = append(nets, sh)
+		default:
+			nets = append(nets, groups[sh]...)
+		}
+	}
+	for _, n := range nets {
+		var pfx *net.IPNet
+		if ip := net.ParseIP(n); ip != nil {
+			bits := 32
+			if ip.To4() == nil {
+				bits = 128
+			}
+			pfx = &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}
+		} else if _, p, err := net.ParseCIDR(n); err == nil {
+			pfx = p
+		}
+		if pfx == nil {
+			continue
+		}
+		for _, src := range srcs {
+			if ip := net.ParseIP(src); ip != nil && pfx.Contains(ip) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Sessions lists the sessions of a policy (0: all), soonest to expire last.
@@ -226,7 +339,11 @@ func (e *Engine) writeSessionChains(ids ...int) error {
 			qc := netfilter.SessionChain(id)
 			b.WriteString(":" + qc + " - [0:0]\n")
 			for _, pr := range e.sessionPairs(id, v6) {
-				fmt.Fprintf(&b, "-A %s -s %s -d %s -g %s\n", qc, pr[0], pr[1], netfilter.MarkChain(id))
+				src := ""
+				if pr[0] != "" {
+					src = pr[0] + " "
+				}
+				fmt.Fprintf(&b, "-A %s %s-d %s -g %s\n", qc, src, pr[1], netfilter.MarkChain(id))
 			}
 			n++
 		}
@@ -267,20 +384,23 @@ func (e *Engine) refreshSessions(conntrack io.Reader, now time.Time) {
 		return
 	}
 	live := map[[2]string]bool{}
+	byDst := map[string][]string{}
 	if conntrack != nil {
 		sc := bufio.NewScanner(conntrack)
 		sc.Buffer(make([]byte, 64*1024), 64*1024)
 		for sc.Scan() {
 			if src, dst, ok := webrtc.LiveFlow(sc.Text()); ok {
 				live[[2]string{src, dst}] = true
+				byDst[dst] = append(byDst[dst], src)
 			}
 		}
 	}
+	groups := e.groupMembers()
 	def := e.sessionTTL()
 	changed := map[int]bool{}
 	s.mu.Lock()
 	for k, se := range s.m {
-		if live[[2]string{k.Client, k.Addr}] && !se.OnLookup {
+		if (live[[2]string{k.Client, k.Addr}] || (len(se.Share) > 0 && sharedLive(se, byDst[k.Addr], groups))) && !se.OnLookup {
 			se.Seen = now
 			if exp := now.Add(se.ttl(def)); exp.After(se.Expires) {
 				se.Expires = exp

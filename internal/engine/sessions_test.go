@@ -89,3 +89,62 @@ func TestSessions(t *testing.T) {
 		t.Fatalf("sessions of a policy without a session chain kept (%d)", n)
 	}
 }
+
+// share=: the session is also routed for other devices, and a connection
+// from one of them keeps it alive.
+func TestSessionShare(t *testing.T) {
+	e, rec := sessionEngine(t)
+	if _, err := e.UpdateConfig(func(c *config.Config) error {
+		c.Groups = []config.Group{{Name: "kids", MACs: []string{"aa:bb:cc:00:00:31", "192.168.50.31"}}}
+		c.Policies[0].Domains = []string{"session[share=kids;share=192.168.50.40]:**.akamaized.net"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r := e.domainSet(e.runtime().Policies[0]).MatchAny("a1.akamaized.net")
+	rec.Commands = nil
+	if err := e.AddSessions(1, "192.168.50.23", []string{"203.0.113.80"}, SessionRule, r.Rule, "a1.akamaized.net", r.Opts); err != nil {
+		t.Fatal(err)
+	}
+	w := strings.Join(chainWrites(rec), "\n")
+	for _, want := range []string{
+		"-A SNAKE_Q1 -s 192.168.50.23 -d 203.0.113.80 -g SNAKE_M1",
+		"-A SNAKE_Q1 -m mac --mac-source aa:bb:cc:00:00:31 -d 203.0.113.80 -g SNAKE_M1",
+		"-A SNAKE_Q1 -s 192.168.50.31 -d 203.0.113.80 -g SNAKE_M1",
+		"-A SNAKE_Q1 -s 192.168.50.40 -d 203.0.113.80 -g SNAKE_M1",
+	} {
+		if !strings.Contains(w, want) {
+			t.Errorf("missing %q in\n%s", want, w)
+		}
+	}
+	// A shared device's connection renews the session.
+	start := time.Now()
+	e.refreshSessions(strings.NewReader(conn("192.168.50.40", "203.0.113.80")), start.Add(50*time.Second))
+	e.refreshSessions(strings.NewReader(""), start.Add(100*time.Second))
+	if len(e.Sessions(1)) != 1 {
+		t.Fatal("shared device's connection did not keep the session")
+	}
+	// global: one rule for every device of the policy.
+	if err := e.AddSessions(1, "192.168.50.23", []string{"203.0.113.81"}, SessionRule, "r", "n", match.Opts{Share: []string{"global", "kids"}}); err != nil {
+		t.Fatal(err)
+	}
+	if pairs := e.sessionPairs(1, false); !containsPair(pairs, [2]string{"", "203.0.113.81"}) || containsPair(pairs, [2]string{"-s 192.168.50.23", "203.0.113.81"}) {
+		t.Fatalf("global share pairs %v", pairs)
+	}
+	// Unknown group: rejected by the config.
+	if _, err := e.UpdateConfig(func(c *config.Config) error {
+		c.Policies[0].Domains = []string{"session[share=nope]:x.example"}
+		return nil
+	}); err == nil || !strings.Contains(err.Error(), "share=nope: no device group") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func containsPair(ps [][2]string, p [2]string) bool {
+	for _, x := range ps {
+		if x == p {
+			return true
+		}
+	}
+	return false
+}

@@ -107,6 +107,17 @@ while True:
 	if get("snakea", "203.0.113.80") {
 		t.Error("session lost by a re-apply")
 	}
+	// share=: device A's session to .81 is routed for device B too.
+	if err := e.AddSessions(1, "192.168.77.2", []string{"203.0.113.81"}, SessionRule, "session[share=192.168.77.3]:**.example.net", "b.example.net",
+		match.Opts{Share: []string{"192.168.77.3"}}); err != nil {
+		t.Fatal(err)
+	}
+	if get("snakea", "203.0.113.81") || get("snakeb", "203.0.113.81") {
+		t.Error("shared session did not route both devices into the tunnel")
+	}
+	if !get("snakeb", "203.0.113.80") {
+		t.Error("sharing one session routed the other for device B")
+	}
 	// TTL over with no connection: the route ends.
 	e.refreshSessions(strings.NewReader(""), time.Now().Add(2*time.Minute))
 	if !get("snakea", "203.0.113.80") {

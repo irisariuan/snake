@@ -390,6 +390,7 @@ var SYNTAX = [
   ['drop:asn:1234 / drop:cidr:1.2.3.0/24', 'block an autonomous system or address range'],
   ['session:rule', 'device session: what any domain rule after session: matches is routed only for the device that looked it up, until the session TTL after its last connection; not added to the policy\'s sets. Beats include rules; drop: and ! beat it'],
   ['session[ttl=10m;onlookup=1]:rule', 'options: ttl (seconds or 90s, 10m, 1h) overrides the session TTL; onlookup=1 counts it from the lookup (lookups renew it, connections do not)'],
+  ['session[share=global,share=kids,share=10.6.0.2]:rule', 'share the session with other devices (repeatable): global = every device of the policy, a device group, or a device (IP, subnet, MAC); a connection from any of them keeps it alive'],
   ['route:EXPR;if:EXPR', 'conditional sessions: if: names are routed for everyone; a device\'s lookup of a route: name starts sessions for it only while it has a live connection to an address of the if: names. Options as for session: route[ttl=…]:'],
   ['not:X  and:(X, Y)  or:(X, Y)  (X, Y)', 'expressions in route: and if: (nestable; (X, Y) means and:); a rule may span lines: after a line ending in ;, before one starting with ;, and inside open ( )'],
   ['asn:2906', 'autonomous system (all its announced prefixes)'],

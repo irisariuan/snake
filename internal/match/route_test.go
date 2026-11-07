@@ -132,3 +132,23 @@ func TestRouteErrors(t *testing.T) {
 		t.Fatalf("errors %+v", errs)
 	}
 }
+
+func TestShareOption(t *testing.T) {
+	p, err := Parse("session[share=kids,share=10.6.0.2;share=AA-BB-CC-00-00-31,share=group:kids,share=10.8.0.5/24]:x.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(p.Opts.Share, " "); got != "kids 10.6.0.2 aa:bb:cc:00:00:31 10.8.0.0/24" {
+		t.Fatalf("shares %q", got)
+	}
+	if p.Raw != "session[share=kids;share=10.6.0.2;share=aa:bb:cc:00:00:31;share=10.8.0.0/24]:x.example" {
+		t.Fatalf("raw %q", p.Raw)
+	}
+	r, err := ParseRoute("route[share=global]:a.example;if:b.example")
+	if err != nil || len(r.Opts.Share) != 1 || r.Opts.Share[0] != ShareGlobal {
+		t.Fatalf("route share %+v %v", r, err)
+	}
+	if _, err := Parse("session[share=bad/name]:x.example"); err == nil {
+		t.Error("bad share accepted")
+	}
+}
