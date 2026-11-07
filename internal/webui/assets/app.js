@@ -612,7 +612,7 @@
       (state.cfg.groups || []).map(function (g) { var v = 'group:' + g.name; return el('option', { value: v, selected: p.devices.indexOf(v) >= 0 }, 'Group: ' + g.name); }),
       knownDevices().map(function (d) { return el('option', { value: d.mac, selected: p.devices.indexOf(d.mac) >= 0 }, (d.name || '?') + ' (' + d.mac + (d.ip ? ', ' + d.ip : '') + ')'); }));
     var extraMacs = p.devices.filter(function (d) { return d.indexOf('group:') !== 0 && !knownDevices().some(function (k) { return k.mac === d; }); });
-    var macTA = el('textarea', { style: 'min-height:40px', placeholder: 'aa:bb:cc:dd:ee:ff' }, extraMacs.join('\n'));
+    var macTA = el('textarea', { style: 'min-height:40px', placeholder: 'aa:bb:cc:dd:ee:ff\n10.6.0.2\n10.8.0.0/24' }, extraMacs.join('\n'));
     var rulesEd = ruleEditor({ value: policyRulesText(p), height: 240,
       placeholder: 'netflix.com\n**.nflxvideo.net\n/^ipv4-c\\d+-.*\\.oca\\.nflxvideo\\.net$/\n!=ads.netflix.com\nasn:2906\ncidr:23.246.0.0/18' });
     var listSel = el('select', { multiple: true, size: Math.min(6, Math.max(2, state.cfg.rule_lists.length)), style: 'width:100%' },
@@ -643,7 +643,7 @@
         el('div', { class: 'small muted' }, 'A tunnel whose exit country differs is treated as failed for this policy.')),
       el('div', { class: 'card' },
         el('label', { class: 'f' }, 'Devices (none = whole LAN). Ctrl/Cmd-click to select several.'), devSel,
-        el('label', { class: 'f' }, 'Other MAC addresses'), macTA,
+        el('label', { class: 'f' }, 'Other devices: MAC addresses, or IP addresses / subnets for VPN server clients'), macTA,
         el('div', { class: 'small muted' }, 'Devices only → the whole device goes through the tunnel. Devices + destinations → only those destinations, only for those devices.')),
       el('div', { class: 'card' },
         el('b', null, 'Leak protection'),
@@ -853,7 +853,7 @@
       el('div', { class: 'card' }, el('b', null, 'Advanced'),
         bool('doh_canary', 'Answer DoH canary domains with NXDOMAIN', 'Firefox and iCloud Private Relay turn themselves off network-wide.'),
         bool('pre_resolve', 'Pre-resolve policy domains at start'),
-        txt('lan_interfaces', 'LAN interfaces (iptables -i pattern)'),
+        txt('lan_interfaces', 'Client interfaces (iptables -i patterns, space-separated)', 'br+ = LAN and guest networks, wgs+ = WireGuard server clients, tun2+ = OpenVPN server clients (tun mode). Remove a pattern to leave those clients alone.'),
         num('api_port', 'API port (HTTPS uses port + 1)', 'Restart the daemon after changing.'),
         num('queue_base', 'NFQUEUE base number'),
         el('label', { class: 'f' }, 'Mark mask (hex)'),

@@ -45,8 +45,11 @@ type Policy struct {
 	ID   int
 	Name string
 	Set  *match.Set
-	// MACs limits the policy to these clients (empty: every client).
+	// MACs and Nets limit the policy to these clients (both empty: every
+	// client). VPN server clients have no MAC address at the router and
+	// are matched by address.
 	MACs map[string]bool
+	Nets []netip.Prefix
 	Mark uint32 // fwmark of the policy's routing table
 	// Set4/Set6 learn the destination of a matched connection (the
 	// policy's domain sets), so later connections to it take the kernel
@@ -113,12 +116,11 @@ type Proxy struct {
 	origDst func(*net.TCPConn) (netip.AddrPort, error)
 	dial    func(ctx context.Context, mark uint32, addr string) (net.Conn, error)
 
-	mu      sync.Mutex
-	cfg     Config
-	lns     []net.Listener
-	neigh   neighbors
-	pol     atomic.Pointer[[]Policy]
-	needMAC atomic.Bool
+	mu    sync.Mutex
+	cfg   Config
+	lns   []net.Listener
+	neigh neighbors
+	pol   atomic.Pointer[[]Policy]
 
 	learnMu sync.Mutex
 	learned map[string]time.Time
@@ -153,13 +155,6 @@ func (p *Proxy) Configure(c Config) error {
 	defer p.mu.Unlock()
 	pols := append([]Policy(nil), c.Policies...)
 	p.pol.Store(&pols)
-	need := false
-	for _, x := range pols {
-		if len(x.MACs) > 0 {
-			need = true
-		}
-	}
-	p.needMAC.Store(need)
 	if len(pols) == 0 {
 		p.closeLocked()
 		p.cfg = c
@@ -316,17 +311,34 @@ func (p *Proxy) applicable(client netip.Addr) []Policy {
 	if pols == nil {
 		return nil
 	}
-	mac := ""
-	if p.needMAC.Load() {
-		mac = p.neigh.mac(client)
-	}
+	mac, looked := "", false
 	var out []Policy
 	for _, pol := range *pols {
-		if len(pol.MACs) == 0 || pol.MACs[mac] {
+		if len(pol.MACs)+len(pol.Nets) == 0 || inNets(pol.Nets, client) {
+			out = append(out, pol)
+			continue
+		}
+		if len(pol.MACs) == 0 {
+			continue
+		}
+		if !looked {
+			mac, looked = p.neigh.mac(client), true
+		}
+		if pol.MACs[mac] {
 			out = append(out, pol)
 		}
 	}
 	return out
+}
+
+func inNets(nets []netip.Prefix, a netip.Addr) bool {
+	a = a.Unmap()
+	for _, n := range nets {
+		if n.Contains(a) {
+			return true
+		}
+	}
+	return false
 }
 
 // refusesECH returns a policy applying to the client that refuses ECH.

@@ -154,7 +154,9 @@ func (s *Server) routes(authed bool) http.Handler {
 		s.E.FlushLearned(id)
 		writeJSON(w, map[string]string{"result": "flushed"})
 	})
-	mux.HandleFunc("GET /api/clients", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, engine.Clients()) })
+	mux.HandleFunc("GET /api/clients", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, append(engine.Clients(), s.E.VPNClients()...))
+	})
 	mux.HandleFunc("GET /api/leaks", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, s.E.LeakChecks()) })
 	mux.HandleFunc("GET /api/logs", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, logx.Recent()) })
 	s.ruleRoutes(mux)

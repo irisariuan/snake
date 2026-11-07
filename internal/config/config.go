@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -145,10 +146,14 @@ type Settings struct {
 	DoHCanary        bool     `json:"doh_canary"` // answer Firefox/iCloud Private Relay canaries with NXDOMAIN
 	PreResolve       bool     `json:"pre_resolve"`
 	FlushConntrack   bool     `json:"flush_conntrack"`
-	LANInterfaces    string   `json:"lan_interfaces"` // iptables -i pattern
-	STUNTestServers  []string `json:"stun_test_servers"`
-	AutoUpdate       bool     `json:"auto_update"` // install new releases automatically
-	UpdateRepo       string   `json:"update_repo"` // GitHub owner/name releases come from
+	// LANInterfaces are the iptables -i patterns of client traffic,
+	// separated by spaces: the LAN bridges plus the router's VPN servers
+	// (WireGuard wgs*, OpenVPN tun21/tun22), whose clients are covered
+	// like LAN devices.
+	LANInterfaces   string   `json:"lan_interfaces"`
+	STUNTestServers []string `json:"stun_test_servers"`
+	AutoUpdate      bool     `json:"auto_update"` // install new releases automatically
+	UpdateRepo      string   `json:"update_repo"` // GitHub owner/name releases come from
 	// Router-wide DoT / DoH blocking: policy (each policy's toggle), always
 	// (whole LAN) or never (overrides every policy).
 	BlockDoT string `json:"block_dot"`
@@ -167,7 +172,36 @@ type Settings struct {
 //	   egress port, IPsec and policy-routing fields, and routed traffic
 //	   stopped working.
 //	4: conntrack marks move to their own bits (conn_mark_mask).
-const CurrentVersion = 4
+//	5: lan_interfaces is a list and includes the VPN servers by default.
+const CurrentVersion = 5
+
+// DefaultLANInterfaces covers the LAN bridges (br0, guest networks) and
+// the clients of the router's VPN servers: WireGuard (wgs1...) and OpenVPN
+// in tun mode (tun21, tun22). OpenVPN in tap mode is bridged into br0.
+const DefaultLANInterfaces = "br+ wgs+ tun2+"
+
+// ClientInterfaces returns the iptables -i patterns of client traffic.
+func (s Settings) ClientInterfaces() []string {
+	f := strings.FieldsFunc(s.LANInterfaces, func(r rune) bool { return r == ' ' || r == ',' || r == '\t' })
+	if len(f) == 0 {
+		return []string{"br+"}
+	}
+	return dedup(f)
+}
+
+// L2Interface reports whether a pattern names interfaces with Ethernet
+// headers, where clients can be matched by MAC address. Routed tunnels
+// (VPN servers) carry IP packets only.
+func L2Interface(pattern string) bool {
+	for _, p := range []string{"wg", "tun", "ppp", "ipsec", "vti"} {
+		if strings.HasPrefix(pattern, p) {
+			return false
+		}
+	}
+	return true
+}
+
+var ifacePatternRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}\+?$`)
 
 // Mark bits.
 //
@@ -407,7 +441,7 @@ func DefaultSettings() Settings {
 		DoHCanary:        true,
 		PreResolve:       true,
 		FlushConntrack:   true,
-		LANInterfaces:    "br+",
+		LANInterfaces:    DefaultLANInterfaces,
 		STUNTestServers:  []string{"stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"},
 		UpdateRepo:       "irisariuan/snake",
 		BlockDoT:         BlockPolicy,
@@ -546,6 +580,33 @@ var (
 	ccRe   = regexp.MustCompile(`^[A-Z]{2}$`)
 )
 
+// NormalizeClient validates a device entry: a MAC address, an IP address or
+// a subnet (for VPN server clients and other routed clients, which have no
+// MAC address at the router). It returns the canonical form.
+func NormalizeClient(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if m, err := NormalizeMAC(s); err == nil {
+		return m, nil
+	}
+	if a, err := netip.ParseAddr(s); err == nil && a.Zone() == "" {
+		return a.Unmap().String(), nil
+	}
+	if p, err := netip.ParsePrefix(s); err == nil {
+		p = p.Masked()
+		if p.Addr().Is4In6() {
+			return "", fmt.Errorf("invalid device %q: use the IPv4 form", s)
+		}
+		return p.String(), nil
+	}
+	return "", fmt.Errorf("invalid device %q (MAC address, IP address or subnet)", s)
+}
+
+// ClientMAC reports whether a normalized device entry is a MAC address.
+func ClientMAC(s string) bool {
+	_, err := NormalizeMAC(s)
+	return err == nil
+}
+
 // NormalizeMAC lowercases and validates a MAC address.
 func NormalizeMAC(s string) (string, error) {
 	hw, err := net.ParseMAC(strings.TrimSpace(s))
@@ -605,7 +666,7 @@ func (c *Config) Normalize() {
 			if strings.HasPrefix(s, "group:") {
 				return s
 			}
-			if m, err := NormalizeMAC(s); err == nil {
+			if m, err := NormalizeClient(s); err == nil {
 				return m
 			}
 			return s
@@ -659,14 +720,14 @@ func (c *Config) Normalize() {
 	for i := range c.Groups {
 		c.Groups[i].Name = strings.TrimSpace(c.Groups[i].Name)
 		c.Groups[i].MACs = dedup(mapStr(c.Groups[i].MACs, func(s string) string {
-			if m, err := NormalizeMAC(s); err == nil {
+			if m, err := NormalizeClient(s); err == nil {
 				return m
 			}
 			return strings.TrimSpace(s)
 		}))
 	}
 	for i := range c.Devices {
-		if m, err := NormalizeMAC(c.Devices[i].MAC); err == nil {
+		if m, err := NormalizeClient(c.Devices[i].MAC); err == nil {
 			c.Devices[i].MAC = m
 		}
 	}
@@ -722,6 +783,14 @@ func (c *Config) Validate() error {
 			add("%s must be policy, always or never", name)
 		}
 	}
+	if len(strings.Fields(strings.NewReplacer(",", " ").Replace(s.LANInterfaces))) == 0 {
+		add("lan_interfaces needs at least one interface pattern")
+	}
+	for _, p := range s.ClientInterfaces() {
+		if !ifacePatternRe.MatchString(p) {
+			add("lan_interfaces: %q is not an interface name or pattern (e.g. br+, wgs1)", p)
+		}
+	}
 	if s.DNSForwardPort < 1024 || s.DNSForwardPort > 65000 {
 		add("dns_forward_port must be between 1024 and 65000")
 	}
@@ -748,13 +817,13 @@ func (c *Config) Validate() error {
 		}
 		groups[g.Name] = true
 		for _, m := range g.MACs {
-			if _, err := NormalizeMAC(m); err != nil {
+			if _, err := NormalizeClient(m); err != nil {
 				add("group %s: %v", g.Name, err)
 			}
 		}
 	}
 	for _, d := range c.Devices {
-		if _, err := NormalizeMAC(d.MAC); err != nil {
+		if _, err := NormalizeClient(d.MAC); err != nil {
 			add("device %s: %v", d.Name, err)
 		}
 	}
@@ -823,7 +892,7 @@ func (c *Config) Validate() error {
 				if !groups[strings.TrimPrefix(d, "group:")] {
 					add(pre+"unknown group %q", d)
 				}
-			} else if _, err := NormalizeMAC(d); err != nil {
+			} else if _, err := NormalizeClient(d); err != nil {
 				add(pre+"%v", err)
 			}
 		}
@@ -872,7 +941,8 @@ func compileErrs(rules []string) []match.LineError {
 	return errs
 }
 
-// ResolveDevices expands groups into MAC addresses.
+// ResolveDevices expands groups into device entries: MAC addresses, IP
+// addresses and subnets.
 func (c *Config) ResolveDevices(p Policy) []string {
 	var out []string
 	for _, d := range p.Devices {
@@ -957,12 +1027,18 @@ func Load(path string) (*Config, error) {
 	if err := json.Unmarshal(b, c); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	if c.Version < CurrentVersion {
+	if c.Version < 4 {
 		// Before version 4 conntrack marks used the packet-mark bits.
 		c.migratedMask = c.Settings.MarkMask
 		if c.Version == 2 && c.Settings.MarkMask == BadMarkMask {
 			c.Settings.MarkMask = DefaultMarkMask
 		}
+	}
+	if c.Version < 5 && strings.TrimSpace(c.Settings.LANInterfaces) == "br+" {
+		// The old default: VPN server clients join the LAN.
+		c.Settings.LANInterfaces = DefaultLANInterfaces
+	}
+	if c.Version < CurrentVersion {
 		c.Version = CurrentVersion
 	}
 	c.ApplyDefaults()

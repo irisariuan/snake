@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -367,7 +368,7 @@ func (e *Engine) states(cfg *config.Config, caps Caps) []netfilter.PolicyState {
 		if !p.Enabled {
 			continue
 		}
-		st := netfilter.PolicyState{Policy: p, MACs: cfg.ResolveDevices(p), ActiveTunnel: e.active[p.ID]}
+		st := netfilter.PolicyState{Policy: p, Clients: cfg.ResolveDevices(p), ActiveTunnel: e.active[p.ID]}
 		switch {
 		case !caps.IPv6 || p.Leak.IPv6 == config.IPv6Off:
 			st.IPv6Mode = netfilter.V6Off
@@ -556,7 +557,7 @@ func (e *Engine) Apply(reason string) error {
 	// listen, no redirect is installed (HTTPS would otherwise break).
 	sniPort := e.configureSNI(cfg, states, caps, &errs)
 	plan := netfilter.Build(s, states, netfilter.Options{IPv6: caps.IPv6, IPv6NAT: caps.IPv6NAT, DNSQueue: dnsQueue, Existing: existing,
-		TunnelAddrs: tunnelAddrs(usedTunnels(cfg)), WANAddrs: e.wanAddrs(), SNIPort: sniPort})
+		TunnelAddrs: tunnelAddrs(usedTunnels(cfg)), WANAddrs: e.wanAddrs(), SNIPort: sniPort, LANAddr: e.lanAddr()})
 	if err := nf.Apply(plan); err != nil {
 		errs = append(errs, err.Error())
 	}
@@ -666,6 +667,15 @@ func (e *Engine) wanAddrs() []string {
 	return out
 }
 
+// lanAddr is the router's LAN IPv4 address ("" if unknown).
+func (e *Engine) lanAddr() string {
+	ip := net.ParseIP(system.NVRAM{R: e.R}.Get("lan_ipaddr"))
+	if ip == nil || ip.To4() == nil || ip.IsUnspecified() {
+		return ""
+	}
+	return ip.String()
+}
+
 // tunnelAddrs returns the global addresses of each tunnel interface.
 func tunnelAddrs(tunnels []string) map[string][]string {
 	out := map[string][]string{}
@@ -764,11 +774,20 @@ func (e *Engine) sniPolicies(cfg *config.Config, states []netfilter.PolicyState,
 				sp.Session6 = netfilter.SetName(p.ID, netfilter.KindSession, true)
 			}
 		}
-		if len(st.MACs) > 0 {
-			sp.MACs = map[string]bool{}
-			for _, m := range st.MACs {
-				sp.MACs[m] = true
+		for _, c := range st.Clients {
+			if config.ClientMAC(c) {
+				if sp.MACs == nil {
+					sp.MACs = map[string]bool{}
+				}
+				sp.MACs[c] = true
+			} else if pf, err := netip.ParsePrefix(c); err == nil {
+				sp.Nets = append(sp.Nets, pf)
+			} else if a, err := netip.ParseAddr(c); err == nil {
+				sp.Nets = append(sp.Nets, netip.PrefixFrom(a, a.BitLen()))
 			}
+		}
+		if len(st.Clients) > 0 && len(sp.MACs)+len(sp.Nets) == 0 {
+			continue // no usable device entry: the policy applies to no one here
 		}
 		out = append(out, sp)
 	}

@@ -90,7 +90,8 @@ A policy is:
 * **Tunnels**, in priority order. The first healthy one is used. Later ones are
   failover backups.
 * **Match**: [rules](#domain-rules) (domain rules, `asn:`, `cidr:`), [rule lists](#rule-files-and-rule-lists)
-  it includes, and/or devices (MACs or groups).
+  it includes, and/or devices (MACs, IP addresses or subnets, or groups of them;
+  see [VPN server clients](#vpn-server-clients)).
   * destinations only → those destinations, for every device
   * devices only → the **whole device** (most reliable for TV apps)
   * both → those destinations, only for those devices
@@ -279,6 +280,42 @@ devices that use it bypass snake's domain rules).
 
 "Scoped clients" means the policy's devices. For destination-only policies it
 means the whole LAN, because any device might reach those destinations.
+"The LAN" includes the clients of the router's own VPN servers, below.
+
+### VPN server clients
+
+Clients connected to the router's VPN servers are covered like LAN devices.
+*Settings → Client interfaces* (`lan_interfaces`) lists the iptables
+interface patterns snake treats as clients; the default is
+`br+ wgs+ tun2+`:
+
+| Pattern | Clients |
+|---|---|
+| `br+` | LAN, guest networks, and OpenVPN servers in TAP mode (bridged into br0) |
+| `wgs+` | WireGuard server peers (`wgs1`, default subnet 10.6.0.0/24) |
+| `tun2+` | OpenVPN servers in TUN mode (`tun21` 10.8.0.0/24, `tun22` 10.16.0.0/24) |
+
+Configurations from before this version that still had the old default
+(`br+`) are moved to the new one; a customised value is kept. Remove a
+pattern to leave those clients alone.
+
+For VPN server clients:
+
+* Destination-only policies, leak protection, DNS inspection and the SNI
+  proxy apply to them like to any LAN device.
+* They have no MAC address at the router, so device-scoped policies select
+  them by **IP address or subnet**: `10.6.0.2` for one WireGuard peer,
+  `10.8.0.0/24` for every client of an OpenVPN server. The device picker
+  lists WireGuard peers and OpenVPN client subnets from the router's
+  settings. An address only matches its own family: add a peer's IPv6
+  address too if it has one, or its IPv6 traffic is not matched (set the
+  policy's IPv6 to *block* to make it fall back to IPv4).
+* DNS hijacking DNATs their port-53 traffic to the router's LAN address
+  (dnsmasq may not listen on the VPN server's own address). IPv6 DNS of VPN
+  clients is not hijacked.
+* The VPN server must let its clients reach the Internet (*Client access:
+  LAN + Internet* / *Internet only*), or the firmware drops their traffic
+  before it can be routed into a tunnel.
 
 ### Encrypted DNS through the tunnel
 
@@ -516,7 +553,7 @@ entries of the policy are flushed when the `conntrack` tool exists.
 ## How it works
 
 ```
-LAN client ──► mangle PREROUTING -i br+ ─► SNAKE
+LAN client ──► mangle PREROUTING -i br+/wgs+/tun2+ ─► SNAKE
                  WAN/tunnel NAT affinity, then isolated connection policy │ private dst → RETURN
                  SNAKE_P<id> (in policy order):
                    mac / ipset(dnsmasq-learned, ASN+CIDR, WebRTC peers/servers)  ─► SNAKE_M<id>: MARK id<<16, save connmark
