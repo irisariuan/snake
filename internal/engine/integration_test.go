@@ -132,10 +132,17 @@ func TestIntegrationApply(t *testing.T) {
 		t.Errorf("v6 table 1001 (tunnel has IPv6): %s", r)
 	}
 	sets := sh(t, "ipset list -n")
-	for _, s := range []string{"SNK_1_d4", "SNK_1_n4", "SNK_1_s4", "SNK_1_r4", "SNK_1_t4", "SNK_2_d4", "SNK_DOH4"} {
+	for _, s := range []string{"SNK_1_d4", "SNK_1_n4", "SNK_1_s4", "SNK_1_t4", "SNK_2_d4", "SNK_DOH4"} {
 		if !strings.Contains(sets, s) {
 			t.Errorf("missing set %s", s)
 		}
+	}
+	// WebRTC peers are device sessions (session chain), not a peer set.
+	if strings.Contains(sets, "SNK_1_r4") {
+		t.Error("former WebRTC peer set SNK_1_r4 still created")
+	}
+	if save := sh(t, "iptables-save -t mangle"); !strings.Contains(save, "-A SNAKE_P1 -j SNAKE_Q1") {
+		t.Error("WebRTC policy has no session chain")
 	}
 	if !strings.Contains(sh(t, "ipset list SNK_1_n4"), "23.246.0.0/18") {
 		t.Error("CIDR not loaded")
@@ -210,8 +217,14 @@ func TestIntegrationApply(t *testing.T) {
 		if srv := sh(t, "ipset list SNK_1_t4"); !strings.Contains(srv, "203.0.113.7") || strings.Contains(srv, "198.51.100.5") {
 			t.Errorf("server set:\n%s", srv)
 		}
-		if peers := sh(t, "ipset list SNK_1_r4"); !strings.Contains(peers, "198.51.100.5") || strings.Contains(peers, "203.0.113.7") {
-			t.Errorf("peer set:\n%s", peers)
+		var peers []string
+		for _, se := range e.Sessions(1) {
+			if se.Source == SessionWebRTC {
+				peers = append(peers, se.Addr)
+			}
+		}
+		if p := strings.Join(peers, ","); p != "198.51.100.5" {
+			t.Errorf("WebRTC peer sessions: %q", p)
 		}
 		t.Logf("webrtc stats: %+v", e.rtc.Stats()[1])
 		sh(t, "iptables -t mangle -D OUTPUT -p udp --dport 3478 -m mark --mark 0/0xff0000 -j NFQUEUE --queue-num 4201 --queue-bypass")
