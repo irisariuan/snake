@@ -2,6 +2,9 @@ name: Release
 
 # Push a tag like v1.2.3 to build and publish a release:
 #   git tag v1.2.3 && git push origin v1.2.3
+# or run this workflow by hand (Actions → Release → Run workflow) with a
+# tag: it is created on the given branch or commit (default main) if it
+# does not exist yet, otherwise that tag is rebuilt and republished.
 # Routers running snake find it with "Check now" / auto-update.
 
 on:
@@ -10,8 +13,12 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to (re)build and publish, e.g. v1.2.3"
+        description: "Tag to publish, e.g. v1.2.3 (created if missing)"
         required: true
+      ref:
+        description: "Branch or commit for a new tag (ignored if the tag exists)"
+        required: false
+        default: main
 
 permissions:
   contents: write
@@ -24,7 +31,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.TAG }}
           fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
@@ -37,6 +43,24 @@ jobs:
       - name: Check tag
         run: |
           echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' || { echo "bad tag $TAG"; exit 1; }
+      - name: Create tag if missing, check it out
+        env:
+          REF: ${{ github.event.inputs.ref || 'main' }}
+        run: |
+          git fetch --tags --force origin
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "tag $TAG exists: $(git rev-parse "$TAG^{commit}")"
+          else
+            commit=$(git rev-parse --verify "origin/$REF^{commit}" 2>/dev/null || git rev-parse --verify "$REF^{commit}")
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" "$commit" -m "snake $TAG"
+            # Pushed with the workflow token, so it does not start this
+            # workflow a second time.
+            git push origin "refs/tags/$TAG"
+            echo "created tag $TAG at $commit ($REF)"
+          fi
+          git checkout -q "$TAG"
       - name: Build web UI (Astro + Tailwind → static page)
         run: make web
       - name: Test
