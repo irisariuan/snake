@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -27,10 +28,12 @@ import (
 	"github.com/irisariuan/snake/internal/logx"
 	"github.com/irisariuan/snake/internal/match"
 	"github.com/irisariuan/snake/internal/netfilter"
+	"github.com/irisariuan/snake/internal/openvpn"
 	"github.com/irisariuan/snake/internal/routing"
 	"github.com/irisariuan/snake/internal/sniproxy"
 	"github.com/irisariuan/snake/internal/system"
 	"github.com/irisariuan/snake/internal/webrtc"
+	"github.com/irisariuan/snake/internal/wireguard"
 )
 
 // Version is set at build time.
@@ -110,9 +113,11 @@ type Engine struct {
 	learnRoute  atomic.Value // map[string]int: server -> policy (0 = WAN), as installed
 	dns         *dnsinspect.Inspector
 	dnsOn       bool
-	fwd         dnsfwd.Manager  // DoT/DoH forwarders for resolve-via-tunnel
-	sni         *sniproxy.Proxy // transparent SNI proxy (sniff_sni)
-	sniErr      string          // why the SNI proxy is not running
+	fwd         dnsfwd.Manager     // DoT/DoH forwarders for resolve-via-tunnel
+	sni         *sniproxy.Proxy    // transparent SNI proxy (sniff_sni)
+	wg          *wireguard.Manager // snake's own WireGuard tunnels (wgx1...)
+	ovpn        *openvpn.Manager   // snake's own OpenVPN clients (ovx1...)
+	sniErr      string             // why the SNI proxy is not running
 	asnCache    *asn.Cache
 	active      map[int]string
 	cands       map[int][]Candidate
@@ -140,6 +145,8 @@ func New(p Paths, r system.Runner) *Engine {
 		rtc:       webrtc.NewTracker(netfilter.IPSet{R: r}, 0),
 		dns:       &dnsinspect.Inspector{IPSet: netfilter.IPSet{R: r}},
 		sni:       &sniproxy.Proxy{Sets: netfilter.IPSet{R: r}},
+		wg:        NewWireGuard(r),
+		ovpn:      NewOpenVPN(r),
 		active:    map[int]string{},
 		cands:     map[int][]Candidate{},
 		asnErrors: map[int]string{},
@@ -287,7 +294,8 @@ func (e *Engine) ipset() netfilter.IPSet {
 	return netfilter.IPSet{R: e.R, NL: e.nl}
 }
 
-// usedTunnels lists tunnels referenced by enabled policies.
+// usedTunnels lists tunnels referenced by enabled policies: they are
+// monitored, and snake's own among them are running.
 func usedTunnels(c *config.Config) []string {
 	seen := map[string]bool{}
 	var out []string
@@ -367,7 +375,7 @@ func (e *Engine) states(cfg *config.Config, caps Caps) []netfilter.PolicyState {
 		if !p.Enabled {
 			continue
 		}
-		st := netfilter.PolicyState{Policy: p, MACs: cfg.ResolveDevices(p), ActiveTunnel: e.active[p.ID]}
+		st := netfilter.PolicyState{Policy: p, Clients: cfg.ResolveDevices(p), Excluded: cfg.ResolveExcluded(p), ActiveTunnel: e.active[p.ID]}
 		switch {
 		case !caps.IPv6 || p.Leak.IPv6 == config.IPv6Off:
 			st.IPv6Mode = netfilter.V6Off
@@ -467,6 +475,11 @@ func (e *Engine) Apply(reason string) error {
 	rt := routing.Manager{R: e.R}
 	var errs []string
 
+	// 0. snake's own tunnels that policies use: the routes below point at them.
+	if !e.DryRun {
+		errs = append(errs, e.syncSnakeTunnels(cfg)...)
+	}
+
 	// 1. ipsets
 	specs := setSpecs(cfg, states, caps.IPv6)
 	want := map[string]bool{}
@@ -556,7 +569,7 @@ func (e *Engine) Apply(reason string) error {
 	// listen, no redirect is installed (HTTPS would otherwise break).
 	sniPort := e.configureSNI(cfg, states, caps, &errs)
 	plan := netfilter.Build(s, states, netfilter.Options{IPv6: caps.IPv6, IPv6NAT: caps.IPv6NAT, DNSQueue: dnsQueue, Existing: existing,
-		TunnelAddrs: tunnelAddrs(usedTunnels(cfg)), WANAddrs: e.wanAddrs(), SNIPort: sniPort})
+		TunnelAddrs: tunnelAddrs(usedTunnels(cfg)), WANAddrs: e.wanAddrs(), SNIPort: sniPort, LANAddr: e.lanAddr()})
 	if err := nf.Apply(plan); err != nil {
 		errs = append(errs, err.Error())
 	}
@@ -666,6 +679,15 @@ func (e *Engine) wanAddrs() []string {
 	return out
 }
 
+// lanAddr is the router's LAN IPv4 address ("" if unknown).
+func (e *Engine) lanAddr() string {
+	ip := net.ParseIP(system.NVRAM{R: e.R}.Get("lan_ipaddr"))
+	if ip == nil || ip.To4() == nil || ip.IsUnspecified() {
+		return ""
+	}
+	return ip.String()
+}
+
 // tunnelAddrs returns the global addresses of each tunnel interface.
 func tunnelAddrs(tunnels []string) map[string][]string {
 	out := map[string][]string{}
@@ -764,15 +786,33 @@ func (e *Engine) sniPolicies(cfg *config.Config, states []netfilter.PolicyState,
 				sp.Session6 = netfilter.SetName(p.ID, netfilter.KindSession, true)
 			}
 		}
-		if len(st.MACs) > 0 {
-			sp.MACs = map[string]bool{}
-			for _, m := range st.MACs {
-				sp.MACs[m] = true
-			}
+		sp.MACs, sp.Nets = splitClients(st.Clients)
+		sp.ExcludeMACs, sp.ExcludeNets = splitClients(st.Excluded)
+		if len(st.Clients) > 0 && len(sp.MACs)+len(sp.Nets) == 0 {
+			continue // no usable device entry: the policy applies to no one here
 		}
 		out = append(out, sp)
 	}
 	return out
+}
+
+// splitClients separates device entries into MAC addresses and networks.
+func splitClients(clients []string) (map[string]bool, []netip.Prefix) {
+	var macs map[string]bool
+	var nets []netip.Prefix
+	for _, c := range clients {
+		if config.ClientMAC(c) {
+			if macs == nil {
+				macs = map[string]bool{}
+			}
+			macs[c] = true
+		} else if pf, err := netip.ParsePrefix(c); err == nil {
+			nets = append(nets, pf)
+		} else if a, err := netip.ParseAddr(c); err == nil {
+			nets = append(nets, netip.PrefixFrom(a, a.BitLen()))
+		}
+	}
+	return macs, nets
 }
 
 // configureSNI starts, updates or stops the SNI proxy and returns the port

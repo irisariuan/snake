@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/irisariuan/snake/internal/config"
 	"github.com/irisariuan/snake/internal/system"
 )
 
@@ -62,10 +63,77 @@ func (a Applier) Apply(p Plan) error {
 			errs = append(errs, err.Error())
 		}
 	}
+	// Interface hooks of patterns no longer configured (lan_interfaces
+	// changed), added after the new ones so coverage has no gap.
+	want := map[string]bool{}
+	fams := map[bool]bool{}
+	for _, h := range p.Hooks {
+		fams[h.V6] = true
+		if iface := hookIface(h.Args); iface != "" {
+			want[ifaceHookKey(h.V6, h.Table, h.Chain, iface, hookTarget(h.Args))] = true
+		}
+	}
+	for v6 := range fams {
+		a.removeIfaceHooks(v6, func(table, chain, iface, target string) bool {
+			return !want[ifaceHookKey(v6, table, chain, iface, target)]
+		})
+	}
 	if len(errs) > 0 {
 		return fmt.Errorf("netfilter: %s", strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+// ifaceHooks are the built-in chains snake hooks per client interface,
+// with the snake chain they jump to.
+var ifaceHooks = []struct{ table, chain, target string }{
+	{"mangle", "PREROUTING", ChainMain},
+	{"nat", "PREROUTING", ChainDNS},
+}
+
+func ifaceHookKey(v6 bool, table, chain, iface, target string) string {
+	return fmt.Sprintf("%v/%s/%s/%s/%s", v6, table, chain, iface, target)
+}
+
+func hookIface(args []string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-i" {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+func hookTarget(args []string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-j" || args[i] == "-g" {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// removeIfaceHooks deletes the per-interface jumps into snake chains for
+// which drop returns true.
+func (a Applier) removeIfaceHooks(v6 bool, drop func(table, chain, iface, target string) bool) {
+	b := bin(v6, "tables")
+	for _, ih := range ifaceHooks {
+		out, err := a.R.Run(b, "-t", ih.table, "-S", ih.chain)
+		if err != nil {
+			continue
+		}
+		for _, l := range strings.Split(out, "\n") {
+			f := strings.Fields(l)
+			if len(f) < 3 || f[0] != "-A" || f[1] != ih.chain {
+				continue
+			}
+			args := f[2:]
+			if hookTarget(args) != ih.target || !drop(ih.table, ih.chain, hookIface(args), ih.target) {
+				continue
+			}
+			_, _ = a.R.Run(b, append([]string{"-t", ih.table, "-D", ih.chain}, args...)...)
+		}
+	}
 }
 
 func (a Applier) ensureHook(h Hook) error {
@@ -91,7 +159,8 @@ func (a Applier) HooksPresent(hooks []Hook) bool {
 	return true
 }
 
-// Teardown removes every hook and chain snake owns.
+// Teardown removes every hook and chain snake owns. lan is the configured
+// lan_interfaces; hooks of other interfaces are found and removed too.
 func (a Applier) Teardown(ipv6 bool, lan string) {
 	fams := []bool{false}
 	if ipv6 {
@@ -99,12 +168,15 @@ func (a Applier) Teardown(ipv6 bool, lan string) {
 	}
 	for _, v6 := range fams {
 		hooks := []Hook{
-			{V6: v6, Table: "mangle", Chain: "PREROUTING", Args: []string{"-i", lan, "-j", ChainMain}},
 			{V6: v6, Table: "mangle", Chain: "FORWARD", Args: []string{"-j", ChainMSS}},
 			{V6: v6, Table: "mangle", Chain: "OUTPUT", Args: []string{"-p", "udp", "--sport", "53", "-j", ChainDNSOut}},
 			{V6: v6, Table: "filter", Chain: "FORWARD", Args: []string{"-j", ChainFwd}},
-			{V6: v6, Table: "nat", Chain: "PREROUTING", Args: []string{"-i", lan, "-j", ChainDNS}},
 			{V6: v6, Table: "nat", Chain: "POSTROUTING", Args: []string{"-j", ChainNAT}},
+		}
+		for _, l := range (config.Settings{LANInterfaces: lan}).ClientInterfaces() {
+			hooks = append(hooks,
+				Hook{V6: v6, Table: "mangle", Chain: "PREROUTING", Args: []string{"-i", l, "-j", ChainMain}},
+				Hook{V6: v6, Table: "nat", Chain: "PREROUTING", Args: []string{"-i", l, "-j", ChainDNS}})
 		}
 		for _, h := range hooks {
 			for i := 0; i < 10; i++ {
@@ -114,6 +186,7 @@ func (a Applier) Teardown(ipv6 bool, lan string) {
 				}
 			}
 		}
+		a.removeIfaceHooks(v6, func(_, _, _, _ string) bool { return true })
 		ex := a.ExistingChains(v6)
 		fam := "4"
 		if v6 {

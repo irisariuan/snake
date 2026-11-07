@@ -95,6 +95,9 @@ func (e *Engine) Run(ctx context.Context) error {
 // when needed.
 func (e *Engine) checkHealth(geo bool) {
 	cfg := e.runtime()
+	if !e.DryRun && !e.Disabled() {
+		e.restartOpenVPN(cfg) // clients that exited (server down, network change)
+	}
 	tunnels := usedTunnels(cfg)
 	e.mon.Prune(tunnels)
 	var wg sync.WaitGroup
@@ -471,6 +474,9 @@ func (e *Engine) TestDomain(name string) DomainTest {
 		}
 		if len(p.Devices) > 0 {
 			res.Notes = append(res.Notes, "policy is limited to selected devices")
+		}
+		if n := len(p.ExcludeDevices); n > 0 {
+			res.Notes = append(res.Notes, fmt.Sprintf("%d excluded device(s) or group(s) are never routed by this policy", n))
 		}
 	} else if len(res.Others) == 0 {
 		res.Notes = append(res.Notes, "no policy matches: traffic goes via WAN")

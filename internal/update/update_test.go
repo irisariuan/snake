@@ -135,3 +135,101 @@ func TestRollbackWithoutPrevious(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 }
+
+// fakeGitHub serves releases v0.8.0 (no binary), v0.9.0, v1.0.0, v1.1.0
+// and a draft; each binary prints its version.
+func fakeGitHub(t *testing.T) *httptest.Server {
+	t.Helper()
+	var srv *httptest.Server
+	rel := func(tag string, withBin bool) map[string]any {
+		assets := []map[string]string{{"name": SumsAsset, "browser_download_url": srv.URL + "/dl/" + tag + "/sums"}}
+		if withBin {
+			assets = append(assets, map[string]string{"name": Asset(), "browser_download_url": srv.URL + "/dl/" + tag + "/bin"})
+		}
+		return map[string]any{"tag_name": tag, "body": "notes " + tag, "published_at": "2026-01-02T03:04:05Z", "assets": assets}
+	}
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		switch {
+		case p == "/repos/o/r/releases":
+			draft := rel("v2.0.0", true)
+			draft["draft"] = true
+			_ = json.NewEncoder(w).Encode([]any{rel("v0.9.0", true), draft, rel("v1.1.0", true), rel("v0.8.0", false), rel("v1.0.0", true)})
+		case strings.HasPrefix(p, "/repos/o/r/releases/tags/"):
+			tag := strings.TrimPrefix(p, "/repos/o/r/releases/tags/")
+			if tag != "v0.9.0" && tag != "v1.1.0" && tag != "v1.0.0" {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(rel(tag, true))
+		case strings.HasPrefix(p, "/dl/"):
+			parts := strings.Split(p, "/") // "", dl, tag, kind
+			bin := []byte("#!/bin/sh\necho snake " + parts[2] + "\n")
+			if parts[3] == "bin" {
+				_, _ = w.Write(bin)
+				return
+			}
+			sum := sha256.Sum256(bin)
+			_, _ = w.Write([]byte(hex.EncodeToString(sum[:]) + "  " + Asset() + "\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestReleasesAndInstallVersion(t *testing.T) {
+	srv := fakeGitHub(t)
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "snake")
+	fakeBin(t, bin, "v1.1.0")
+	fakeBin(t, bin+".prev", "v1.0.0")
+	u := &Updater{Bin: bin, Current: "v1.1.0", Repo: func() string { return "o/r" }, APIBase: srv.URL}
+
+	rels, err := u.Releases(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, r := range rels {
+		s := r.Version
+		if r.Running {
+			s += " running"
+		}
+		if r.Previous {
+			s += " previous"
+		}
+		if r.Older {
+			s += " older"
+		}
+		if !r.Installable {
+			s += " no-binary"
+		}
+		got = append(got, s)
+	}
+	want := "v1.1.0 running|v1.0.0 previous older|v0.9.0 older|v0.8.0 older no-binary"
+	if strings.Join(got, "|") != want {
+		t.Fatalf("releases\n got %s\nwant %s", strings.Join(got, "|"), want)
+	}
+
+	// Two versions back: the running one becomes the rollback copy.
+	v, err := u.InstallVersion(context.Background(), "0.9.0")
+	if err != nil || v != "v0.9.0" {
+		t.Fatalf("installed %q, %v", v, err)
+	}
+	if got, _ := BinaryVersion(bin); got != "v0.9.0" {
+		t.Fatalf("binary is %q", got)
+	}
+	if u.PreviousVersion() != "v1.1.0" {
+		t.Fatalf("previous = %q", u.PreviousVersion())
+	}
+	for _, bad := range []string{"v3.0.0", "../../etc", "latest"} {
+		if _, err := u.InstallVersion(context.Background(), bad); err == nil {
+			t.Errorf("installed %q", bad)
+		}
+	}
+	if got, _ := BinaryVersion(bin); got != "v0.9.0" {
+		t.Fatalf("failed installs touched the binary: %q", got)
+	}
+}

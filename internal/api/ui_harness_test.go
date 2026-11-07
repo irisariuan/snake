@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,9 +26,25 @@ func TestUIHarness(t *testing.T) {
 	var c config.Config
 	_ = json.Unmarshal(b, &c)
 	c.ApplyDefaults()
+	// snake's own WireGuard tunnel (dummy keys).
+	c.WireGuard = []config.WireGuard{{ID: "wgx1", Name: "Tokyo", Enabled: true, Conf: "[Interface]\nPrivateKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nAddress = 10.64.1.2/32\nDNS = 10.64.0.1\n\n[Peer]\nPublicKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=\nEndpoint = jp-tyo.example.net:51820\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n"}}
+	c.OpenVPN = []config.OpenVPN{{ID: "ovx1", Name: "Paris", Enabled: true, Username: "alice", Password: "pw",
+		Conf: "client\ndev tun\nproto udp\nremote fr1.example.net 1194\nauth-user-pass\n<ca>\n-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n</ca>\n"}}
+	c.Policies[0].Tunnels = append(c.Policies[0].Tunnels, "ovx1")
+	// A realistic household for the device pickers.
+	c.Devices = append(c.Devices,
+		config.Device{Name: "Living-room TV", MAC: "aa:bb:cc:00:00:02"},
+		config.Device{Name: "Pixel 8", MAC: "aa:bb:cc:00:00:23"},
+		config.Device{Name: "iPad (kids)", MAC: "aa:bb:cc:00:00:31"},
+		config.Device{Name: "Switch", MAC: "aa:bb:cc:00:00:09"},
+		config.Device{Name: "Work laptop", MAC: "aa:bb:cc:00:00:40"},
+		config.Device{Name: "Printer", MAC: "aa:bb:cc:00:00:50"})
+	c.Groups = append(c.Groups, config.Group{Name: "kids", MACs: []string{"aa:bb:cc:00:00:31", "aa:bb:cc:00:00:09"}})
 	c.Normalize()
 	_ = config.Save(filepath.Join(dir, "config.json"), &c)
 	rec := &system.Recorder{Responses: map[string]string{"nvram get wan0_ipaddr": "198.51.100.20",
+		// VPN server clients for the device picker: a WireGuard peer and an OpenVPN subnet.
+		"nvram show":          "wgs1_enable=1\nwgs1_c1_enable=1\nwgs1_c1_name=Phone abroad\nwgs1_c1_addr=10.6.0.2/32\nvpn_server1_sn=10.8.0.0\nvpn_server1_nm=255.255.255.0\nvpn_server1_state=2\n",
 		"ipset list SNK_1_d4": "Name: SNK_1_d4\nType: hash:net\nNumber of entries: 4\nMembers:\n54.155.178.5\n23.246.50.141\n52.31.4.200\n203.0.113.99\n",
 		"ipset list SNK_1_r4": "Name: SNK_1_r4\nNumber of entries: 2\nMembers:\n81.2.69.160 timeout 412\n81.2.69.161 timeout 75\n"}}
 	now0 := time.Now()
@@ -44,6 +61,8 @@ func TestUIHarness(t *testing.T) {
 	}
 	e.DetectCaps()
 	e.Monitor().Set(health.Status{Tunnel: "wgc1", Iface: "wgc1", Exists: true, Up: true, LinkOK: true, ProbeOK: true, Healthy: true, ExitIP: "203.0.113.9", Country: "US", ProbeRTT: "38ms", Handshake: time.Now().Add(-40 * time.Second), GeoChecked: time.Now()})
+	e.Monitor().Set(health.Status{Tunnel: "wgx1", Iface: "wgx1", Exists: true, Up: true, LinkOK: true, ProbeOK: true, Healthy: true, ExitIP: "198.51.100.61", Country: "JP", ProbeRTT: "121ms", Handshake: time.Now().Add(-70 * time.Second), GeoChecked: time.Now()})
+	e.Monitor().Set(health.Status{Tunnel: "ovx1", Iface: "ovx1", Exists: true, Up: true, LinkOK: true, ProbeOK: true, Healthy: true, ExitIP: "192.0.2.80", Country: "FR", ProbeRTT: "30ms", GeoChecked: time.Now()})
 	e.Monitor().Set(health.Status{Tunnel: "ovpnc2", Iface: "tun12", Exists: true, Reason: "interface down"})
 	e.Monitor().Set(health.Status{Tunnel: "wgc2", Iface: "wgc2", Exists: true, Up: true, LinkOK: true, ProbeOK: true, Healthy: true, ExitIP: "192.0.2.44", Country: "GB"})
 	e.Decide()
@@ -76,6 +95,18 @@ func TestUIHarness(t *testing.T) {
 	gh.HandleFunc("/repos/irisariuan/snake/releases/latest", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"tag_name": "v1.1.0", "html_url": "https://github.com/irisariuan/snake/releases/tag/v1.1.0",
 			"body": "## What's changed\n* Emergency disable switch\n* Self-update and rollback", "published_at": time.Now().Add(-26 * time.Hour)})
+	})
+	gh.HandleFunc("/repos/irisariuan/snake/releases", func(w http.ResponseWriter, r *http.Request) {
+		var rels []map[string]any
+		for i, v := range []string{"v1.1.0", "v1.0.0", "v0.9.0", "v0.8.0-rc1", "v0.7.0"} {
+			rel := map[string]any{"tag_name": v, "html_url": "https://github.com/irisariuan/snake/releases/tag/" + v, "body": "Changes in " + v,
+				"published_at": time.Now().Add(-time.Duration(i*20+1) * 24 * time.Hour), "prerelease": strings.Contains(v, "-rc")}
+			if v != "v0.7.0" { // too old: no binary for this CPU
+				rel["assets"] = []map[string]string{{"name": update.Asset(), "browser_download_url": "x"}, {"name": update.SumsAsset, "browser_download_url": "x"}}
+			}
+			rels = append(rels, rel)
+		}
+		_ = json.NewEncoder(w).Encode(rels)
 	})
 	ghl, _ := net.Listen("tcp", "127.0.0.1:0")
 	go func() { _ = http.Serve(ghl, gh) }()

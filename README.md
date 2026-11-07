@@ -33,7 +33,9 @@ Inspired by and able to import from Ranger802004's
 
 * Asuswrt-Merlin 386.x or newer (Addons API, `ipset`, `dnsmasq` with ipset support)
 * One or more VPN clients configured in *VPN → VPN Client* (WireGuard `wgc1-5`
-  and/or OpenVPN `ovpnc1-5`; mixing types in one failover list is fine)
+  and/or OpenVPN `ovpnc1-5`; mixing types in one failover list is fine), and/or
+  saved WireGuard and OpenVPN configurations that snake runs itself
+  ([below](#more-than-ten-vpns-saved-tunnels))
 * JFFS custom scripts (the installer turns them on)
 
 In each VPN client you want snake to use, set **"Redirect Internet traffic
@@ -62,8 +64,9 @@ created an Addons menu, the page is under **Tools → snake**.
 
 **Settings → Updates** in the web UI shows the running version and the latest
 [GitHub release](https://github.com/irisariuan/snake/releases), with
-**Install** and **Roll back** buttons. Over SSH: `snake update [--check]` and
-`snake rollback`.
+**Install**, **Roll back** and **Install another version…** buttons. Over
+SSH: `snake update [--check]`, `snake update --list`,
+`snake update --version <version>` and `snake rollback`.
 
 * The daemon checks for a new release a few minutes after it starts and then
   twice a day. Turn on **Install updates automatically** to install new
@@ -76,12 +79,107 @@ created an Addons menu, the page is under **Tools → snake**.
   syslog.
 * **Roll back** swaps the current and previous binaries, so rolling back twice
   returns you to where you started. Your configuration is not changed.
+* **Install another version…** lists every published release (newest
+  first, with the running version and the rollback copy marked) and installs
+  the one you pick, older or newer: for going back further than the one
+  version **Roll back** keeps. It is verified and checked like an update, the
+  running version becomes the rollback copy, and if the chosen version does
+  not start snake rolls back by itself. Over SSH: `snake update --list` and
+  `snake update --version v1.2.3`.
+* An older version ignores settings it does not know, and refuses a
+  configuration that uses features it lacks (it then fails to start and
+  snake rolls back). Going back to an older version, with either button,
+  turns **Install updates automatically** off; otherwise the next check
+  would install the latest release again.
 * Development builds (not a release tag) are never auto-updated. You can still
   install the latest release by hand.
 * To use releases from a fork, change **Release repository**.
 
 Uninstall with `snake uninstall`. This removes rules, routes, sets, hooks and
 the page; add `--purge` to delete the config too.
+
+## More than ten VPNs: saved tunnels
+
+The firmware has five WireGuard and five OpenVPN clients. For more, save the
+files VPN providers hand out for their WireGuard or OpenVPN apps in snake: up
+to 20 WireGuard tunnels (`wgx1`–`wgx20`) and 20 OpenVPN clients
+(`ovx1`–`ovx20`), which snake runs itself.
+
+**A saved tunnel runs only while an enabled policy uses it**, as its main
+tunnel or as a failover backup (backups are kept connected so failover is
+instant and their health is known). Saved tunnels no enabled policy lists
+stay stopped. snake never starts or stops the firmware's own clients.
+
+1. Web UI → **Tunnels** → **+ Add WireGuard tunnel** or **+ Add OpenVPN
+   tunnel**.
+2. Paste the file (or **Load .conf/.ovpn file…**), give it a name, and
+   **Save & apply**.
+3. Add it to a policy's tunnels. It can be mixed with `wgc`/`ovpnc` clients
+   in a failover list. On **Save & apply** snake starts it; it is used once
+   its health check passes, a few seconds later.
+
+Either way, snake routes traffic itself: the tunnel gets no routes of its
+own, and like a firmware client in VPN Director mode it carries only what
+snake's policies send into it. DNS settings in the files are ignored (each
+policy chooses its resolver) and their scripts are never run.
+
+### WireGuard
+
+```ini
+[Interface]
+PrivateKey = <your private key>
+Address = 10.64.1.2/32, fc00:bbbb::2/128
+DNS = 10.64.0.1              # ignored: each policy chooses its resolver
+
+[Peer]
+PublicKey = <server public key>
+Endpoint = jp-tyo.example.net:51820
+AllowedIPs = 0.0.0.0/0, ::/0 # keep: it limits what the tunnel accepts
+PersistentKeepalive = 25
+```
+
+* `PrivateKey`, `Address`, and a `[Peer]` with `PublicKey`, `Endpoint` and
+  `AllowedIPs` are required; `ListenPort`, `MTU` (default 1420),
+  `PresharedKey` and `PersistentKeepalive` are optional. Keepalive defaults
+  to 25 seconds: a tunnel only counts as healthy after a recent handshake,
+  and without keepalives an idle tunnel never handshakes.
+* wg-quick's `Table`, `FwMark`, `SaveConfig` and
+  `PreUp`/`PostUp`/`PreDown`/`PostDown` are accepted and ignored.
+* snake creates the interface with `ip` and configures it with `wg`.
+  Changing a tunnel's peers reconfigures it with `wg syncconf`, which keeps
+  the session when it can.
+
+### OpenVPN
+
+* A client configuration (`client`, one or more `remote` lines) for a
+  routed (`dev tun`) server. Certificates and keys must be inline
+  (`<ca>…</ca>`, `<cert>`, `<key>`, `<tls-auth>`, `<tls-crypt>`), as in the
+  files most providers hand out: the router has no copy of separate files.
+* If the file has `auth-user-pass`, enter the username and password in the
+  fields next to it.
+* snake runs the router's `openvpn` with the provider's options plus its
+  own, which win: the interface (`dev ovxN`), `route-nopull` (pushed routes,
+  redirect-gateway and DNS are ignored), `script-security 1` (no scripts) and
+  `persist-tun`. Directives for routes, DNS, scripts, logging, management and
+  privileges are removed from the file. The client logs to the system log
+  as `snake-ovxN`.
+* Generated files, including the credentials, live in `/tmp/snake-openvpn`
+  (mode 0600; nothing is written to flash) and are removed when the client
+  stops. A client that exits (wrong password, server unreachable) is started
+  again at most every 30 seconds; changing its file or credentials
+  restarts it at once.
+
+### Notes
+
+* Saved tunnels are kept in `config.json` (mode 0600); private keys and
+  passwords are shown in the web UI, which needs the API token.
+* Disabling a saved tunnel, or deleting it, stops it on **Save & apply**.
+  *Emergency disable* leaves running tunnels up but sends no traffic into
+  them. Running tunnels stay up across snake restarts and updates.
+  `snake uninstall` stops them all.
+* Needs the firmware's WireGuard support (kernel module and `wg`) for
+  WireGuard and its `openvpn` for OpenVPN; both are on any model that offers
+  those VPN clients. Also needs the default 8-bit `mark_mask`.
 
 ## Policies
 
@@ -90,10 +188,19 @@ A policy is:
 * **Tunnels**, in priority order. The first healthy one is used. Later ones are
   failover backups.
 * **Match**: [rules](#domain-rules) (domain rules, `asn:`, `cidr:`), [rule lists](#rule-files-and-rule-lists)
-  it includes, and/or devices (MACs or groups).
+  it includes, and/or devices (MACs, IP addresses or subnets, or groups of them;
+  see [VPN server clients](#vpn-server-clients)).
   * destinations only → those destinations, for every device
   * devices only → the **whole device** (most reliable for TV apps)
   * both → those destinations, only for those devices
+* **Excluded devices** (optional): devices or groups the policy never
+  handles, also when they belong to an included group or subnet. With
+  destinations only, this means "every device except these". An excluded
+  device is not routed into the policy's tunnel (nor by its WebRTC tracking
+  or SNI proxy), not blocked by its `drop:` rules, and not under its leak
+  protection; other policies still apply to it. DNS for policy domains is
+  resolved the same way for every device, because the router's DNS does
+  not know which device will connect.
 * **Kill switch**: if no tunnel is usable, block instead of falling back to WAN.
 * **Expected exit country**: a tunnel whose exit country differs (for example,
   the VPN reconnected to another server) counts as failed for this policy.
@@ -279,6 +386,42 @@ devices that use it bypass snake's domain rules).
 
 "Scoped clients" means the policy's devices. For destination-only policies it
 means the whole LAN, because any device might reach those destinations.
+"The LAN" includes the clients of the router's own VPN servers, below.
+
+### VPN server clients
+
+Clients connected to the router's VPN servers are covered like LAN devices.
+*Settings → Client interfaces* (`lan_interfaces`) lists the iptables
+interface patterns snake treats as clients; the default is
+`br+ wgs+ tun2+`:
+
+| Pattern | Clients |
+|---|---|
+| `br+` | LAN, guest networks, and OpenVPN servers in TAP mode (bridged into br0) |
+| `wgs+` | WireGuard server peers (`wgs1`, default subnet 10.6.0.0/24) |
+| `tun2+` | OpenVPN servers in TUN mode (`tun21` 10.8.0.0/24, `tun22` 10.16.0.0/24) |
+
+Configurations from before this version that still had the old default
+(`br+`) are moved to the new one; a customised value is kept. Remove a
+pattern to leave those clients alone.
+
+For VPN server clients:
+
+* Destination-only policies, leak protection, DNS inspection and the SNI
+  proxy apply to them like to any LAN device.
+* They have no MAC address at the router, so device-scoped policies select
+  them by **IP address or subnet**: `10.6.0.2` for one WireGuard peer,
+  `10.8.0.0/24` for every client of an OpenVPN server. The device picker
+  lists WireGuard peers and OpenVPN client subnets from the router's
+  settings. An address only matches its own family: add a peer's IPv6
+  address too if it has one, or its IPv6 traffic is not matched (set the
+  policy's IPv6 to *block* to make it fall back to IPv4).
+* DNS hijacking DNATs their port-53 traffic to the router's LAN address
+  (dnsmasq may not listen on the VPN server's own address). IPv6 DNS of VPN
+  clients is not hijacked.
+* The VPN server must let its clients reach the Internet (*Client access:
+  LAN + Internet* / *Internet only*), or the firmware drops their traffic
+  before it can be routed into a tunnel.
 
 ### Encrypted DNS through the tunnel
 
@@ -497,7 +640,9 @@ Each tunnel used by an enabled policy is checked every `health_interval`
 seconds (default 15):
 
 * Interface exists and is up. For WireGuard, the latest handshake is newer than
-  `handshake_max_age`. For OpenVPN, `vpn_clientN_state` is 2 (connected).
+  `handshake_max_age`. For the firmware's OpenVPN clients,
+  `vpn_clientN_state` is 2 (connected); snake's own (`ovxN`) rely on the
+  probes below.
 * TCP connects to `probe_targets` **through the tunnel**. The sockets carry a
   per-tunnel probe fwmark routed by a table with an unreachable fallback, so a
   dead tunnel can never look healthy via WAN. After `probe_failures`
@@ -516,7 +661,7 @@ entries of the policy are flushed when the `conntrack` tool exists.
 ## How it works
 
 ```
-LAN client ──► mangle PREROUTING -i br+ ─► SNAKE
+LAN client ──► mangle PREROUTING -i br+/wgs+/tun2+ ─► SNAKE
                  WAN/tunnel NAT affinity, then isolated connection policy │ private dst → RETURN
                  SNAKE_P<id> (in policy order):
                    mac / ipset(dnsmasq-learned, ASN+CIDR, WebRTC peers/servers)  ─► SNAKE_M<id>: MARK id<<16, save connmark
@@ -545,7 +690,10 @@ mangle OUTPUT SNAKE_DNSO: dnsmasq's UDP answers → NFQUEUE → DNS inspector �
   ownership. Overlapping custom connection masks are rejected even when
   QoS is off, so enabling it later does not invalidate the configuration.
   Other addons must not claim snake's documented masks, tables or priorities.
-* ip rule priorities 4980–5499, routing tables 1000–1310.
+* ip rule priorities 4980–5499, routing tables 1000–1350 (probe tables
+  1301–1310 for the firmware clients, 1311–1330 for `wgx1`–`wgx20` and
+  1331–1350 for `ovx1`–`ovx20`, whose probe rules use priorities
+  5401–5440).
 * All chains are loaded with `iptables-restore --noflush`, so each table is
   updated atomically. Chains of removed policies are deleted in the same
   transaction.
@@ -649,15 +797,44 @@ hand and run `snake reload`. See `testdata/config.json` for an example.
 ## Development
 
 Building needs Go 1.26 or newer (with the default `GOTOOLCHAIN=auto`, an
-older `go` downloads it).
+older `go` downloads it) and, for the web UI, Node.js 22.
+
+The web UI is an [Astro](https://astro.build) + [React](https://react.dev) + [Tailwind CSS](https://tailwindcss.com)
+project in `web/`:
+
+* `web/src/pages/index.astro`: the page shell;
+* `web/src/scripts/app.js`: the app, which renders the UI from the daemon's
+  JSON API;
+* `web/src/components/`: React components the app mounts in place
+  (`src/scripts/react-bridge.js`): `DeviceSelector` (include/exclude
+  devices, used for policies and for groups), `TunnelPicker` (failover
+  order), `ChecklistPicker` (rule lists), and shared controls in
+  `components/controls/` (`Button`, `Badge`/`TunnelHealth`, `SearchBox`,
+  `FilterChips`, `SelectionToolbar`, `TriState`). React is compiled by
+  Vite's React plugin; Astro's React integration is not used because its
+  island runtime would add a second script, and the router page needs
+  one. `npm test` runs the components' logic tests (`*.test.js`);
+* `web/src/styles/global.css`: Tailwind theme and the UI's component
+  classes. Utilities are prefixed (`tw:mt-2`, `tw:text-warn`) and there is no
+  preflight reset, because the same CSS runs inside the router's own WebUI
+  page.
+
+`make web` builds it to a static page in `internal/webui/build/site` (not
+committed), which the Go binary embeds. Its CSS and JS are inlined into the
+standalone page and into the router's Addons page, which must be a single
+file. `make arm64`, `make armv7` and `make test` build the UI first. A plain
+`go build` without it still works; the binary then shows a "web UI not built"
+notice instead of the UI.
 
 Releases are built by GitHub Actions: push a tag like `v1.2.3` and
-`.github/workflows/release.yml` tests, builds `snake-arm64` and `snake-armv7`,
-and publishes them with `SHA256SUMS` as a GitHub release. Every push also runs
-tests and builds (`ci.yml`).
+`.github/workflows/release.yml` builds the web UI, tests, builds `snake-arm64`
+and `snake-armv7`, and publishes them with `SHA256SUMS` as a GitHub release.
+Every push also builds the UI, runs tests and builds (`ci.yml`), and uploads
+the binaries and the static page as artifacts.
 
 ```
-make test          # unit tests
-make integration   # real iptables/ipset/ip in a throwaway netns (root)
+make web           # build the web UI (npm ci when web/package-lock.json changed)
+make test          # web UI build, JS + Go unit tests (fails if the UI is missing)
+make integration   # real iptables/ipset/ip and OpenVPN in a throwaway netns (root)
 make ui-dev        # UI against a fake engine at http://127.0.0.1:18444 (token "testtoken")
 ```

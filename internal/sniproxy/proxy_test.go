@@ -196,7 +196,8 @@ func (h *harness) send(t *testing.T, payload []byte) ([]byte, error) {
 	t.Helper()
 	c, err := net.Dial("tcp4", h.p.Addr())
 	if err != nil {
-		t.Fatal(err)
+		// A refused connection can be reset before the dial returns.
+		return nil, err
 	}
 	defer c.Close()
 	if _, err := c.Write(payload); err != nil {

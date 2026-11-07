@@ -1,7 +1,10 @@
 // Package netfilter builds and applies iptables/ipset state for snake.
 package netfilter
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Set kinds.
 const (
@@ -51,18 +54,35 @@ const (
 // PolicyChain is the per-policy match chain.
 func PolicyChain(id int) string { return fmt.Sprintf("%s%d", chainPolicy, id) }
 
+// GuardChain is a policy's chain for one feature (drop, dns, dot, doh,
+// quic, sni, sniq) when it excludes devices: it returns for them first.
+func GuardChain(id int, feature string) string {
+	return fmt.Sprintf("SNAKE_X%d_%s", id, strings.ToUpper(feature))
+}
+
 // MarkChain is the per-policy mark chain.
 func MarkChain(id int) string { return fmt.Sprintf("%s%d", chainMark, id) }
+
+// ProbePref is the ip rule priority of a tunnel's probe rule.
+func ProbePref(idx, merlin int) int {
+	if idx <= merlin {
+		return ProbePrefBase + idx
+	}
+	return ProbePrefExtra + idx - merlin
+}
 
 // Routing constants.
 const (
 	PolicyTableBase = 1000 // table = base + policy id
 	ProbeTableBase  = 1300 // table = base + tunnel index
 	DNSRulePrefBase = 5000 // pref = base + policy id
-	ProbePrefBase   = 4980 // pref = base + tunnel index
+	ProbePrefBase   = 4980 // pref = base + tunnel index (firmware clients)
 	PolicyPrefBase  = 5200 // pref = base + policy id
-	PrefMin         = 4980
-	PrefMax         = 5499
+	// ProbePrefExtra is the base for snake's own WireGuard tunnels (tunnel
+	// index 11 and up): 4980+11 would collide with the DNS rules.
+	ProbePrefExtra = 5400 // pref = base + tunnel index - 10
+	PrefMin        = 4980
+	PrefMax        = 5499
 )
 
 // DefaultDoHDomains are well-known DNS-over-HTTPS endpoints. Their resolved

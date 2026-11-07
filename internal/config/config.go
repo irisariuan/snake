@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -22,12 +23,72 @@ var TunnelNames = []string{
 	"ovpnc1", "ovpnc2", "ovpnc3", "ovpnc4", "ovpnc5",
 }
 
+// WireGuardPrefix names the WireGuard tunnels snake runs itself, beyond
+// the firmware's VPN clients: wgx1 ... wgx<MaxWireGuard>. The name is
+// also the kernel interface.
+const WireGuardPrefix = "wgx"
+
+// MaxWireGuard is the number of WireGuard tunnels snake can run itself.
+const MaxWireGuard = 20
+
+// OpenVPNPrefix names the OpenVPN clients snake runs itself: ovx1 ...
+// ovx<MaxOpenVPN>, also the interface name.
+const OpenVPNPrefix = "ovx"
+
+// MaxOpenVPN is the number of OpenVPN clients snake can run itself.
+const MaxOpenVPN = 20
+
+// MaxTunnels is the number of tunnel slots (firmware clients + snake's
+// own WireGuard and OpenVPN tunnels): probe marks, probe tables and rule
+// priorities are reserved for each.
+var MaxTunnels = len(TunnelNames) + MaxWireGuard + MaxOpenVPN
+
+// WireGuardName returns the tunnel name of snake's own WireGuard slot n.
+func WireGuardName(n int) string { return WireGuardPrefix + strconv.Itoa(n) }
+
+// WireGuardSlot returns n for "wgx<n>", or 0.
+func WireGuardSlot(name string) int { return slot(name, WireGuardPrefix, MaxWireGuard) }
+
+// OpenVPNName returns the tunnel name of snake's own OpenVPN slot n.
+func OpenVPNName(n int) string { return OpenVPNPrefix + strconv.Itoa(n) }
+
+// OpenVPNSlot returns n for "ovx<n>", or 0.
+func OpenVPNSlot(name string) int { return slot(name, OpenVPNPrefix, MaxOpenVPN) }
+
+// SnakeTunnel reports whether snake runs the tunnel itself (wgx, ovx).
+func SnakeTunnel(name string) bool { return WireGuardSlot(name) > 0 || OpenVPNSlot(name) > 0 }
+
+func slot(name, prefix string, max int) int {
+	if !strings.HasPrefix(name, prefix) {
+		return 0
+	}
+	d := strings.TrimPrefix(name, prefix)
+	n, err := strconv.Atoi(d)
+	if err != nil || n < 1 || n > max || strconv.Itoa(n) != d {
+		return 0
+	}
+	return n
+}
+
+// IsWireGuard reports whether a tunnel is WireGuard (firmware or snake's own).
+func IsWireGuard(name string) bool {
+	return strings.HasPrefix(name, "wgc") || WireGuardSlot(name) > 0
+}
+
 // TunnelIndex returns a stable 1-based index for a tunnel name, or 0.
+// Firmware clients are 1-10, snake's WireGuard tunnels 11-30, its
+// OpenVPN clients 31-50.
 func TunnelIndex(name string) int {
 	for i, n := range TunnelNames {
 		if n == name {
 			return i + 1
 		}
+	}
+	if n := WireGuardSlot(name); n > 0 {
+		return len(TunnelNames) + n
+	}
+	if n := OpenVPNSlot(name); n > 0 {
+		return len(TunnelNames) + MaxWireGuard + n
 	}
 	return 0
 }
@@ -87,8 +148,12 @@ type Policy struct {
 	ASNs            []int    `json:"asns"`
 	CIDRs           []string `json:"cidrs"`
 	Devices         []string `json:"devices"` // MAC addresses or "group:<name>"
-	Lists           []string `json:"lists"`   // names of rule lists merged into this policy
-	Leak            Leak     `json:"leak"`
+	// ExcludeDevices are never handled by this policy: not routed, not
+	// blocked by its drop: rules, not under its leak protection. With no
+	// Devices the policy covers every device but these.
+	ExcludeDevices []string `json:"exclude_devices"`
+	Lists          []string `json:"lists"` // names of rule lists merged into this policy
+	Leak           Leak     `json:"leak"`
 }
 
 // RuleList is a reusable, importable/exportable set of rules (a .rules file).
@@ -145,10 +210,14 @@ type Settings struct {
 	DoHCanary        bool     `json:"doh_canary"` // answer Firefox/iCloud Private Relay canaries with NXDOMAIN
 	PreResolve       bool     `json:"pre_resolve"`
 	FlushConntrack   bool     `json:"flush_conntrack"`
-	LANInterfaces    string   `json:"lan_interfaces"` // iptables -i pattern
-	STUNTestServers  []string `json:"stun_test_servers"`
-	AutoUpdate       bool     `json:"auto_update"` // install new releases automatically
-	UpdateRepo       string   `json:"update_repo"` // GitHub owner/name releases come from
+	// LANInterfaces are the iptables -i patterns of client traffic,
+	// separated by spaces: the LAN bridges plus the router's VPN servers
+	// (WireGuard wgs*, OpenVPN tun21/tun22), whose clients are covered
+	// like LAN devices.
+	LANInterfaces   string   `json:"lan_interfaces"`
+	STUNTestServers []string `json:"stun_test_servers"`
+	AutoUpdate      bool     `json:"auto_update"` // install new releases automatically
+	UpdateRepo      string   `json:"update_repo"` // GitHub owner/name releases come from
 	// Router-wide DoT / DoH blocking: policy (each policy's toggle), always
 	// (whole LAN) or never (overrides every policy).
 	BlockDoT string `json:"block_dot"`
@@ -167,7 +236,36 @@ type Settings struct {
 //	   egress port, IPsec and policy-routing fields, and routed traffic
 //	   stopped working.
 //	4: conntrack marks move to their own bits (conn_mark_mask).
-const CurrentVersion = 4
+//	5: lan_interfaces is a list and includes the VPN servers by default.
+const CurrentVersion = 5
+
+// DefaultLANInterfaces covers the LAN bridges (br0, guest networks) and
+// the clients of the router's VPN servers: WireGuard (wgs1...) and OpenVPN
+// in tun mode (tun21, tun22). OpenVPN in tap mode is bridged into br0.
+const DefaultLANInterfaces = "br+ wgs+ tun2+"
+
+// ClientInterfaces returns the iptables -i patterns of client traffic.
+func (s Settings) ClientInterfaces() []string {
+	f := strings.FieldsFunc(s.LANInterfaces, func(r rune) bool { return r == ' ' || r == ',' || r == '\t' })
+	if len(f) == 0 {
+		return []string{"br+"}
+	}
+	return dedup(f)
+}
+
+// L2Interface reports whether a pattern names interfaces with Ethernet
+// headers, where clients can be matched by MAC address. Routed tunnels
+// (VPN servers) carry IP packets only.
+func L2Interface(pattern string) bool {
+	for _, p := range []string{"wg", "tun", "ppp", "ipsec", "vti"} {
+		if strings.HasPrefix(pattern, p) {
+			return false
+		}
+	}
+	return true
+}
+
+var ifacePatternRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}\+?$`)
 
 // Mark bits.
 //
@@ -305,7 +403,7 @@ func (c *Config) DoHBlockedLANWide() bool {
 		return false
 	}
 	for _, p := range c.Policies {
-		if p.Enabled && p.Leak.BlockDoH && len(c.ResolveDevices(p)) == 0 {
+		if p.Enabled && p.Leak.BlockDoH && len(c.ResolveDevices(p)) == 0 && len(p.ExcludeDevices) == 0 {
 			return true
 		}
 	}
@@ -320,6 +418,11 @@ type Config struct {
 	Groups    []Group    `json:"groups"`
 	RuleLists []RuleList `json:"rule_lists"`
 	Policies  []Policy   `json:"policies"`
+	// WireGuard are tunnels snake creates and runs itself (wgx1...),
+	// for more VPNs than the firmware's ten clients.
+	WireGuard []WireGuard `json:"wireguard"`
+	// OpenVPN are OpenVPN clients snake runs itself (ovx1...).
+	OpenVPN []OpenVPN `json:"openvpn"`
 
 	migratedMask uint32 // set by Load, see MigratedMarkMask
 }
@@ -407,7 +510,7 @@ func DefaultSettings() Settings {
 		DoHCanary:        true,
 		PreResolve:       true,
 		FlushConntrack:   true,
-		LANInterfaces:    "br+",
+		LANInterfaces:    DefaultLANInterfaces,
 		STUNTestServers:  []string{"stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"},
 		UpdateRepo:       "irisariuan/snake",
 		BlockDoT:         BlockPolicy,
@@ -526,10 +629,19 @@ func (s Settings) PolicyMark(id int) uint32 {
 }
 
 // ProbeMark returns the fwmark used by health probes for a tunnel. Probe marks
-// occupy the top of the mark range so they never collide with policy ids.
+// occupy the top of the mark range so they never collide with policy ids:
+// the firmware clients the top ten values, snake's own tunnels the values
+// below them.
 func (s Settings) ProbeMark(tunnel string) uint32 {
-	idx := TunnelIndex(tunnel)
-	return (s.MaxMarkValue() - uint32(len(TunnelNames)) + uint32(idx)) << s.MarkShift() & s.MarkMask
+	return s.probeValue(TunnelIndex(tunnel)) << s.MarkShift() & s.MarkMask
+}
+
+func (s Settings) probeValue(idx int) uint32 {
+	n := len(TunnelNames)
+	if idx <= n {
+		return s.MaxMarkValue() - uint32(n) + uint32(idx)
+	}
+	return s.MaxMarkValue() - uint32(idx)
 }
 
 // MaxPolicyID is the largest policy id allowed.
@@ -545,6 +657,33 @@ var (
 	nameRe = regexp.MustCompile(`^[A-Za-z0-9 _.\-+]{1,40}$`)
 	ccRe   = regexp.MustCompile(`^[A-Z]{2}$`)
 )
+
+// NormalizeClient validates a device entry: a MAC address, an IP address or
+// a subnet (for VPN server clients and other routed clients, which have no
+// MAC address at the router). It returns the canonical form.
+func NormalizeClient(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if m, err := NormalizeMAC(s); err == nil {
+		return m, nil
+	}
+	if a, err := netip.ParseAddr(s); err == nil && a.Zone() == "" {
+		return a.Unmap().String(), nil
+	}
+	if p, err := netip.ParsePrefix(s); err == nil {
+		p = p.Masked()
+		if p.Addr().Is4In6() {
+			return "", fmt.Errorf("invalid device %q: use the IPv4 form", s)
+		}
+		return p.String(), nil
+	}
+	return "", fmt.Errorf("invalid device %q (MAC address, IP address or subnet)", s)
+}
+
+// ClientMAC reports whether a normalized device entry is a MAC address.
+func ClientMAC(s string) bool {
+	_, err := NormalizeMAC(s)
+	return err == nil
+}
 
 // NormalizeMAC lowercases and validates a MAC address.
 func NormalizeMAC(s string) (string, error) {
@@ -600,16 +739,8 @@ func (c *Config) Normalize() {
 		p.Name = strings.TrimSpace(p.Name)
 		p.Domains = dedupKeepComments(mapStr(p.Domains, normalizeRule))
 		p.CIDRs = dedup(mapStr(p.CIDRs, strings.TrimSpace))
-		p.Devices = dedup(mapStr(p.Devices, func(s string) string {
-			s = strings.TrimSpace(s)
-			if strings.HasPrefix(s, "group:") {
-				return s
-			}
-			if m, err := NormalizeMAC(s); err == nil {
-				return m
-			}
-			return s
-		}))
+		p.Devices = dedup(mapStr(p.Devices, normalizeDevice))
+		p.ExcludeDevices = dedup(mapStr(p.ExcludeDevices, normalizeDevice))
 		p.Tunnels = dedup(mapStr(p.Tunnels, func(s string) string { return strings.ToLower(strings.TrimSpace(s)) }))
 		p.ExpectedCountry = strings.ToUpper(strings.TrimSpace(p.ExpectedCountry))
 		sort.Ints(p.ASNs)
@@ -653,23 +784,35 @@ func (c *Config) Normalize() {
 	if c.Groups == nil {
 		c.Groups = []Group{}
 	}
+	c.normalizeSnakeTunnels()
 	if c.Devices == nil {
 		c.Devices = []Device{}
 	}
 	for i := range c.Groups {
 		c.Groups[i].Name = strings.TrimSpace(c.Groups[i].Name)
 		c.Groups[i].MACs = dedup(mapStr(c.Groups[i].MACs, func(s string) string {
-			if m, err := NormalizeMAC(s); err == nil {
+			if m, err := NormalizeClient(s); err == nil {
 				return m
 			}
 			return strings.TrimSpace(s)
 		}))
 	}
 	for i := range c.Devices {
-		if m, err := NormalizeMAC(c.Devices[i].MAC); err == nil {
+		if m, err := NormalizeClient(c.Devices[i].MAC); err == nil {
 			c.Devices[i].MAC = m
 		}
 	}
+}
+
+func normalizeDevice(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "group:") {
+		return s
+	}
+	if m, err := NormalizeClient(s); err == nil {
+		return m
+	}
+	return s
 }
 
 func countID(ps []Policy, id int) int {
@@ -722,6 +865,14 @@ func (c *Config) Validate() error {
 			add("%s must be policy, always or never", name)
 		}
 	}
+	if len(strings.Fields(strings.NewReplacer(",", " ").Replace(s.LANInterfaces))) == 0 {
+		add("lan_interfaces needs at least one interface pattern")
+	}
+	for _, p := range s.ClientInterfaces() {
+		if !ifacePatternRe.MatchString(p) {
+			add("lan_interfaces: %q is not an interface name or pattern (e.g. br+, wgs1)", p)
+		}
+	}
 	if s.DNSForwardPort < 1024 || s.DNSForwardPort > 65000 {
 		add("dns_forward_port must be between 1024 and 65000")
 	}
@@ -748,13 +899,13 @@ func (c *Config) Validate() error {
 		}
 		groups[g.Name] = true
 		for _, m := range g.MACs {
-			if _, err := NormalizeMAC(m); err != nil {
+			if _, err := NormalizeClient(m); err != nil {
 				add("group %s: %v", g.Name, err)
 			}
 		}
 	}
 	for _, d := range c.Devices {
-		if _, err := NormalizeMAC(d.MAC); err != nil {
+		if _, err := NormalizeClient(d.MAC); err != nil {
 			add("device %s: %v", d.Name, err)
 		}
 	}
@@ -776,6 +927,7 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	snakeIDs := c.validateSnakeTunnels(add)
 	names := map[string]bool{}
 	ids := map[int]bool{}
 	for _, p := range c.Policies {
@@ -798,8 +950,11 @@ func (c *Config) Validate() error {
 			add("%sat least one tunnel is required", pre)
 		}
 		for _, t := range p.Tunnels {
-			if TunnelIndex(t) == 0 {
+			switch {
+			case TunnelIndex(t) == 0:
 				add(pre+"unknown tunnel %q", t)
+			case SnakeTunnel(t) && !snakeIDs[t]:
+				add(pre+"tunnel %q is not set up (add it under Tunnels)", t)
 			}
 		}
 		if p.ExpectedCountry != "" && !ccRe.MatchString(p.ExpectedCountry) {
@@ -818,13 +973,22 @@ func (c *Config) Validate() error {
 				add(pre+"invalid CIDR %q", cidr)
 			}
 		}
+		inc := map[string]bool{}
 		for _, d := range p.Devices {
+			inc[d] = true
+		}
+		for _, d := range append(append([]string(nil), p.Devices...), p.ExcludeDevices...) {
 			if strings.HasPrefix(d, "group:") {
 				if !groups[strings.TrimPrefix(d, "group:")] {
 					add(pre+"unknown group %q", d)
 				}
-			} else if _, err := NormalizeMAC(d); err != nil {
+			} else if _, err := NormalizeClient(d); err != nil {
 				add(pre+"%v", err)
+			}
+		}
+		for _, d := range p.ExcludeDevices {
+			if inc[d] {
+				add(pre+"%s is both included and excluded", d)
 			}
 		}
 		if ep := c.Expand(p); !ep.HasDomains() && !ep.HasDrops() && len(ep.ASNs)+len(ep.CIDRs)+len(p.Devices) == 0 {
@@ -872,10 +1036,16 @@ func compileErrs(rules []string) []match.LineError {
 	return errs
 }
 
-// ResolveDevices expands groups into MAC addresses.
-func (c *Config) ResolveDevices(p Policy) []string {
+// ResolveDevices expands groups into device entries: MAC addresses, IP
+// addresses and subnets.
+func (c *Config) ResolveDevices(p Policy) []string { return c.resolve(p.Devices) }
+
+// ResolveExcluded expands the policy's excluded devices.
+func (c *Config) ResolveExcluded(p Policy) []string { return c.resolve(p.ExcludeDevices) }
+
+func (c *Config) resolve(devices []string) []string {
 	var out []string
-	for _, d := range p.Devices {
+	for _, d := range devices {
 		if strings.HasPrefix(d, "group:") {
 			name := strings.TrimPrefix(d, "group:")
 			for _, g := range c.Groups {
@@ -934,6 +1104,9 @@ func (p Policy) HasDestinations() bool {
 
 // Scope describes the policy match mode for display.
 func (p Policy) Scope() string {
+	if len(p.ExcludeDevices) > 0 && len(p.Devices) == 0 && p.HasDestinations() {
+		return "destinations, some devices excluded"
+	}
 	switch {
 	case len(p.Devices) > 0 && p.HasDestinations():
 		return "devices+destinations"
@@ -957,12 +1130,18 @@ func Load(path string) (*Config, error) {
 	if err := json.Unmarshal(b, c); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	if c.Version < CurrentVersion {
+	if c.Version < 4 {
 		// Before version 4 conntrack marks used the packet-mark bits.
 		c.migratedMask = c.Settings.MarkMask
 		if c.Version == 2 && c.Settings.MarkMask == BadMarkMask {
 			c.Settings.MarkMask = DefaultMarkMask
 		}
+	}
+	if c.Version < 5 && strings.TrimSpace(c.Settings.LANInterfaces) == "br+" {
+		// The old default: VPN server clients join the LAN.
+		c.Settings.LANInterfaces = DefaultLANInterfaces
+	}
+	if c.Version < CurrentVersion {
 		c.Version = CurrentVersion
 	}
 	c.ApplyDefaults()

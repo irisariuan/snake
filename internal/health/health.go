@@ -100,14 +100,14 @@ func (m *Monitor) Link(s config.Settings, tunnel string) Status {
 		st.Reason = "interface down"
 		return st
 	}
-	if strings.HasPrefix(tunnel, "wgc") {
+	if config.IsWireGuard(tunnel) {
 		st.Handshake = m.wgHandshake(st.Iface)
 		age := time.Since(st.Handshake)
 		if st.Handshake.IsZero() || age > time.Duration(s.HandshakeMaxAge)*time.Second {
 			st.Reason = "stale WireGuard handshake"
 			return st
 		}
-	} else {
+	} else if strings.HasPrefix(tunnel, "ovpnc") {
 		unit := strings.TrimPrefix(tunnel, "ovpnc")
 		st.ClientState = system.NVRAM{R: m.R}.Get("vpn_client" + unit + "_state")
 		if st.ClientState != "" && st.ClientState != "2" {

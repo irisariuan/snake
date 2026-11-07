@@ -54,6 +54,9 @@ Usage: snake <command> [args]
   status                  show tunnels and policies
   update [--check] [--yes] [--force]
                           install the latest GitHub release (restarts the daemon)
+  update --list           list published releases
+  update --version V [--yes]
+                          install release V, older or newer (restarts the daemon)
   rollback [--yes]        go back to the version before the last update
   apply [--dry-run]       re-apply rules (dry run prints the generated commands)
   reload                  reload config.json from disk and apply
@@ -493,6 +496,13 @@ func status() error {
 	return tw.Flush()
 }
 
+func devicesSummary(p config.Policy) string {
+	if len(p.ExcludeDevices) == 0 {
+		return strconv.Itoa(len(p.Devices))
+	}
+	return fmt.Sprintf("%d (-%d)", len(p.Devices), len(p.ExcludeDevices))
+}
+
 func policyList() error {
 	cfg, err := config.Load(paths().Config)
 	if err != nil {
@@ -501,7 +511,7 @@ func policyList() error {
 	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "ID\tNAME\tENABLED\tTUNNELS\tKILL\tSCOPE\tDOMAINS\tASNS\tCIDRS\tDEVICES")
 	for _, p := range cfg.Policies {
-		fmt.Fprintf(tw, "%d\t%s\t%v\t%s\t%v\t%s\t%d\t%d\t%d\t%d\n", p.ID, p.Name, p.Enabled, strings.Join(p.Tunnels, ">"), p.KillSwitch, p.Scope(), len(p.Domains), len(p.ASNs), len(p.CIDRs), len(p.Devices))
+		fmt.Fprintf(tw, "%d\t%s\t%v\t%s\t%v\t%s\t%d\t%d\t%d\t%s\n", p.ID, p.Name, p.Enabled, strings.Join(p.Tunnels, ">"), p.KillSwitch, p.Scope(), len(p.Domains), len(p.ASNs), len(p.CIDRs), devicesSummary(p))
 	}
 	return tw.Flush()
 }
@@ -755,6 +765,8 @@ func install() error {
 
 func uninstall(purge bool) error {
 	_ = stop(true)
+	engine.NewWireGuard(system.Exec{}).RemoveAll() // snake's own tunnels
+	engine.NewOpenVPN(system.Exec{}).StopAll()
 	for _, h := range hookFiles() {
 		removeHook(h)
 	}

@@ -51,3 +51,25 @@ func TestSyncReconciles(t *testing.T) {
 		t.Error("delete before add")
 	}
 }
+
+func TestSyncWireGuardProbe(t *testing.T) {
+	rec := &system.Recorder{}
+	s := config.DefaultSettings()
+	err := Manager{R: rec}.Sync(s, []PolicyRoute{{ID: 1, Iface: "wgx20", DNSServer: "9.9.9.9", DNSTunnel: "wgx20"}},
+		[]ProbeRoute{{Tunnel: "wgx1", Iface: "wgx1", Up: true}, {Tunnel: "wgx20", Iface: "wgx20", Up: false}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := rec.Joined()
+	for _, s := range []string{
+		"ip -4 rule add pref 5401 fwmark 0xf40000/0xc0ff0000 lookup 1311",
+		"ip -4 route replace default dev wgx1 table 1311",
+		"ip -4 rule add pref 5420 fwmark 0xe10000/0xc0ff0000 lookup 1330",
+		"ip -4 route replace unreachable default table 1330",
+		"ip -4 rule add pref 5001 iif lo oif wgx20 to 9.9.9.9/32 lookup 1330",
+	} {
+		if !strings.Contains(out, s) {
+			t.Errorf("missing %q in\n%s", s, out)
+		}
+	}
+}

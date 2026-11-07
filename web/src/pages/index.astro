@@ -1,0 +1,25 @@
+---
+// snake's web UI. The page is a shell: src/scripts/app.js renders the UI
+// into #snake from the daemon's JSON API.
+//
+// Standalone (served by the daemon on the API port) the context below is
+// used. In the router's Addons page Go takes only this page's styles and
+// module script and puts them in the Merlin template (internal/webui),
+// which sets its own SNAKE_CTX.
+import '../styles/global.css';
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>snake router</title>
+    <script is:inline data-snake-ctx>window.SNAKE_CTX = { mode: 'standalone', token: '', apiBase: '' };</script>
+  </head>
+  <body class="tw:m-0 tw:bg-bg">
+    <div id="snake" class="tw:mx-auto tw:min-h-screen tw:max-w-[1100px]"></div>
+    <script>
+      import '../scripts/app.js';
+    </script>
+  </body>
+</html>

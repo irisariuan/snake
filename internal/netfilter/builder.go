@@ -3,6 +3,7 @@ package netfilter
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"sort"
 	"strings"
 
@@ -25,12 +26,17 @@ const (
 
 // PolicyState is a policy plus its runtime decisions.
 type PolicyState struct {
-	Policy       config.Policy
-	MACs         []string // resolved device MACs (groups expanded)
-	ActiveTunnel string   // "" when no tunnel is usable
-	IPv6Mode     string   // V6Route / V6Block / V6Off
-	WebRTCMode   string   // RTCQueue / RTCPorts / RTCOff
-	Drops        bool     // the policy has drop: rules
+	Policy config.Policy
+	// Clients are the policy's devices, groups expanded: MAC addresses,
+	// IP addresses or subnets. Empty: every client (destination policy).
+	Clients []string
+	// Excluded are devices the policy never handles (groups expanded):
+	// they return from its chains before anything matches.
+	Excluded     []string
+	ActiveTunnel string // "" when no tunnel is usable
+	IPv6Mode     string // V6Route / V6Block / V6Off
+	WebRTCMode   string // RTCQueue / RTCPorts / RTCOff
+	Drops        bool   // the policy has drop: rules
 }
 
 // Options describe router capabilities and existing state.
@@ -55,6 +61,10 @@ type Options struct {
 	// connections of sniffing policies' clients that no policy claimed are
 	// redirected to it. 0 installs no redirect (proxy not running).
 	SNIPort int
+	// LANAddr is the router's LAN IPv4 address. DNS hijacking on routed
+	// client interfaces (VPN servers) DNATs to it: dnsmasq may not listen
+	// on those interfaces' own addresses.
+	LANAddr string
 }
 
 // Plan is a set of iptables-restore payloads keyed by "family/table".
@@ -140,18 +150,19 @@ func Build(s config.Settings, states []PolicyState, opt Options) Plan {
 		if !v6 || opt.IPv6NAT {
 			plan.Restore[fam+"/nat"] = nat.render("nat", opt.Existing[fam+"/nat"])
 		}
-		lan := s.LANInterfaces
+		for _, lan := range s.ClientInterfaces() {
+			plan.Hooks = append(plan.Hooks, Hook{V6: v6, Table: "mangle", Chain: "PREROUTING", Args: []string{"-i", lan, "-j", ChainMain}})
+		}
 		plan.Hooks = append(plan.Hooks,
-			Hook{V6: v6, Table: "mangle", Chain: "PREROUTING", Args: []string{"-i", lan, "-j", ChainMain}},
 			Hook{V6: v6, Table: "mangle", Chain: "FORWARD", Args: []string{"-j", ChainMSS}},
 			Hook{V6: v6, Table: "mangle", Chain: "OUTPUT", Args: []string{"-p", "udp", "--sport", "53", "-j", ChainDNSOut}},
 			Hook{V6: v6, Table: "filter", Chain: "FORWARD", Args: []string{"-j", ChainFwd}},
 		)
 		if !v6 || opt.IPv6NAT {
-			plan.Hooks = append(plan.Hooks,
-				Hook{V6: v6, Table: "nat", Chain: "PREROUTING", Args: []string{"-i", lan, "-j", ChainDNS}},
-				Hook{V6: v6, Table: "nat", Chain: "POSTROUTING", Args: []string{"-j", ChainNAT}},
-			)
+			for _, lan := range s.ClientInterfaces() {
+				plan.Hooks = append(plan.Hooks, Hook{V6: v6, Table: "nat", Chain: "PREROUTING", Args: []string{"-i", lan, "-j", ChainDNS}})
+			}
+			plan.Hooks = append(plan.Hooks, Hook{V6: v6, Table: "nat", Chain: "POSTROUTING", Args: []string{"-j", ChainNAT}})
 		}
 	}
 	return plan
@@ -163,13 +174,15 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 	rmask := hex(s.RouteMask())
 	cmask := hex(s.ConnMarkMask)
 	qdir := hex(config.QoSDirMask)
-	lan := s.LANInterfaces
+	lans := s.ClientInterfaces()
 	for _, c := range []string{ChainMain, ChainSave, ChainRTC, ChainMSS, ChainDNSOut} {
 		mangle.chain(c)
 	}
 	if opt.DNSQueue > 0 {
 		q := fmt.Sprint(opt.DNSQueue)
-		mangle.add(ChainDNSOut, "-o", lan, "-j NFQUEUE --queue-num", q, "--queue-bypass")
+		for _, lan := range lans {
+			mangle.add(ChainDNSOut, "-o", lan, "-j NFQUEUE --queue-num", q, "--queue-bypass")
+		}
 		mangle.add(ChainDNSOut, "-o lo -j NFQUEUE --queue-num", q, "--queue-bypass")
 	}
 	nat.chain(ChainDNS)
@@ -261,21 +274,57 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 
 	tunnels := map[string]bool{}
 	type scope struct {
-		global bool
-		macs   map[string]bool
+		global  bool
+		clients map[string]bool
 	}
 	scopes := map[string]*scope{} // leak feature -> scope
+	// Policies with excluded devices get their own guarded chain per
+	// feature instead of joining the merged scope.
+	guarded := map[string][]PolicyState{}
 	addScope := func(feature string, st PolicyState) {
+		if len(st.Excluded) > 0 {
+			guarded[feature] = append(guarded[feature], st)
+			return
+		}
 		sc := scopes[feature]
 		if sc == nil {
-			sc = &scope{macs: map[string]bool{}}
+			sc = &scope{clients: map[string]bool{}}
 			scopes[feature] = sc
 		}
-		if len(st.MACs) == 0 {
+		if len(st.Clients) == 0 {
 			sc.global = true
 		}
-		for _, m := range st.MACs {
-			sc.macs[m] = true
+		for _, m := range st.Clients {
+			sc.clients[m] = true
+		}
+	}
+	// who lists the match prefixes for traffic from the given clients
+	// (every client when empty) on every client interface. A device that
+	// cannot be matched in this family or on an interface (an IPv4
+	// address in the IPv6 table, a MAC on a routed tunnel) is skipped.
+	who := func(clients []string) [][]string {
+		var out [][]string
+		for _, lan := range lans {
+			if len(clients) == 0 {
+				out = append(out, []string{"-i", lan})
+				continue
+			}
+			for _, c := range clients {
+				if m, ok := clientMatch(c, v6, config.L2Interface(lan)); ok {
+					out = append(out, []string{"-i", lan, m})
+				}
+			}
+		}
+		return out
+	}
+
+	// guard starts a chain with a RETURN for each excluded device.
+	guard := func(t *table, chain string, excluded []string) {
+		t.chain(chain)
+		for _, c := range excluded {
+			if m, ok := clientMatch(c, v6, true); ok {
+				t.add(chain, m, "-j RETURN")
+			}
 		}
 	}
 
@@ -288,17 +337,16 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		// whole LAN for destination-only policies) to the drop sets. They
 		// apply on IPv6 too, whatever the policy does with IPv6 traffic.
 		if st.Drops {
-			who := [][]string{{"-i", lan}}
-			if len(st.MACs) > 0 {
-				who = nil
-				for _, m := range st.MACs {
-					who = append(who, []string{"-i", lan, "-m mac --mac-source", m})
-				}
+			into := ChainFwd
+			if len(st.Excluded) > 0 {
+				into = GuardChain(p.ID, "drop")
+				guard(filter, into, st.Excluded)
+				filter.add(ChainFwd, "-j", into)
 			}
 			for _, set := range []string{SetName(p.ID, KindDrop, v6), SetName(p.ID, KindDropNet, v6)} {
-				for _, w := range who {
-					filter.add(ChainFwd, append(w, "-p tcp -m set --match-set", set, "dst -j REJECT --reject-with tcp-reset")...)
-					filter.add(ChainFwd, append(w, "-m set --match-set", set, "dst -j REJECT --reject-with", reject)...)
+				for _, w := range who(st.Clients) {
+					filter.add(into, append(w, "-p tcp -m set --match-set", set, "dst -j REJECT --reject-with tcp-reset")...)
+					filter.add(into, append(w, "-m set --match-set", set, "dst -j REJECT --reject-with", reject)...)
 				}
 			}
 		}
@@ -323,13 +371,22 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		if len(p.ASNs)+len(p.CIDRs) > 0 {
 			dsets = append(dsets, SetName(id, KindNet, v6))
 		}
-		macMatch := func(m string) string { return "-m mac --mac-source " + m }
+		// Inside SNAKE the interface is already one of the client
+		// interfaces; a MAC match simply never matches on a routed one.
+		sel := clientMatches(st.Clients, v6)
 
 		// Session refresh for WebRTC tracking: a NEW connection from a client
 		// to a policy destination (re)opens that client's session window. So
 		// does STUN to a server learned in an earlier session: ICE gathering
 		// often starts before the first connection to a policy destination,
 		// and the peers it then checks must be learned too.
+		// Excluded devices leave the policy chain first; the session
+		// refresh then moves into it, after them.
+		refreshIn := ChainMain
+		if len(st.Excluded) > 0 {
+			guard(mangle, pc, st.Excluded)
+			refreshIn = pc
+		}
 		if st.WebRTCMode != RTCOff && len(dsets) > 0 {
 			sess := SetName(id, KindSession, v6)
 			opens := []string{}
@@ -338,11 +395,11 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 			}
 			opens = append(opens, "-p udp -m conntrack --ctstate NEW -m set --match-set "+SetName(id, KindServer, v6)+" dst")
 			for _, base := range opens {
-				if len(st.MACs) == 0 {
-					mangle.add(ChainMain, base, "-j SET --add-set", sess, "src --exist")
+				if len(st.Clients) == 0 {
+					mangle.add(refreshIn, base, "-j SET --add-set", sess, "src --exist")
 				}
-				for _, m := range st.MACs {
-					mangle.add(ChainMain, macMatch(m), base, "-j SET --add-set", sess, "src --exist")
+				for _, m := range sel {
+					mangle.add(refreshIn, m, base, "-j SET --add-set", sess, "src --exist")
 				}
 			}
 		}
@@ -350,14 +407,14 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		mangle.add(ChainMain, "-j", pc)
 		mangle.add(pc, "-m mark ! --mark 0/"+mask, "-m mark --mark 0/"+qdir, "-j RETURN")
 		switch {
-		case len(st.MACs) > 0 && len(dsets) == 0: // whole device
-			for _, m := range st.MACs {
-				mangle.add(pc, macMatch(m), "-g", mc)
+		case len(st.Clients) > 0 && len(dsets) == 0: // whole device
+			for _, m := range sel {
+				mangle.add(pc, m, "-g", mc)
 			}
-		case len(st.MACs) > 0: // device + destination
-			for _, m := range st.MACs {
+		case len(st.Clients) > 0: // device + destination
+			for _, m := range sel {
 				for _, ds := range dsets {
-					mangle.add(pc, macMatch(m), "-m set --match-set", ds, "dst -g", mc)
+					mangle.add(pc, m, "-m set --match-set", ds, "dst -g", mc)
 				}
 			}
 		default: // destination only
@@ -377,11 +434,11 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 			// requests sent before the session opens cannot reveal the WAN
 			// address.
 			srv := SetName(id, KindServer, v6)
-			if len(st.MACs) == 0 {
+			if len(st.Clients) == 0 {
 				mangle.add(pc, "-p udp -m set --match-set", srv, "dst -g", mc)
 			}
-			for _, m := range st.MACs {
-				mangle.add(pc, macMatch(m), "-p udp -m set --match-set", srv, "dst -g", mc)
+			for _, m := range sel {
+				mangle.add(pc, m, "-p udp -m set --match-set", srv, "dst -g", mc)
 			}
 			switch st.WebRTCMode {
 			case RTCQueue:
@@ -421,51 +478,91 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 
 	// Leak protection, scoped to the devices of the policies that asked for it
 	// (or the whole LAN for destination-only policies).
-	forScope := func(t *table, chain, feature string, args ...string) {
+	scopeWho := func(feature string) [][]string {
 		sc := scopes[feature]
 		if sc == nil {
-			return
+			return nil
 		}
 		if sc.global {
-			t.add(chain, append([]string{"-i", lan}, args...)...)
-			return
+			return who(nil)
 		}
-		macs := make([]string, 0, len(sc.macs))
-		for m := range sc.macs {
-			macs = append(macs, m)
+		clients := make([]string, 0, len(sc.clients))
+		for m := range sc.clients {
+			clients = append(clients, m)
 		}
-		sort.Strings(macs)
-		for _, m := range macs {
-			t.add(chain, append([]string{"-i", lan, "-m mac --mac-source", m}, args...)...)
+		sort.Strings(clients)
+		return who(clients)
+	}
+	// emit adds a feature's rules: gen writes them into a chain for a set
+	// of match prefixes. The merged scope goes straight into parent; each
+	// policy with excluded devices gets a chain of its own, which returns
+	// for those devices first and is jumped to from parent.
+	emit := func(t *table, parent, feature, tag string, gen func(chain string, w [][]string)) {
+		if w := scopeWho(feature); len(w) > 0 {
+			gen(parent, w)
+		}
+		for _, st := range guarded[feature] {
+			ch := GuardChain(st.Policy.ID, tag)
+			guard(t, ch, st.Excluded)
+			gen(ch, who(st.Clients))
+			t.add(parent, "-j", ch)
+		}
+	}
+	rules := func(t *table, args ...[]string) func(string, [][]string) {
+		return func(chain string, ws [][]string) {
+			for _, a := range args {
+				for _, w := range ws {
+					t.add(chain, append(append([]string(nil), w...), a...)...)
+				}
+			}
 		}
 	}
 	// Router-wide overrides from Settings (block_dot / block_doh).
 	for feature, mode := range map[string]string{"dot": s.BlockDoT, "doh": s.BlockDoH} {
 		switch mode {
 		case config.BlockAlways:
-			scopes[feature] = &scope{global: true, macs: map[string]bool{}}
+			scopes[feature] = &scope{global: true, clients: map[string]bool{}}
+			delete(guarded, feature)
 		case config.BlockNever:
 			delete(scopes, feature)
+			delete(guarded, feature)
 		}
 	}
-	forScope(nat, ChainDNS, "dns", "-p udp --dport 53 -j REDIRECT --to-ports 53")
-	forScope(nat, ChainDNS, "dns", "-p tcp --dport 53 -j REDIRECT --to-ports 53")
-	forScope(filter, ChainFwd, "dot", "-p tcp --dport 853 -j REJECT --reject-with tcp-reset")
-	forScope(filter, ChainFwd, "dot", "-p udp --dport 853 -j REJECT --reject-with", reject)
+	// DNS hijack: REDIRECT to dnsmasq on bridges. Routed client interfaces
+	// (VPN servers) DNAT to the LAN address instead, where dnsmasq always
+	// listens (IPv4 only; their IPv6 DNS is left alone).
+	emit(nat, ChainDNS, "dns", "dns", func(chain string, ws [][]string) {
+		for _, w := range ws {
+			target := "-j REDIRECT --to-ports 53"
+			if !config.L2Interface(w[1]) {
+				if v6 || opt.LANAddr == "" {
+					continue
+				}
+				target = "-j DNAT --to-destination " + opt.LANAddr + ":53"
+			}
+			for _, proto := range []string{"udp", "tcp"} {
+				nat.add(chain, append(append([]string(nil), w...), "-p", proto, "--dport 53", target)...)
+			}
+		}
+	})
+	emit(filter, ChainFwd, "dot", "dot", rules(filter,
+		[]string{"-p tcp --dport 853 -j REJECT --reject-with tcp-reset"},
+		[]string{"-p udp --dport 853 -j REJECT --reject-with", reject}))
 	doh := DoHSet4
 	if v6 {
 		doh = DoHSet6
 	}
-	forScope(filter, ChainFwd, "doh", "-p tcp --dport 443 -m set --match-set", doh, "dst -j REJECT --reject-with tcp-reset")
-	forScope(filter, ChainFwd, "doh", "-p udp --dport 443 -m set --match-set", doh, "dst -j REJECT --reject-with", reject)
-	forScope(filter, ChainFwd, "quic", "-p udp --dport 443 -j REJECT --reject-with", reject)
+	emit(filter, ChainFwd, "doh", "doh", rules(filter,
+		[]string{"-p tcp --dport 443 -m set --match-set", doh, "dst -j REJECT --reject-with tcp-reset"},
+		[]string{"-p udp --dport 443 -m set --match-set", doh, "dst -j REJECT --reject-with", reject}))
+	emit(filter, ChainFwd, "quic", "quic", rules(filter, []string{"-p udp --dport 443 -j REJECT --reject-with", reject}))
 
 	// SNI sniffing: HTTPS connections no policy claimed go to the proxy,
 	// which routes them by TLS server name. Only families with NAT can be
 	// redirected.
-	if opt.SNIPort > 0 && scopes["sni"] != nil && (!v6 || opt.IPv6NAT) {
+	if opt.SNIPort > 0 && (scopes["sni"] != nil || len(guarded["sni"]) > 0) && (!v6 || opt.IPv6NAT) {
 		nat.chain(ChainSNI)
-		forScope(nat, ChainDNS, "sni", "-p tcp --dport 443 -j", ChainSNI)
+		emit(nat, ChainDNS, "sni", "sni", rules(nat, []string{"-p tcp --dport 443 -j", ChainSNI}))
 		// Claimed by a policy (sets, devices, WebRTC): the kernel routes it.
 		nat.add(ChainSNI, "-m connmark ! --mark 0/"+cmask, "-j RETURN")
 		nat.add(ChainSNI, "-d", strings.Join(private, ","), "-j RETURN")
@@ -484,7 +581,7 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 		// proxy does not handle: unclaimed QUIC is rejected so browsers
 		// fall back to TCP, which is sniffed. QUIC to policy destinations
 		// (connmark set) still goes through the tunnel.
-		forScope(filter, ChainFwd, "sni", "-p udp --dport 443 -m connmark --mark 0/"+cmask, "-j REJECT --reject-with", reject)
+		emit(filter, ChainFwd, "sni", "sniq", rules(filter, []string{"-p udp --dport 443 -m connmark --mark 0/" + cmask, "-j REJECT --reject-with", reject}))
 	}
 
 	ifaces := make([]string, 0, len(tunnels))
@@ -501,10 +598,47 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 				// connmark before first-packet NAT. The routing mark is
 				// still usable when no QoS direction bits are present.
 				nat.add(ChainNAT, "-o", ifc, "-m mark --mark", hex(s.PolicyMark(st.Policy.ID))+"/"+rmask, "-j MASQUERADE")
-				filter.add(ChainFwd, "-i", lan, "-o", ifc, "-m connmark --mark", hex(s.ConnMark(st.Policy.ID))+"/"+cmask, "-j ACCEPT")
+				for _, lan := range lans {
+					filter.add(ChainFwd, "-i", lan, "-o", ifc, "-m connmark --mark", hex(s.ConnMark(st.Policy.ID))+"/"+cmask, "-j ACCEPT")
+				}
 			}
 		}
-		filter.add(ChainFwd, "-i", ifc, "-o", lan, "-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT")
+		for _, lan := range lans {
+			filter.add(ChainFwd, "-i", ifc, "-o", lan, "-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT")
+		}
 	}
 	return mangle, nat, filter
+}
+
+// clientMatch is the iptables match for one device entry in a family: a
+// MAC address (on Ethernet interfaces only), or a source address or
+// subnet of that family.
+func clientMatch(client string, v6, l2 bool) (string, bool) {
+	if config.ClientMAC(client) {
+		return "-m mac --mac-source " + client, l2
+	}
+	if p, err := netip.ParsePrefix(client); err == nil {
+		if p.Addr().Is6() != v6 {
+			return "", false
+		}
+		return "-s " + p.String(), true
+	}
+	if a, err := netip.ParseAddr(client); err == nil {
+		if a.Is6() != v6 {
+			return "", false
+		}
+		return "-s " + a.String(), true
+	}
+	return "", false
+}
+
+// clientMatches lists the matches of the devices usable in a family.
+func clientMatches(clients []string, v6 bool) []string {
+	var out []string
+	for _, c := range clients {
+		if m, ok := clientMatch(c, v6, true); ok {
+			out = append(out, m)
+		}
+	}
+	return out
 }

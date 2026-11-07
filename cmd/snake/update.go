@@ -157,6 +157,12 @@ func updateCmd(args []string) error {
 	u := newUpdater(repoFromConfig)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+	if hasFlag(args, "--list") {
+		return listReleases(ctx, u)
+	}
+	if want := flagValue(args, "--version"); want != "" {
+		return installVersion(ctx, u, want, hasFlag(args, "--yes"))
+	}
 	in, err := u.Check(ctx)
 	if err != nil {
 		return err
@@ -188,6 +194,64 @@ func updateCmd(args []string) error {
 	return restartAfterSwap()
 }
 
+func listReleases(ctx context.Context, u *update.Updater) error {
+	rels, err := u.Releases(ctx)
+	if err != nil {
+		return err
+	}
+	for _, r := range rels {
+		var notes []string
+		if r.Running {
+			notes = append(notes, "running")
+		}
+		if r.Previous {
+			notes = append(notes, "kept for rollback")
+		}
+		if r.Prerelease {
+			notes = append(notes, "pre-release")
+		}
+		if !r.Installable {
+			notes = append(notes, "no "+update.Asset()+" binary")
+		}
+		fmt.Printf("%-12s %s  %s\n", r.Version, r.Published.Format("2006-01-02"), strings.Join(notes, ", "))
+	}
+	fmt.Println("install one with: snake update --version <version>")
+	return nil
+}
+
+func installVersion(ctx context.Context, u *update.Updater, want string, yes bool) error {
+	q := fmt.Sprintf("Install %s (running %s)?", want, u.Current)
+	older := update.Newer(u.Current, want)
+	if older {
+		q = fmt.Sprintf("Install %s, older than the running %s? Settings it does not know are ignored, and if it cannot start with this configuration snake rolls back.", want, u.Current)
+	}
+	if !yes && !confirm(q) {
+		return nil
+	}
+	v, err := u.InstallVersion(ctx, want)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("installed %s; previous version kept for: snake rollback\n", v)
+	if older {
+		pinVersion()
+	}
+	return restartAfterSwap()
+}
+
+// pinVersion turns automatic updates off after going back to an older
+// version: the next check would install the latest release again.
+func pinVersion() {
+	c, err := config.Load(paths().Config)
+	if err != nil || !c.Settings.AutoUpdate {
+		return
+	}
+	c.Settings.AutoUpdate = false
+	if err := config.Save(paths().Config, c); err == nil {
+		fmt.Println("automatic updates turned off (turn them back on in Settings → Updates)")
+	}
+}
+
 func rollbackCmd(args []string) error {
 	u := newUpdater(repoFromConfig)
 	prev := u.PreviousVersion()
@@ -202,6 +266,9 @@ func rollbackCmd(args []string) error {
 		return err
 	}
 	fmt.Printf("rolled back to %s (run snake rollback again to undo)\n", v)
+	if update.Newer(u.Current, v) {
+		pinVersion()
+	}
 	return restartAfterSwap()
 }
 

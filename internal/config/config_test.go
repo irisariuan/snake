@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -265,5 +266,131 @@ func TestSNIProxyPort(t *testing.T) {
 	p.Domains = []string{"drop:ads.example.com"}
 	if p.Sniffs() {
 		t.Error("drop-only policy sniffs")
+	}
+}
+
+func TestClientDevices(t *testing.T) {
+	for in, want := range map[string]string{
+		"AA:BB:CC:DD:EE:FF": "aa:bb:cc:dd:ee:ff",
+		" 10.6.0.2 ":        "10.6.0.2",
+		"10.8.0.7/24":       "10.8.0.0/24",
+		"fd00:6::2":         "fd00:6::2",
+		"::ffff:10.6.0.2":   "10.6.0.2",
+	} {
+		got, err := NormalizeClient(in)
+		if err != nil || got != want {
+			t.Errorf("%q: %q %v, want %q", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"", "10.6.0", "host.lan", "fe80::1%br0", "::ffff:10.0.0.0/104"} {
+		if _, err := NormalizeClient(bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+	if !ClientMAC("aa:bb:cc:dd:ee:ff") || ClientMAC("10.6.0.2") || ClientMAC("fd00::1:2:3:4") {
+		t.Error("ClientMAC")
+	}
+	c := Default()
+	c.Groups = []Group{{Name: "vpn", MACs: []string{"10.6.0.0/24", "AA:BB:CC:DD:EE:01"}}}
+	c.Policies = []Policy{{Name: "p", Enabled: true, Tunnels: []string{"wgc1"}, Devices: []string{"group:vpn", "10.8.0.5"},
+		Leak: Leak{IPv6: IPv6Off, WebRTC: WebRTCOff}}}
+	c.Normalize()
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(c.ResolveDevices(c.Policies[0]), " "); got != "10.6.0.0/24 aa:bb:cc:dd:ee:01 10.8.0.5" {
+		t.Errorf("resolved %q", got)
+	}
+	c.Policies[0].Devices = []string{"10.8.0.300"}
+	if err := c.Validate(); err == nil {
+		t.Error("invalid device accepted")
+	}
+}
+
+func TestLANInterfaces(t *testing.T) {
+	s := DefaultSettings()
+	if got := strings.Join(s.ClientInterfaces(), ","); got != "br+,wgs+,tun2+" {
+		t.Fatalf("default %q", got)
+	}
+	s.LANInterfaces = "br0, wgs1  br0"
+	if got := strings.Join(s.ClientInterfaces(), ","); got != "br0,wgs1" {
+		t.Fatalf("parsed %q", got)
+	}
+	if L2Interface("wgs+") || L2Interface("tun21") || !L2Interface("br+") {
+		t.Error("L2Interface")
+	}
+	c := Default()
+	for _, bad := range []string{"br+ bad;rule", "averyverylongname0", "-j"} {
+		c.Settings.LANInterfaces = bad
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "lan_interfaces") {
+			t.Errorf("%q accepted: %v", bad, err)
+		}
+	}
+}
+
+func TestMigrateLANInterfaces(t *testing.T) {
+	dir := t.TempDir()
+	for name, tc := range map[string]struct {
+		version int
+		lan     string
+		want    string
+	}{
+		"old default":    {4, "br+", DefaultLANInterfaces},
+		"customised":     {4, "br0", "br0"},
+		"current":        {5, "br+", "br+"},
+		"v3 old default": {3, "br+", DefaultLANInterfaces},
+	} {
+		p := dir + "/" + strings.ReplaceAll(name, " ", "_") + ".json"
+		if err := os.WriteFile(p, []byte(fmt.Sprintf(`{"version": %d, "settings": {"lan_interfaces": %q, "mark_mask": 16711680, "conn_mark_mask": 1069547520}}`, tc.version, tc.lan)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Settings.LANInterfaces != tc.want || c.Version != CurrentVersion {
+			t.Errorf("%s: %q v%d", name, c.Settings.LANInterfaces, c.Version)
+		}
+		if tc.version >= 4 && c.MigratedMarkMask() != 0 {
+			t.Errorf("%s: mark migration triggered for version %d", name, tc.version)
+		}
+	}
+}
+
+func TestExcludeDevices(t *testing.T) {
+	c := load(t)
+	p := &c.Policies[0] // destinations only
+	p.ExcludeDevices = []string{" AA:BB:CC:00:00:09 ", "group:living-room", "10.8.0.0/24", "aa:bb:cc:00:00:09"}
+	c.Normalize()
+	if got := strings.Join(p.ExcludeDevices, ","); got != "aa:bb:cc:00:00:09,group:living-room,10.8.0.0/24" {
+		t.Fatalf("normalized %s", got)
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.ResolveExcluded(*p); len(got) < 3 || p.Scope() != "destinations, some devices excluded" {
+		t.Fatalf("resolved %v, scope %q", got, p.Scope())
+	}
+	// DoH blocking is no longer LAN-wide in DNS when devices are excluded.
+	for i := range c.Policies {
+		c.Policies[i].Leak.BlockDoH = false
+	}
+	p.Leak.BlockDoH = true
+	if c.DoHBlockedLANWide() {
+		t.Error("DoH blocked LAN-wide despite excluded devices")
+	}
+	p.ExcludeDevices, p.Leak.BlockDoH = nil, true
+	if !c.DoHBlockedLANWide() {
+		t.Error("destination-only policy without exclusions should block DoH LAN-wide")
+	}
+	p.ExcludeDevices = []string{"aa:bb:cc:00:00:09"}
+	p.ExcludeDevices = append(p.ExcludeDevices, "group:nope", "not-a-device")
+	q := &c.Policies[1]
+	q.ExcludeDevices = append([]string(nil), q.Devices[0])
+	err := c.Validate()
+	for _, s := range []string{`unknown group "group:nope"`, `invalid device "not-a-device"`, "both included and excluded"} {
+		if err == nil || !strings.Contains(err.Error(), s) {
+			t.Errorf("missing %q in %v", s, err)
+		}
 	}
 }
