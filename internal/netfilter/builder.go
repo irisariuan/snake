@@ -37,6 +37,9 @@ type PolicyState struct {
 	IPv6Mode     string // V6Route / V6Block / V6Off
 	WebRTCMode   string // RTCQueue / RTCPorts / RTCOff
 	Drops        bool   // the policy has drop: rules
+	// Sessions: the policy routes device sessions (session: rules, WebRTC
+	// peers) through its session chain.
+	Sessions bool
 }
 
 // Options describe router capabilities and existing state.
@@ -61,6 +64,9 @@ type Options struct {
 	// connections of sniffing policies' clients that no policy claimed are
 	// redirected to it. 0 installs no redirect (proxy not running).
 	SNIPort int
+	// SessionPairs returns the policy's current sessions in a family:
+	// [device, address] pairs routed for that device only.
+	SessionPairs func(id int, v6 bool) [][2]string
 	// LANAddr is the router's LAN IPv4 address. DNS hijacking on routed
 	// client interfaces (VPN servers) DNATs to it: dnsmasq may not listen
 	// on those interfaces' own addresses.
@@ -406,6 +412,23 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 
 		mangle.add(ChainMain, "-j", pc)
 		mangle.add(pc, "-m mark ! --mark 0/"+mask, "-m mark --mark 0/"+qdir, "-j RETURN")
+		// Sessions: one rule per device + address, rewritten by the daemon
+		// as sessions start and end; reached only for the policy's devices.
+		if st.Sessions {
+			qc := SessionChain(id)
+			mangle.chain(qc)
+			if opt.SessionPairs != nil {
+				for _, pr := range opt.SessionPairs(id, v6) {
+					mangle.add(qc, "-s", pr[0], "-d", pr[1], "-g", mc)
+				}
+			}
+			if len(st.Clients) == 0 {
+				mangle.add(pc, "-j", qc)
+			}
+			for _, m := range sel {
+				mangle.add(pc, m, "-j", qc)
+			}
+		}
 		switch {
 		case len(st.Clients) > 0 && len(dsets) == 0: // whole device
 			for _, m := range sel {
@@ -423,11 +446,10 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 			}
 		}
 
-		// WebRTC: learned peers are routed only for clients inside a session window.
+		// WebRTC: peers learned from a device's STUN are sessions of that
+		// device (session chain above).
 		if st.WebRTCMode != RTCOff && len(dsets) > 0 {
 			sess := SetName(id, KindSession, v6)
-			peers := SetName(id, KindPeer, v6)
-			mangle.add(pc, "-p udp -m set --match-set", sess, "src -m set --match-set", peers, "dst -g", mc)
 			// STUN/TURN servers of learning groups routed via this policy
 			// (SNK_<id>_t, kept in sync by the daemon) are routed for the
 			// policy's clients even outside a session window, so binding

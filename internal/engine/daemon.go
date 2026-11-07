@@ -55,6 +55,8 @@ func (e *Engine) Run(ctx context.Context) error {
 	hookT := time.NewTicker(30 * time.Second)
 	asnT := time.NewTicker(time.Hour)
 	saveT := time.NewTicker(time.Duration(cfg.Settings.SaveInterval) * time.Second)
+	sessT := time.NewTicker(20 * time.Second) // renew live sessions, end expired ones
+	defer sessT.Stop()
 	defer healthT.Stop()
 	defer hookT.Stop()
 	defer asnT.Stop()
@@ -87,6 +89,10 @@ func (e *Engine) Run(ctx context.Context) error {
 			go e.refreshASNs(false)
 		case <-saveT.C:
 			e.saveSets()
+		case <-sessT.C:
+			if !e.Disabled() {
+				e.refreshSessionsNow()
+			}
 		}
 	}
 }
@@ -190,6 +196,7 @@ type PolicyStatus struct {
 	DomainMode  string         `json:"domain_mode,omitempty"`
 	DNSUpstream *dnsfwd.Stats  `json:"dns_upstream,omitempty"` // DoT/DoH forwarder
 	SNIMatched  *uint64        `json:"sni_matched,omitempty"`  // connections routed by server name (sniff_sni)
+	Sessions    int            `json:"sessions,omitempty"`     // active device sessions (session: rules, WebRTC peers)
 	Country     string         `json:"country,omitempty"`
 }
 
@@ -286,7 +293,7 @@ func (e *Engine) Status() Status {
 			ps.Candidates = cands[p.ID]
 			s := stByID[p.ID]
 			ps.IPv6Mode, ps.WebRTCMode = s.IPv6Mode, s.WebRTCMode
-			for _, kind := range []string{netfilter.KindDomain, netfilter.KindNet, netfilter.KindSession, netfilter.KindPeer, netfilter.KindServer, netfilter.KindDrop, netfilter.KindDropNet} {
+			for _, kind := range []string{netfilter.KindDomain, netfilter.KindNet, netfilter.KindSession, netfilter.KindServer, netfilter.KindDrop, netfilter.KindDropNet} {
 				for _, v6 := range []bool{false, true} {
 					if v6 && !caps.IPv6 {
 						continue
@@ -311,6 +318,7 @@ func (e *Engine) Status() Status {
 			if ps.Active != "" {
 				ps.Country = st.Tunnels[ps.Active].Country
 			}
+			ps.Sessions = len(e.Sessions(p.ID))
 			if p.Sniffs() && st.SNI != nil {
 				n := sniStats.ByPolicy[p.ID]
 				ps.SNIMatched = &n
@@ -467,9 +475,17 @@ func (e *Engine) TestDomain(name string) DomainTest {
 		if !dnsOn && (mr.Name != name || e.domainSet(p).NeedsInspector()) {
 			res.Notes = append(res.Notes, "this match needs the DNS inspector, which is not running (kernel without NFQUEUE?)")
 		}
-		for _, a := range res.Addrs {
-			if a.InSet == "" {
-				res.Notes = append(res.Notes, a.IP+" is not in any set yet: is the router's dnsmasq the resolver? (check DNS hijack / DoH blocking)")
+		if mr.Session {
+			ttl := e.sessionTTL()
+			res.Notes = append(res.Notes, fmt.Sprintf("session: rule: these addresses are routed only for the device that looked the name up, until %s after its last connection to them; they are not added to the policy's sets", ttl))
+			if n := len(e.Sessions(p.ID)); n > 0 {
+				res.Notes = append(res.Notes, fmt.Sprintf("the policy has %d active session(s) (Learnings → Policy addresses, kind session)", n))
+			}
+		} else {
+			for _, a := range res.Addrs {
+				if a.InSet == "" {
+					res.Notes = append(res.Notes, a.IP+" is not in any set yet: is the router's dnsmasq the resolver? (check DNS hijack / DoH blocking)")
+				}
 			}
 		}
 		if len(p.Devices) > 0 {
@@ -496,7 +512,8 @@ func (e *Engine) SetMembers(name string, limit int) ([]string, error) {
 // groups are managed separately (Learnings tab).
 func (e *Engine) FlushLearned(id int) {
 	ips := e.ipset()
-	for _, k := range []string{netfilter.KindDomain, netfilter.KindDrop, netfilter.KindPeer, netfilter.KindSession} {
+	e.clearSessions(id)
+	for _, k := range []string{netfilter.KindDomain, netfilter.KindDrop, netfilter.KindSession} {
 		for _, v6 := range []bool{false, true} {
 			_ = ips.Flush(netfilter.SetName(id, k, v6))
 		}

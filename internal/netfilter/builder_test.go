@@ -53,7 +53,6 @@ func TestBuild(t *testing.T) {
 		"-A SNAKE_P1 -m set --match-set SNK_1_n4 dst -g SNAKE_M1",
 		// session refresh + learned peers + nfqueue
 		"-m conntrack --ctstate NEW -m set --match-set SNK_1_d4 dst -j SET --add-set SNK_1_s4 src --exist",
-		"-A SNAKE_P1 -p udp -m set --match-set SNK_1_s4 src -m set --match-set SNK_1_r4 dst -g SNAKE_M1",
 		"-A SNAKE_RTC -p udp -m conntrack --ctstate NEW -m set --match-set SNK_1_s4 src -j NFQUEUE --queue-num 4201 --queue-bypass",
 		// learned STUN servers: routed outside sessions and open the window
 		"-A SNAKE_P1 -p udp -m set --match-set SNK_1_t4 dst -g SNAKE_M1",
@@ -444,4 +443,53 @@ func TestExcludedDevices(t *testing.T) {
 	st[0].Excluded = nil
 	plan = Build(c.Settings, st, Options{Existing: map[string][]string{"4/filter": {"SNAKE_FWD", "SNAKE_X1_DROP"}}})
 	mustContain(t, plan.Restore["4/filter"], "-X SNAKE_X1_DROP")
+}
+
+// Sessions: the policy chain jumps to its session chain (for its devices
+// only, after excluded devices left), which holds one rule per device +
+// address; the former WebRTC peer set is gone.
+func TestSessionChain(t *testing.T) {
+	c, st := states(t)
+	st[0].Sessions = true // destination-only
+	st[1].Sessions = true // devices + destinations
+	st[1].Excluded = []string{"aa:bb:cc:00:00:02"}
+	pairs := func(id int, v6 bool) [][2]string {
+		if v6 {
+			return [][2]string{{"fd00::23", "2001:db8::80"}}
+		}
+		return [][2]string{{"192.168.50.23", "203.0.113.80"}, {"192.168.50.40", "198.51.100.9"}}
+	}
+	plan := Build(c.Settings, st, Options{IPv6: true, IPv6NAT: true, SessionPairs: pairs})
+	m4, m6 := plan.Restore["4/mangle"], plan.Restore["6/mangle"]
+	mustContain(t, m4,
+		":SNAKE_Q1 - [0:0]",
+		"-A SNAKE_Q1 -s 192.168.50.23 -d 203.0.113.80 -g SNAKE_M1",
+		"-A SNAKE_Q1 -s 192.168.50.40 -d 198.51.100.9 -g SNAKE_M1",
+		"-A SNAKE_P1 -j SNAKE_Q1",
+		"-A SNAKE_P2 -m mac --mac-source aa:bb:cc:00:00:01 -j SNAKE_Q2",
+	)
+	mustContain(t, m6, "-A SNAKE_Q1 -s fd00::23 -d 2001:db8::80 -g SNAKE_M1")
+	if strings.Contains(m4, "SNK_1_r4") {
+		t.Error("peer set still referenced")
+	}
+	// Order in the policy chain: excluded devices return first, the
+	// claimed-already check, then the session chain, then the matches.
+	p2 := regexp.MustCompile(`(?m)^-A SNAKE_P2 .*$`).FindAllString(m4, -1)
+	idx := func(sub string) int {
+		for i, r := range p2 {
+			if strings.Contains(r, sub) {
+				return i
+			}
+		}
+		return -1
+	}
+	if !(idx("aa:bb:cc:00:00:02 -j RETURN") < idx("-m mark ! --mark") && idx("-m mark ! --mark") < idx("-j SNAKE_Q2") && idx("-j SNAKE_Q2") < idx("-g SNAKE_M2")) {
+		t.Errorf("policy chain order:\n%s", strings.Join(p2, "\n"))
+	}
+	// No sessions: no chain, and an old one is deleted.
+	st[0].Sessions, st[1].Sessions = false, false
+	plan = Build(c.Settings, st, Options{Existing: map[string][]string{"4/mangle": {"SNAKE", "SNAKE_Q1"}}})
+	if m := plan.Restore["4/mangle"]; strings.Contains(m, "-j SNAKE_Q1") || !strings.Contains(m, "-X SNAKE_Q1") {
+		t.Errorf("session chain left behind:\n%s", m)
+	}
 }

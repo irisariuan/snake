@@ -17,6 +17,11 @@
 //	                     still exempts a name
 //	drop:asn:1234        drop: block an autonomous system's prefixes
 //	drop:cidr:1.2.3.0/24 drop: block an address range or single IP (drop:ip: too)
+//	session:example.com  session: route what the rule matches only for the
+//	                     device that looked it up (any domain rule after
+//	                     session:); the addresses are not added to the
+//	                     policy's sets. Beats include rules; drop: and !
+//	                     beat it
 //
 // Names are compared lowercase without the trailing dot. With CNAME following
 // (the default) a rule also matches when any name in the answer's CNAME chain
@@ -50,13 +55,19 @@ const (
 // DropPrefix marks a rule whose matches are blocked instead of routed.
 const DropPrefix = "drop:"
 
+// SessionPrefix marks a rule whose matches are routed only for the device
+// that looked the name up, for a while after its last connection, instead
+// of being added to the policy's sets.
+const SessionPrefix = "session:"
+
 // Pattern is one parsed rule.
 type Pattern struct {
-	Raw    string `json:"raw"`
-	Kind   Kind   `json:"kind"`
-	Negate bool   `json:"negate"`
-	Drop   bool   `json:"drop,omitempty"`
-	Value  string `json:"value"`
+	Raw     string `json:"raw"`
+	Kind    Kind   `json:"kind"`
+	Negate  bool   `json:"negate"`
+	Drop    bool   `json:"drop,omitempty"`
+	Session bool   `json:"session,omitempty"`
+	Value   string `json:"value"`
 	// Base is a literal domain suffix every match must end with ("" if none
 	// can be derived). It steers DNS resolution through the tunnel and is
 	// used for pre-resolving.
@@ -118,6 +129,9 @@ func Normalize(s string) string {
 		}
 		return neg + DropPrefix + Normalize(inner)
 	}
+	if len(s) >= len(SessionPrefix) && strings.EqualFold(s[:len(SessionPrefix)], SessionPrefix) {
+		return neg + SessionPrefix + Normalize(strings.TrimSpace(s[len(SessionPrefix):]))
+	}
 	if strings.HasPrefix(s, "/") || strings.HasPrefix(s, "re:") {
 		return neg + s
 	}
@@ -154,6 +168,12 @@ func Parse(raw string) (Pattern, error) {
 			return p, fmt.Errorf("! and drop: cannot be combined; write !name to exempt a name from drop rules")
 		}
 		return parseDrop(s)
+	}
+	if strings.HasPrefix(s, SessionPrefix) {
+		if p.Negate {
+			return p, fmt.Errorf("! and session: cannot be combined; write !name to exempt a name")
+		}
+		return parseSession(s)
 	}
 	switch {
 	case strings.HasPrefix(s, "re:") || strings.HasPrefix(s, "/"):
@@ -249,13 +269,31 @@ func parseDrop(s string) (Pattern, error) {
 		if err != nil {
 			return p, err
 		}
-		if q.Negate || q.Drop {
+		if q.Negate || q.Drop || q.Session {
 			return p, fmt.Errorf("drop: must be followed by a domain rule, asn: or cidr:")
 		}
 		q.Raw, q.Drop = s, true
 		return q, nil
 	}
 	return p, nil
+}
+
+// parseSession parses "session:<domain rule>".
+func parseSession(s string) (Pattern, error) {
+	inner := s[len(SessionPrefix):]
+	p := Pattern{Raw: s, Session: true}
+	if inner == "" {
+		return p, fmt.Errorf("session: needs a domain rule, e.g. session:example.com")
+	}
+	q, err := Parse(inner)
+	if err != nil {
+		return p, err
+	}
+	if q.Negate || q.Drop || q.Session || q.Kind == ASN || q.Kind == CIDR {
+		return p, fmt.Errorf("session: must be followed by a domain rule (a session starts with a DNS lookup)")
+	}
+	q.Raw, q.Session = s, true
+	return q, nil
 }
 
 func globToRegex(g string) string {
@@ -351,13 +389,14 @@ func (p Pattern) Native() bool { return p.Kind == Suffix && !p.Negate }
 // Set is a compiled rule list. Do not modify Include/Exclude after the
 // first MatchAny: the lookup index is built once.
 type Set struct {
-	once          sync.Once
-	inc, exc, drp index
-	Include       []Pattern
-	Exclude       []Pattern
-	Drop          []Pattern // drop: domain rules
-	DropASNs      []int     // drop:asn:
-	DropCIDRs     []string  // drop:cidr:
+	once               sync.Once
+	inc, exc, drp, ses index
+	Include            []Pattern
+	Exclude            []Pattern
+	Drop               []Pattern // drop: domain rules
+	Session            []Pattern // session: domain rules
+	DropASNs           []int     // drop:asn:
+	DropCIDRs          []string  // drop:cidr:
 }
 
 // LineError is a parse error for one rule.
@@ -390,6 +429,8 @@ func Compile(rules []string) (*Set, []LineError) {
 			s.DropCIDRs = append(s.DropCIDRs, p.Value)
 		case p.Drop:
 			s.Drop = append(s.Drop, p)
+		case p.Session:
+			s.Session = append(s.Session, p)
 		default:
 			s.Include = append(s.Include, p)
 		}
@@ -409,12 +450,14 @@ type Result struct {
 	Name     string `json:"name,omitempty"`     // the name in the chain that matched
 	Rule     string `json:"rule,omitempty"`     // the include (or drop) rule that matched
 	Drop     bool   `json:"drop,omitempty"`     // a drop: rule matched: block, do not route
+	Session  bool   `json:"session,omitempty"`  // a session: rule matched: route for the asking device only
 	Excluded string `json:"excluded,omitempty"` // the exclusion that vetoed it
 }
 
 // MatchAny tests every name (query name first, then the CNAME chain).
 // A name matching an exclusion vetoes the whole answer; otherwise a name
-// matching a drop rule blocks it, before include rules are considered.
+// matching a drop rule blocks it, then session rules, then include rules
+// are considered.
 // Among the rules matching the first matching name, the earliest is
 // reported.
 func (s *Set) MatchAny(names ...string) Result {
@@ -427,6 +470,11 @@ func (s *Set) MatchAny(names ...string) Result {
 	for _, n := range names {
 		if i := s.drp.first(n); i >= 0 {
 			return Result{Matched: true, Drop: true, Name: n, Rule: s.Drop[i].Raw}
+		}
+	}
+	for _, n := range names {
+		if i := s.ses.first(n); i >= 0 {
+			return Result{Matched: true, Session: true, Name: n, Rule: s.Session[i].Raw}
 		}
 	}
 	for _, n := range names {
@@ -504,11 +552,14 @@ func (x *index) first(name string) int {
 }
 
 func (s *Set) build() {
-	s.inc, s.exc, s.drp = newIndex(s.Include), newIndex(s.Exclude), newIndex(s.Drop)
+	s.inc, s.exc, s.drp, s.ses = newIndex(s.Include), newIndex(s.Exclude), newIndex(s.Drop), newIndex(s.Session)
 }
 
-// Empty reports whether the set has no include rules.
-func (s *Set) Empty() bool { return s == nil || len(s.Include) == 0 }
+// Empty reports whether the set has no include rules (session: rules count).
+func (s *Set) Empty() bool { return s == nil || len(s.Include)+len(s.Session) == 0 }
+
+// HasSessions reports whether the set has session: rules.
+func (s *Set) HasSessions() bool { return s != nil && len(s.Session) > 0 }
 
 // HasDrops reports whether the set has any drop: rule.
 func (s *Set) HasDrops() bool {
@@ -560,7 +611,11 @@ func (s *Set) PlainSuffixes() []string {
 }
 
 // NeedsInspector reports whether some rules need DNS answer inspection.
+// session: rules always do: only the inspector knows which device asked.
 func (s *Set) NeedsInspector() bool {
+	if len(s.Session) > 0 {
+		return true
+	}
 	if len(s.Exclude) > 0 {
 		return len(s.Include)+len(s.Drop) > 0
 	}
@@ -583,7 +638,7 @@ func (s *Set) NeedsInspector() bool {
 func (s *Set) Bases() []string {
 	seen := map[string]bool{}
 	var out []string
-	for _, p := range s.Include {
+	for _, p := range append(append([]Pattern(nil), s.Include...), s.Session...) {
 		if p.Base != "" && !seen[p.Base] {
 			seen[p.Base] = true
 			out = append(out, p.Base)

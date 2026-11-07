@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -91,6 +92,10 @@ type Tracker struct {
 	OnServer func(ServerEvent)
 	// OnScan receives each conntrack pass.
 	OnScan func(Scan)
+	// OnPeer receives the peers a client's STUN revealed, batched: they
+	// become sessions of that client (routed for it only, while it keeps
+	// talking to them).
+	OnPeer func(policy int, client string, peers []string) error
 
 	mu       sync.Mutex
 	serverCh chan ServerEvent
@@ -103,8 +108,8 @@ type Tracker struct {
 }
 
 type learnReq struct {
-	set  string
-	addr string
+	policy       int
+	client, addr string
 }
 
 // NewTracker creates a tracker.
@@ -174,7 +179,6 @@ func (t *Tracker) openQueue(ctx context.Context, tr PolicyTrack) error {
 		return fmt.Errorf("nfqueue %d: %w", tr.Queue, err)
 	}
 	st := t.stats[tr.ID]
-	peerSet := map[bool]string{false: netfilter.SetName(tr.ID, netfilter.KindPeer, false), true: netfilter.SetName(tr.ID, netfilter.KindPeer, true)}
 	serverCh := t.serverCh
 	fn := func(a nfqueue.Attribute) int {
 		if a.PacketID == nil {
@@ -198,6 +202,7 @@ func (t *Tracker) openQueue(ctx context.Context, tr PolicyTrack) error {
 		}
 		v6 := pk.Dst.To4() == nil
 		dst := pk.Dst.String()
+		src := pk.Src.String()
 		if Classify(pk.Payload) == TargetServer {
 			atomic.AddUint64(&st.Servers, 1)
 			select {
@@ -221,7 +226,7 @@ func (t *Tracker) openQueue(ctx context.Context, tr PolicyTrack) error {
 		}
 		t.repeat(nf, id, orig, tr.Mark, st)
 		select {
-		case t.learnCh <- learnReq{set: peerSet[v6], addr: dst}:
+		case t.learnCh <- learnReq{policy: tr.ID, client: src, addr: dst}:
 		default:
 			atomic.AddUint64(&st.Errors, 1)
 		}
@@ -290,25 +295,39 @@ func (t *Tracker) serverLoop(ctx context.Context, ch chan ServerEvent) {
 	}
 }
 
-// learner batches peer additions into ipset.
+// learner batches the peers each client's STUN revealed and hands them
+// to OnPeer, which makes them sessions of that client.
 func (t *Tracker) learner(ctx context.Context) {
 	defer t.wg.Done()
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
-	pending := map[string]map[string]bool{}
+	type who struct {
+		policy int
+		client string
+	}
+	pending := map[who]map[string]bool{}
 	flush := func() {
-		for set, addrs := range pending {
+		for w, addrs := range pending {
 			list := make([]string, 0, len(addrs))
 			for a := range addrs {
 				list = append(list, a)
 			}
-			if err := t.IPSet.AddMany(set, list); err != nil {
-				logx.Warnf("webrtc: learn into %s: %v", set, err)
-			} else {
-				t.countLearned(set, len(list))
+			sort.Strings(list)
+			if t.OnPeer == nil {
+				continue
+			}
+			if err := t.OnPeer(w.policy, w.client, list); err != nil {
+				logx.Warnf("webrtc: peers of %s: %v", w.client, err)
+				continue
+			}
+			t.mu.Lock()
+			st := t.stats[w.policy]
+			t.mu.Unlock()
+			if st != nil {
+				atomic.AddUint64(&st.Learned, uint64(len(list)))
 			}
 		}
-		pending = map[string]map[string]bool{}
+		pending = map[who]map[string]bool{}
 	}
 	for {
 		select {
@@ -316,34 +335,16 @@ func (t *Tracker) learner(ctx context.Context) {
 			flush()
 			return
 		case r := <-t.learnCh:
-			if pending[r.set] == nil {
-				pending[r.set] = map[string]bool{}
+			k := who{r.policy, r.client}
+			if pending[k] == nil {
+				pending[k] = map[string]bool{}
 			}
-			pending[r.set][r.addr] = true
+			pending[k][r.addr] = true
 		case <-tick.C:
 			if len(pending) > 0 {
 				flush()
 			}
 		}
-	}
-}
-
-func (t *Tracker) countLearned(set string, n int) {
-	var id int
-	var kind string
-	if _, err := fmt.Sscanf(strings.TrimPrefix(set, netfilter.SetPrefix), "%d_%1s", &id, &kind); err != nil {
-		return
-	}
-	t.mu.Lock()
-	st := t.stats[id]
-	t.mu.Unlock()
-	if st == nil {
-		return
-	}
-	if kind == netfilter.KindServer {
-		atomic.AddUint64(&st.Servers, uint64(n))
-	} else {
-		atomic.AddUint64(&st.Learned, uint64(n))
 	}
 }
 
@@ -432,6 +433,13 @@ type Conn struct {
 func ParseConntrack(line string, mask uint32, shift uint) (Conn, bool) {
 	c, marked, live := parseConn(line, mask, shift)
 	return c, marked && live
+}
+
+// LiveFlow returns the original source and destination of any conntrack
+// line that is not a closing TCP connection, marked or not.
+func LiveFlow(line string) (src, dst string, ok bool) {
+	c, _, live := parseConn(line, 0, 0)
+	return c.Src, c.Dst, live && c.Src != "" && c.Dst != ""
 }
 
 // parseConn parses any conntrack line. marked: it carries a policy mark;

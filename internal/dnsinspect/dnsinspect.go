@@ -36,6 +36,10 @@ type Rules struct {
 	Set4, Set6  string // target ipsets ("" to skip a family)
 	// DropSet4/6 receive the addresses of answers matching drop: rules.
 	DropSet4, DropSet6 string
+	// Session starts sessions for answers matching session: rules: the
+	// addresses are routed for the device that asked only, not added to
+	// the sets. nil: session: rules are treated as plain rules.
+	Session func(client string, addrs []string, rule, name string) error
 }
 
 // Answer is the relevant content of a DNS response.
@@ -117,11 +121,12 @@ func Decide(rules []Rules, a Answer) (Rules, match.Result, bool) {
 
 // Stats are counters for the UI.
 type Stats struct {
-	Answers uint64 `json:"answers"`
-	Matched uint64 `json:"matched"`
-	Dropped uint64 `json:"dropped"` // matched a drop: rule
-	Added   uint64 `json:"added"`
-	Errors  uint64 `json:"errors"`
+	Answers  uint64 `json:"answers"`
+	Matched  uint64 `json:"matched"`
+	Dropped  uint64 `json:"dropped"`  // matched a drop: rule
+	Sessions uint64 `json:"sessions"` // matched a session: rule (routed for the asking device)
+	Added    uint64 `json:"added"`
+	Errors   uint64 `json:"errors"`
 }
 
 // inspectorWorkers bounds concurrent set updates for held answers.
@@ -147,7 +152,7 @@ type Inspector struct {
 
 // Stats returns a copy of the counters.
 func (i *Inspector) Stats() Stats {
-	return Stats{Answers: atomic.LoadUint64(&i.stats.Answers), Matched: atomic.LoadUint64(&i.stats.Matched), Dropped: atomic.LoadUint64(&i.stats.Dropped),
+	return Stats{Answers: atomic.LoadUint64(&i.stats.Answers), Matched: atomic.LoadUint64(&i.stats.Matched), Dropped: atomic.LoadUint64(&i.stats.Dropped), Sessions: atomic.LoadUint64(&i.stats.Sessions),
 		Added: atomic.LoadUint64(&i.stats.Added), Errors: atomic.LoadUint64(&i.stats.Errors)}
 }
 
@@ -384,6 +389,27 @@ func (i *Inspector) handle(raw []byte) func() {
 	r, res, ok := Decide(rules, ans)
 	if !ok {
 		return nil
+	}
+	if res.Session && r.Session != nil {
+		// Routed for the asking device only: no sets, no records. The
+		// router's own lookups (pre-resolving) start no session.
+		if pk.Dst.IsLoopback() {
+			return nil
+		}
+		atomic.AddUint64(&i.stats.Matched, 1)
+		atomic.AddUint64(&i.stats.Sessions, 1)
+		client := pk.Dst.String()
+		addrs := make([]string, 0, len(ans.IPs))
+		for _, ip := range ans.IPs {
+			addrs = append(addrs, ip.String())
+		}
+		logx.Debugf("dns: %s matched %q -> session of %s in policy %s", ans.Question, res.Rule, client, r.Name)
+		return func() {
+			if err := r.Session(client, addrs, res.Rule, ans.Question); err != nil {
+				atomic.AddUint64(&i.stats.Errors, 1)
+				logx.Warnf("dns inspector: session: %v", err)
+			}
+		}
 	}
 	if res.Drop {
 		// Blocked: the addresses go to the drop sets instead.

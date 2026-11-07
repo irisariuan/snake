@@ -138,6 +138,7 @@
 #snake .t-kw { color: #82aaff; }
 #snake .t-num { color: #f78c6c; }
 #snake .t-neg, #snake .t-drop { @apply tw:text-bad tw:font-bold; }
+#snake .t-sess { @apply tw:text-info tw:font-bold; }
 #snake .t-re { color: #ffcb6b; }
 #snake .t-op { @apply tw:font-bold; color: #89ddff; }
 #snake .t-wild { @apply tw:font-bold; color: #ff9cac; }

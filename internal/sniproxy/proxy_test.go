@@ -521,3 +521,33 @@ func TestProxyPassthroughECH(t *testing.T) {
 		t.Fatalf("counted as passed through although routed: %+v", st)
 	}
 }
+
+// A connection matching a session: rule is routed through the policy and
+// starts a session for its client; its destination is not learned into
+// the policy's set.
+func TestProxySessionRule(t *testing.T) {
+	var mu sync.Mutex
+	var got []string
+	pol := Policy{ID: 1, Name: "p", Set: match.MustCompile([]string{"netflix.com", "session:**.akamaized.net"}), Mark: 0x10000, Set4: "SNK_1_d4",
+		Session: func(client, dst netip.Addr, rule, name string) error {
+			mu.Lock()
+			defer mu.Unlock()
+			got = append(got, client.String()+" "+dst.String()+" "+rule+" "+name)
+			return nil
+		}}
+	h := newHarness(t, []Policy{pol})
+	if _, err := h.send(t, buildHello(sniExt("a1.akamaized.net"))); err != nil {
+		t.Fatal(err)
+	}
+	if m := h.mark(t); m != 0x10000 {
+		t.Fatalf("session connection not routed through the policy (mark %#x)", m)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 1 || got[0] != "127.0.0.1 127.0.0.1 session:**.akamaized.net a1.akamaized.net" {
+		t.Fatalf("sessions %q", got)
+	}
+	if l := h.sets.get("SNK_1_d4"); len(l) != 0 {
+		t.Fatalf("session destination learned into the set: %v", l)
+	}
+}

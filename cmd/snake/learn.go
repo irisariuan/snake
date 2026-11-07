@@ -29,10 +29,10 @@ const learnUsage = `usage:
   snake learn merge <id> <into-id>           merge a group into another
   snake learn delete <id>
 
-  snake learn addrs <policy> [--kind dns|drop|peer] [--filter Q] [--limit N] [--json]
+  snake learn addrs <policy> [--kind dns|drop|session|peer] [--filter Q] [--limit N] [--json]
                                              addresses a policy learned (DNS answers,
                                              drop: rule answers, WebRTC peers)
-  snake learn forget <policy> [--kind dns|drop|peer] (ADDR... | --rule RULE | --all)
+  snake learn forget <policy> [--kind dns|drop|session|peer] (ADDR... | --rule RULE | --all)
                                              remove learned addresses
 
 P and <policy> are a policy name or id.`

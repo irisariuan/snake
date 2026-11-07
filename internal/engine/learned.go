@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,21 +21,22 @@ import (
 
 // Kinds of policy-learned addresses.
 const (
-	LearnedDNS  = "dns"  // answers to policy domain rules (SNK_<id>_d)
-	LearnedPeer = "peer" // WebRTC peers (SNK_<id>_r)
-	LearnedDrop = "drop" // answers to drop: domain rules (SNK_<id>_x)
+	LearnedDNS  = "dns"     // answers to policy domain rules (SNK_<id>_d)
+	LearnedPeer = "peer"    // WebRTC peers: sessions learned from STUN
+	LearnedSess = "session" // sessions started by session: rules
+	LearnedDrop = "drop"    // answers to drop: domain rules (SNK_<id>_x)
 )
 
 func learnedKind(kind string) (string, error) {
 	switch kind {
 	case "", LearnedDNS:
 		return netfilter.KindDomain, nil
-	case LearnedPeer:
-		return netfilter.KindPeer, nil
+	case LearnedPeer, LearnedSess:
+		return kind, nil // sessions, not a set
 	case LearnedDrop:
 		return netfilter.KindDrop, nil
 	}
-	return "", fmt.Errorf("kind must be %q, %q or %q", LearnedDNS, LearnedDrop, LearnedPeer)
+	return "", fmt.Errorf("kind must be %q, %q, %q or %q", LearnedDNS, LearnedDrop, LearnedSess, LearnedPeer)
 }
 
 // LearnedAddr is one address a policy learned, with what is known about it.
@@ -126,6 +128,9 @@ func (e *Engine) LearnedAddrs(ref, kind, q string, limit int) (LearnedView, erro
 	}
 	if limit <= 0 {
 		limit = 1000
+	}
+	if k == LearnedPeer || k == LearnedSess {
+		return e.sessionView(p, k, q, limit), nil
 	}
 	v := LearnedView{PolicyID: p.ID, Policy: p.Name, Kind: kind, Addrs: []LearnedAddr{}}
 	if v.Kind == "" {
@@ -257,6 +262,12 @@ func (e *Engine) ForgetLearned(ref string, req ForgetRequest) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	if k == LearnedPeer || k == LearnedSess {
+		if k == LearnedPeer && req.Rule != nil {
+			return 0, errors.New("rule selection does not apply to WebRTC peers")
+		}
+		return e.forgetSessions(p.ID, k, req), nil
+	}
 	ips := e.ipset()
 	s4, s6 := netfilter.SetName(p.ID, k, false), netfilter.SetName(p.ID, k, true)
 	if req.All {
@@ -335,3 +346,79 @@ func (e *Engine) saveDNSRecords() {
 // isDNSKind reports whether a set kind is filled from DNS answers (and so
 // has inspector records).
 func isDNSKind(k string) bool { return k == netfilter.KindDomain || k == netfilter.KindDrop }
+
+// sessionView lists a policy's sessions (session: rules or WebRTC peers)
+// like learned addresses: one row per device + address.
+func (e *Engine) sessionView(p config.Policy, kind, q string, limit int) LearnedView {
+	src := SessionRule
+	if kind == LearnedPeer {
+		src = SessionWebRTC
+	}
+	v := LearnedView{PolicyID: p.ID, Policy: p.Name, Kind: kind, Addrs: []LearnedAddr{}}
+	devices := map[string]string{}
+	if !e.DryRun {
+		for _, c := range Clients() {
+			devices[c.IP] = c.Name
+		}
+	}
+	q = strings.ToLower(strings.TrimSpace(q))
+	rules := map[string]*RuleCount{}
+	now := time.Now()
+	for _, s := range e.Sessions(p.ID) {
+		if s.Source != src {
+			continue
+		}
+		v.Total++
+		if rules[s.Rule] == nil {
+			rules[s.Rule] = &RuleCount{Rule: s.Rule}
+		}
+		rules[s.Rule].Count++
+		if q != "" && !strings.Contains(strings.ToLower(s.Addr+" "+s.Client+" "+s.Name+" "+s.Rule+" "+devices[s.Client]), q) {
+			continue
+		}
+		v.Matching++
+		if len(v.Addrs) >= limit {
+			continue
+		}
+		created, seen := s.Created, s.Seen
+		v.Addrs = append(v.Addrs, LearnedAddr{Addr: s.Addr, Expires: int(s.Expires.Sub(now).Seconds()), Name: s.Name, Rule: s.Rule,
+			Client: s.Client, Device: devices[s.Client], FirstSeen: &created, LastSeen: &seen})
+	}
+	for _, rc := range rules {
+		v.Rules = append(v.Rules, *rc)
+	}
+	sort.Slice(v.Rules, func(i, j int) bool { return v.Rules[i].Count > v.Rules[j].Count })
+	return v
+}
+
+// forgetSessions ends sessions of a policy: all of one source, those of a
+// rule, or those to the given addresses.
+func (e *Engine) forgetSessions(policy int, kind string, req ForgetRequest) int {
+	src := SessionRule
+	if kind == LearnedPeer {
+		src = SessionWebRTC
+	}
+	addrs := map[string]bool{}
+	for _, a := range req.Addrs {
+		if ip := net.ParseIP(strings.TrimSpace(a)); ip != nil {
+			addrs[ip.String()] = true
+		}
+	}
+	n := 0
+	s := &e.sess
+	s.mu.Lock()
+	for k, se := range s.m {
+		if k.Policy != policy || se.Source != src {
+			continue
+		}
+		if req.All || (req.Rule != nil && se.Rule == *req.Rule) || addrs[k.Addr] {
+			delete(s.m, k)
+			n++
+		}
+	}
+	s.mu.Unlock()
+	if n > 0 {
+		_ = e.writeSessionChains(policy)
+	}
+	return n
+}

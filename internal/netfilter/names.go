@@ -11,7 +11,7 @@ const (
 	KindDomain  = "d" // populated by dnsmasq in real time
 	KindNet     = "n" // static CIDRs + ASN prefixes
 	KindSession = "s" // WebRTC session window: client IPs with a live policy session
-	KindPeer    = "r" // WebRTC peers learned from STUN (ICE connectivity checks)
+	KindPeer    = "r" // former WebRTC peer set (peers are sessions now); removed when found
 	KindServer  = "t" // STUN/TURN servers of learning groups routed via the policy; routed outside sessions too
 	KindDrop    = "x" // addresses answered for drop: domain rules (connections rejected)
 	KindDropNet = "z" // drop:asn: and drop:cidr: ranges (connections rejected)
@@ -53,6 +53,10 @@ const (
 
 // PolicyChain is the per-policy match chain.
 func PolicyChain(id int) string { return fmt.Sprintf("%s%d", chainPolicy, id) }
+
+// SessionChain is a policy's session chain: one rule per device + address
+// routed for that device only (session: rules, WebRTC peers).
+func SessionChain(id int) string { return fmt.Sprintf("SNAKE_Q%d", id) }
 
 // GuardChain is a policy's chain for one feature (drop, dns, dot, doh,
 // quic, sni, sniq) when it excludes devices: it returns for them first.

@@ -1,9 +1,13 @@
 package webrtc
 
 import (
+	"context"
+	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/irisariuan/snake/internal/netfilter"
 )
@@ -89,12 +93,35 @@ func TestPolicyMark(t *testing.T) {
 	}
 }
 
-func TestCountLearned(t *testing.T) {
-	tr := NewTracker(netfilter.IPSet{R: &fakeIPSet{added: map[string][]string{}}}, 0xff0000)
+// Peers a client's STUN revealed become sessions of that client: they
+// are batched per client and handed to OnPeer.
+func TestLearnerHandsPeersToSessions(t *testing.T) {
+	tr := NewTracker(netfilter.IPSet{}, 0xff0000)
 	tr.stats[12] = &Stats{}
-	tr.countLearned(netfilter.SetName(12, netfilter.KindServer, false), 2)
-	tr.countLearned(netfilter.SetName(12, netfilter.KindPeer, true), 3)
-	if s := tr.Stats()[12]; s.Servers != 2 || s.Learned != 3 {
+	tr.learnCh = make(chan learnReq, 10)
+	var mu sync.Mutex
+	got := map[string]string{}
+	tr.OnPeer = func(policy int, client string, peers []string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		got[fmt.Sprintf("%d %s", policy, client)] = strings.Join(peers, ",")
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	tr.wg.Add(1)
+	go tr.learner(ctx)
+	for _, r := range []learnReq{{12, "192.168.50.23", "203.0.113.9"}, {12, "192.168.50.23", "198.51.100.4"}, {12, "192.168.50.23", "203.0.113.9"}, {12, "192.168.50.40", "203.0.113.9"}} {
+		tr.learnCh <- r
+	}
+	time.Sleep(400 * time.Millisecond)
+	cancel()
+	tr.wg.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if got["12 192.168.50.23"] != "198.51.100.4,203.0.113.9" || got["12 192.168.50.40"] != "203.0.113.9" || len(got) != 2 {
+		t.Fatalf("sessions %v", got)
+	}
+	if s := tr.Stats()[12]; s.Learned != 3 {
 		t.Fatalf("stats %+v", s)
 	}
 }

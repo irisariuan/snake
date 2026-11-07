@@ -226,6 +226,7 @@ One rule per line:
 | `!=ads.example.com` | exclusion: any rule prefixed with `!` |
 | `drop:ads.example.com` | **block**: any domain rule after `drop:` (`drop:**.tracker.net`, `drop:~adserver`, `drop:/re/`) |
 | `drop:asn:1234`, `drop:cidr:198.51.100.0/24` | **block** an autonomous system or an address range / single IP (`drop:ip:` also works) |
+| `session:**.akamaized.net` | **device session**: any domain rule after `session:`; its answers are routed only for the device that looked the name up ([below](#device-sessions)) |
 | `com` | rejected: a bare top-level domain would route everything (`**.com` if you really mean it) |
 | `# comment` | ignored; a trailing ` # comment` is allowed too (except in regexes) |
 
@@ -525,6 +526,42 @@ What it costs and where it stops:
   it (within 5 minutes) or a firewall restart re-applies the rules without
   it.
 
+## Device sessions
+
+A **session** is one device + one address that a policy routes for that
+device only. Two things start sessions:
+
+* **`session:` rules**: when a device looks up a name a `session:` rule
+  matches (e.g. `session:**.akamaized.net`), the answered addresses are
+  routed through the tunnel **for that device only**. They are not added to
+  the policy's sets, not saved, and not handed to dnsmasq. The DNS inspector
+  holds the answer until the route is in place, so the device's first
+  connection already uses the tunnel. The SNI proxy does the same when it
+  sees a connection matching a `session:` rule by its TLS server name.
+* **WebRTC peers** revealed by a device's STUN during its session window
+  ([WebRTC](#webrtc)).
+
+A session lasts **`session_ttl`** (Settings, default 600 s) **after the
+device's last connection** to the address: the daemon renews every session
+that still has a live connection (it scans `/proc/net/nf_conntrack` every
+20 s, which also sees hardware-accelerated flows), so the countdown only
+starts once the last connection closed, and a new connection within the TTL
+renews it. After it ends, the device's next lookup starts a new one.
+
+* Precedence within a policy: `!` exclusions, then `drop:`, then
+  `session:`, then plain rules. So `session:` narrows routing:
+  `example.com` plus `session:cdn.example.com` routes `cdn.example.com`
+  only per device.
+* Use it for shared CDN names: routing a CDN's addresses for every device
+  would also send other sites on those addresses through the tunnel, for
+  everyone.
+* `session:` rules need the DNS inspector (NFQUEUE). Sessions follow the
+  policy's devices and excluded devices, and appear in **Learnings →
+  Policy addresses** (kinds *Sessions* and *WebRTC peers*), where they can
+  be ended. **Flush learned** ends a policy's sessions.
+* Each policy has a session chain `SNAKE_Q<id>` with one rule per device +
+  address (at most 4096 per policy), rewritten as sessions start and end.
+
 ## WebRTC
 
 WebRTC media goes to peer or TURN addresses that never show up in DNS, so
@@ -542,9 +579,12 @@ break every other app's calls. snake tracks it per policy instead:
      so the whole flow, including its NAT binding, uses the tunnel from the
      first packet. Its destination is learned:
      * **ICE connectivity checks** (binding requests carrying `USERNAME`,
-       `PRIORITY` or `ICE-CONTROLLING/CONTROLLED`) and anything ambiguous go
-       to the peer set `SNK_<id>_r` (`peer_timeout`, default 600 s). Peers are
-       routed only for devices inside a session window.
+       `PRIORITY` or `ICE-CONTROLLING/CONTROLLED`) and anything ambiguous
+       start a [device session](#device-sessions) with the peer: it is
+       routed for that device only, until `session_ttl` after its last
+       connection to the peer (an ongoing call keeps it). Older versions
+       kept peers in a policy-wide set (`SNK_<id>_r`, `peer_timeout`); that
+       set is removed on upgrade and `peer_timeout` is no longer used.
      * **Server requests** (plain binding requests, i.e. server-reflexive
        candidate gathering, and TURN Allocate/Refresh/CreatePermission/
        ChannelBind/Send) are learned into a **learning group** (see below).

@@ -53,6 +53,9 @@ func (s *Server) parseRuleFile(w http.ResponseWriter, r *http.Request) {
 			if p.Drop {
 				k = "drop " + k
 			}
+			if p.Session {
+				k = "session " + k
+			}
 			kinds[k]++
 		}
 	}

@@ -189,30 +189,35 @@ type Settings struct {
 	// marks (0x003f0000), which snake would otherwise restore as a policy
 	// mark. Conntrack marks are not read by Broadcom's packet path, so bits
 	// that are unsafe in packet marks are fine here.
-	ConnMarkMask     uint32   `json:"conn_mark_mask"`
-	APIPort          int      `json:"api_port"`
-	QueueBase        int      `json:"queue_base"`
-	DomainSetTimeout int      `json:"domain_set_timeout"` // seconds, 0 = never expire
-	SessionTimeout   int      `json:"session_timeout"`    // WebRTC session window, seconds
-	PeerTimeout      int      `json:"peer_timeout"`       // learned WebRTC peer lifetime, seconds
-	STUNServerTTL    int      `json:"stun_server_ttl"`    // learned STUN/TURN server lifetime once idle, seconds
-	HealthInterval   int      `json:"health_interval"`
-	HandshakeMaxAge  int      `json:"handshake_max_age"`
-	ProbeTargets     []string `json:"probe_targets"` // host:port, TCP
-	ProbeFailures    int      `json:"probe_failures"`
-	GeoURL           string   `json:"geo_url"`
-	GeoCountryField  string   `json:"geo_country_field"`
-	GeoIPField       string   `json:"geo_ip_field"`
-	GeoInterval      int      `json:"geo_interval"`
-	GeoStrict        bool     `json:"geo_strict"` // unknown country counts as failure
-	AutoFailback     bool     `json:"auto_failback"`
-	FailbackHold     int      `json:"failback_hold"`
-	ASNRefresh       int      `json:"asn_refresh"` // hours
-	SaveInterval     int      `json:"save_interval"`
-	STUNPorts        string   `json:"stun_ports"` // multiport syntax for fallback mode
-	DoHCanary        bool     `json:"doh_canary"` // answer Firefox/iCloud Private Relay canaries with NXDOMAIN
-	PreResolve       bool     `json:"pre_resolve"`
-	FlushConntrack   bool     `json:"flush_conntrack"`
+	ConnMarkMask     uint32 `json:"conn_mark_mask"`
+	APIPort          int    `json:"api_port"`
+	QueueBase        int    `json:"queue_base"`
+	DomainSetTimeout int    `json:"domain_set_timeout"` // seconds, 0 = never expire
+	SessionTimeout   int    `json:"session_timeout"`    // WebRTC session window, seconds
+	PeerTimeout      int    `json:"peer_timeout"`       // unused: WebRTC peers are sessions now (session_ttl); kept for older versions
+	// SessionTTL is how long a session (a device + address pair routed by
+	// a session: rule or learned from the device's WebRTC traffic) lasts
+	// after the device's last connection to that address, seconds. A new
+	// connection renews it.
+	SessionTTL      int      `json:"session_ttl"`
+	STUNServerTTL   int      `json:"stun_server_ttl"` // learned STUN/TURN server lifetime once idle, seconds
+	HealthInterval  int      `json:"health_interval"`
+	HandshakeMaxAge int      `json:"handshake_max_age"`
+	ProbeTargets    []string `json:"probe_targets"` // host:port, TCP
+	ProbeFailures   int      `json:"probe_failures"`
+	GeoURL          string   `json:"geo_url"`
+	GeoCountryField string   `json:"geo_country_field"`
+	GeoIPField      string   `json:"geo_ip_field"`
+	GeoInterval     int      `json:"geo_interval"`
+	GeoStrict       bool     `json:"geo_strict"` // unknown country counts as failure
+	AutoFailback    bool     `json:"auto_failback"`
+	FailbackHold    int      `json:"failback_hold"`
+	ASNRefresh      int      `json:"asn_refresh"` // hours
+	SaveInterval    int      `json:"save_interval"`
+	STUNPorts       string   `json:"stun_ports"` // multiport syntax for fallback mode
+	DoHCanary       bool     `json:"doh_canary"` // answer Firefox/iCloud Private Relay canaries with NXDOMAIN
+	PreResolve      bool     `json:"pre_resolve"`
+	FlushConntrack  bool     `json:"flush_conntrack"`
 	// LANInterfaces are the iptables -i patterns of client traffic,
 	// separated by spaces: the LAN bridges plus the router's VPN servers
 	// (WireGuard wgs*, OpenVPN tun21/tun22), whose clients are covered
@@ -510,6 +515,7 @@ func DefaultSettings() Settings {
 		DomainSetTimeout: 0,
 		SessionTimeout:   120,
 		PeerTimeout:      600,
+		SessionTTL:       600,
 		STUNServerTTL:    86400,
 		HealthInterval:   15,
 		HandshakeMaxAge:  180,
@@ -576,6 +582,7 @@ func (c *Config) ApplyDefaults() {
 	setInt(&s.QueueBase, d.QueueBase)
 	setInt(&s.SessionTimeout, d.SessionTimeout)
 	setInt(&s.PeerTimeout, d.PeerTimeout)
+	setInt(&s.SessionTTL, d.SessionTTL)
 	setInt(&s.STUNServerTTL, d.STUNServerTTL)
 	setInt(&s.HealthInterval, d.HealthInterval)
 	setInt(&s.HandshakeMaxAge, d.HandshakeMaxAge)
@@ -875,7 +882,7 @@ func (c *Config) Validate() error {
 	for _, t := range []struct {
 		name string
 		v    int
-	}{{"session_timeout", s.SessionTimeout}, {"peer_timeout", s.PeerTimeout}, {"stun_server_ttl", s.STUNServerTTL}, {"domain_set_timeout", s.DomainSetTimeout}} {
+	}{{"session_timeout", s.SessionTimeout}, {"peer_timeout", s.PeerTimeout}, {"session_ttl", s.SessionTTL}, {"stun_server_ttl", s.STUNServerTTL}, {"domain_set_timeout", s.DomainSetTimeout}} {
 		if t.v > 2147483 {
 			add("%s must be at most 2147483 seconds", t.name)
 		}
@@ -1104,6 +1111,16 @@ func normalizeRule(s string) string {
 func (p Policy) HasDomains() bool {
 	for _, d := range p.Domains {
 		if r := match.StripComment(d); r != "" && !isDrop(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// HasSessions reports whether the policy has session: rules.
+func (p Policy) HasSessions() bool {
+	for _, d := range p.Domains {
+		if r := match.StripComment(d); len(r) >= len(match.SessionPrefix) && strings.EqualFold(r[:len(match.SessionPrefix)], match.SessionPrefix) {
 			return true
 		}
 	}

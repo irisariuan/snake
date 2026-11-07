@@ -355,6 +355,7 @@ function viewStatus(b) {
         el('td', null, el('b', null, p.name), p.domain_mode ? el('div', { class: 'small ' + (p.domain_mode.indexOf('degraded') === 0 ? 'tw:text-warn' : 'muted') }, 'domains: ' + p.domain_mode) : null,
           (p.asn_errors || []).map(function (e) { return el('div', { class: 'small tw:text-warn' }, e); }),
           p.sni_matched !== undefined ? el('div', { class: 'small muted' }, 'SNI: ' + p.sni_matched + ' connections routed by server name') : null,
+          p.sessions ? el('div', { class: 'small muted' }, 'sessions: ' + p.sessions + ' device + address pairs') : null,
           p.dns_upstream ? el('div', { class: 'small muted' }, 'DNS: ' + p.dns_upstream.upstream + ' · local ' + p.dns_upstream.listen + ' · ' + p.dns_upstream.queries + ' queries' +
             (p.dns_upstream.queries > p.dns_upstream.errors ? ', ' + p.dns_upstream.avg_ms.toFixed(0) + ' ms avg' : '') + (p.dns_upstream.errors ? ', ' + p.dns_upstream.errors + ' failed' : '')) : null,
           p.dns_upstream && p.dns_upstream.last_error && (Date.now() - new Date(p.dns_upstream.last_error_at).getTime()) < 600000 ?
@@ -387,6 +388,7 @@ var SYNTAX = [
   ['!rule', 'exclusion: vetoes matches of the rules (drop: rules too)'],
   ['drop:rule', 'block: connections to what any domain rule after drop: matches are rejected; beats include rules'],
   ['drop:asn:1234 / drop:cidr:1.2.3.0/24', 'block an autonomous system or address range'],
+  ['session:rule', 'device session: what any domain rule after session: matches is routed only for the device that looked it up, until the session TTL after its last connection; not added to the policy\'s sets. Beats include rules; drop: and ! beat it'],
   ['asn:2906', 'autonomous system (all its announced prefixes)'],
   ['cidr:23.246.0.0/18', 'address range or single IP (ip: also works)'],
   ['@name / @description / @source', 'list metadata (rule lists)'],
@@ -411,6 +413,7 @@ function hlLine(line) {
   }
   var out = esc(lead);
   if (t[0] === '!') { out += span('neg', '!'); t = t.slice(1); }
+  if ((m = /^(session:)(.*)$/i.exec(t))) { out += span('sess', m[1]); t = m[2]; }
   if ((m = /^(drop:)(.*)$/i.exec(t))) {
     out += span('drop', m[1]); t = m[2];
     if ((m = /^(asn:|cidr:|ip:)(.*)$/i.exec(t))) { var dc = splitComment(m[2]); return out + span('kw', m[1]) + span('num', dc[0]) + span('com', dc[1]); }
@@ -1021,7 +1024,7 @@ function viewSettings(b) {
       bool('geo_strict', 'Strict: unknown country counts as failure')),
     el('div', { class: 'card' }, el('b', null, 'WebRTC & sets'),
       num('session_timeout', 'WebRTC session window (s)', 'How long after the last policy connection a device\'s STUN is still attributed to the policy.'),
-      num('peer_timeout', 'Learned peer lifetime (s)'),
+      num('session_ttl', 'Session TTL (s)', 'How long a device session (session: rules, WebRTC peers) lasts after the device\'s last connection to the address. A new connection renews it; after it ends, the next lookup starts a new one.'),
       num('stun_server_ttl', 'Learning group default idle TTL (s)', 'How long a learned STUN/TURN server stays in its group (see the Learnings tab) after its last connection. Groups can override it or be pinned.'),
       txt('stun_ports', 'STUN/TURN ports (fallback mode)'),
       num('domain_set_timeout', 'Domain set entry timeout (s, 0 = never)'),
@@ -1233,14 +1236,15 @@ function viewLearnedAddrs(b) {
   var pols = (state.cfg.policies || []).filter(function (p) { return p.enabled; });
   var la = state.la = state.la || { policy: pols.length ? pols[0].id : 0, kind: 'dns', q: '' };
   b.appendChild(el('p', { class: 'small muted' },
-    'Addresses each policy has learned: answers to its domain rules (from the DNS inspector, or dnsmasq when the inspector is off) and WebRTC peers. ' +
+    'Addresses each policy has learned: answers to its domain rules (from the DNS inspector, or dnsmasq when the inspector is off), and its device sessions (session: rules and WebRTC peers: each routed for one device only, until the session TTL after its last connection). ' +
     'Removing an address only lasts until the policy learns it again: the next DNS answer or ICE check adds it back. To stop routing a domain, change the rule.'));
   var polSel = el('select', { onchange: function (e) { la.policy = +e.target.value; la.data = null; loadLA(); } },
     pols.map(function (p) { return el('option', { value: p.id, selected: p.id === la.policy ? 'selected' : null }, p.name); }));
   var kindSel = el('select', { onchange: function (e) { la.kind = e.target.value; la.data = null; loadLA(); } },
     el('option', { value: 'dns', selected: la.kind === 'dns' ? 'selected' : null }, 'DNS answers'),
     el('option', { value: 'drop', selected: la.kind === 'drop' ? 'selected' : null }, 'Blocked (drop: rules)'),
-    el('option', { value: 'peer', selected: la.kind === 'peer' ? 'selected' : null }, 'WebRTC peers'));
+    el('option', { value: 'session', selected: la.kind === 'session' ? 'selected' : null }, 'Sessions (session: rules)'),
+    el('option', { value: 'peer', selected: la.kind === 'peer' ? 'selected' : null }, 'WebRTC peers (sessions)'));
   var qIn = el('input', { type: 'text', placeholder: 'filter: address, name, rule, device', size: 30, value: la.q,
     onkeydown: function (e) { if (e.key === 'Enter') { la.q = qIn.value; loadLA(); } } });
   b.appendChild(el('div', { class: 'row tw:mb-2' }, polSel, kindSel, qIn,
@@ -1266,7 +1270,7 @@ function viewLearnedAddrs(b) {
     if (!v.inspector) info += ' · DNS inspector off: new answers are added by dnsmasq without details';
   }
   out.appendChild(el('div', { class: 'row tw:mb-2' }, el('span', { class: 'small muted' }, info),
-    v.total ? btn('Remove all', function () { if (confirm('Remove all ' + v.total + ' learned ' + ({ dns: 'DNS', drop: 'blocked', peer: 'peer' }[v.kind]) + ' addresses of ' + v.policy + '?')) forget({ all: true }, 'Removed'); }, 'danger') : null));
+    v.total ? btn('Remove all', function () { if (confirm('Remove all ' + v.total + ' learned ' + ({ dns: 'DNS', drop: 'blocked', session: 'session', peer: 'peer' }[v.kind]) + ' addresses of ' + v.policy + '?')) forget({ all: true }, 'Removed'); }, 'danger') : null));
   if (dnsKind && (v.rules || []).length) {
     out.appendChild(el('details', { class: 'card', open: la.rulesOpen ? true : null, ontoggle: function (e) { la.rulesOpen = e.target.open; } },
       el('summary', { class: 'tw:cursor-pointer' }, el('b', null, 'By rule'), el('span', { class: 'small muted' }, ' (' + v.rules.length + ')')),

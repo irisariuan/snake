@@ -67,6 +67,10 @@ type Policy struct {
 	// connection opens the client's session window, like a connection to a
 	// learned destination does.
 	Session4, Session6 string
+	// Session starts a session for a connection matching a session: rule:
+	// its destination is routed for that client only, not learned into
+	// Set4/Set6. nil: session: rules are treated as plain rules.
+	Session func(client, dst netip.Addr, rule, name string) error
 	// ECH is what happens to the policy's clients' Encrypted Client Hello
 	// connections: ECHDrop, ECHRelay ("" = relay) or ECHPassthrough.
 	ECH string
@@ -477,7 +481,13 @@ func (p *Proxy) handle(c *net.TCPConn) {
 		}
 		p.byPol[pol.ID]++
 		p.statMu.Unlock()
-		p.learn(dst.Addr(), pol.Set4, pol.Set6)
+		if res.Session && pol.Session != nil {
+			if err := pol.Session(client, dst.Addr(), res.Rule, hello.ServerName); err != nil {
+				logx.Warnf("sni proxy: session for %s -> %s (%s): %v", client, dst, hello.ServerName, err)
+			}
+		} else {
+			p.learn(dst.Addr(), pol.Set4, pol.Set6)
+		}
 		if client.IsValid() {
 			p.learn(client, pol.Session4, pol.Session6)
 		}

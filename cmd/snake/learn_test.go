@@ -123,12 +123,15 @@ func TestLearnAddrsCLI(t *testing.T) {
 	if last := rec.Commands[len(rec.Commands)-1]; !strings.Contains(last, "del SNK_1_d4 203.0.113.99") {
 		t.Fatalf("ipset: %s", last)
 	}
-	run(t, "forget", "Disney UK TV", "--kind", "peer", "--all")
-	found := false
-	for _, c := range rec.Commands {
-		found = found || c == "ipset flush SNK_2_r4"
+	// WebRTC peers are device sessions now: forgetting them ends sessions
+	// and touches no set.
+	out = run(t, "forget", "Disney UK TV", "--kind", "peer", "--all")
+	if !strings.Contains(out, "removed 0") {
+		t.Fatalf("forget peers:\n%s", out)
 	}
-	if !found {
-		t.Fatal("peer flush not run")
+	for _, c := range rec.Commands {
+		if strings.Contains(c, "SNK_2_r") {
+			t.Fatalf("peer set used: %s", c)
+		}
 	}
 }
