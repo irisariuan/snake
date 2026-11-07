@@ -4,3 +4,4 @@ dist/
 internal/webui/build/site/
 web/node_modules/
 web/.astro/
+.env
