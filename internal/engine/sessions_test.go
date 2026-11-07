@@ -164,8 +164,8 @@ func TestDropSessions(t *testing.T) {
 	}
 	r := e.domainSet(e.runtime().Policies[0]).MatchAny("x.ads.example.net")
 	rec.Commands = nil
-	if err := e.AddSessions(1, "192.168.50.23", []string{"203.0.113.9"}, SessionDrop, r.Rule, "x.ads.example.net", r.Opts); err != nil {
-		t.Fatal(err)
+	if act, err := e.RouteAction(1, "192.168.50.23", []string{"203.0.113.9"}, r.Rule, "x.ads.example.net", r.Name); err != nil || act != "drop" || !r.Route {
+		t.Fatalf("%q %v (match %+v)", act, err, r)
 	}
 	w := rec.Joined()
 	for _, want := range []string{"*filter\n:SNAKE_D1 - [0:0]",
@@ -189,5 +189,79 @@ func TestDropSessions(t *testing.T) {
 	e.refreshSessions(strings.NewReader(""), start.Add(115*time.Second))
 	if len(e.Sessions(1)) != 0 {
 		t.Fatal("drop session kept after its TTL")
+	}
+}
+
+// ttl=-1: sessions never expire; set=1/0/toggle turn them on, off or flip
+// them at each lookup; rules matching one lookup apply top to bottom; they
+// survive a restart.
+func TestPermanentSessions(t *testing.T) {
+	e, _ := sessionEngine(t)
+	if _, err := e.UpdateConfig(func(c *config.Config) error {
+		c.Policies[0].Domains = []string{"example.com",
+			"route[ttl=-1]:**.both.example",
+			"drop[ttl=-1]:=x.both.example",
+			"route[ttl=-1;set=toggle]:switch.example",
+			"route[ttl=-1;set=0]:=off.switch.example",
+			"drop[ttl=-1;set=0]:=keep.example",
+			"route[ttl=60]:keep.example"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	set := e.domainSet(e.runtime().Policies[0])
+	look := func(name, addr string) string {
+		t.Helper()
+		r := set.MatchAny(name)
+		act, err := e.RouteAction(1, "192.168.50.23", []string{addr}, r.Rule, name, r.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return act
+	}
+	// Both rules match x.both.example: the drop below the route wins.
+	if a := look("x.both.example", "203.0.113.1"); a != "drop" {
+		t.Errorf("x.both.example: %q", a)
+	}
+	if a := look("y.both.example", "203.0.113.2"); a != "route" {
+		t.Errorf("y.both.example: %q", a)
+	}
+	// toggle flips; a later set=0 rule turns it off.
+	for i, want := range []string{"route", "", "route"} {
+		if a := look("switch.example", "203.0.113.3"); a != want {
+			t.Errorf("toggle %d: %q, want %q", i, a, want)
+		}
+	}
+	if a := look("off.switch.example", "203.0.113.3"); a != "" {
+		t.Errorf("toggle then set=0 (both match, top to bottom): %q", a)
+	}
+	// set=0 on drop leaves a route session alone; a timed rule does not
+	// shorten a permanent session.
+	if a := look("keep.example", "203.0.113.4"); a != "route" {
+		t.Errorf("keep.example: %q", a)
+	}
+	if a := look("y.both.example", "203.0.113.4"); a != "route" {
+		t.Fatal(a)
+	}
+	_ = look("keep.example", "203.0.113.4")
+	// Never expire.
+	e.refreshSessions(strings.NewReader(""), time.Now().Add(30*24*time.Hour))
+	perm := 0
+	for _, s := range e.Sessions(1) {
+		if !s.Permanent {
+			t.Errorf("timed session survived: %+v", s)
+		}
+		perm++
+	}
+	if perm != 3 {
+		t.Fatalf("permanent sessions: %+v", e.Sessions(1))
+	}
+	// Saved and restored.
+	e2 := New(e.P, &system.Recorder{})
+	if err := e2.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(e2.Sessions(1)); n != 3 {
+		t.Fatalf("restored %d permanent sessions", n)
 	}
 }

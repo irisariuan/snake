@@ -442,13 +442,6 @@ func (e *Engine) TestDomain(name string) DomainTest {
 		}
 		res.Addrs = append(res.Addrs, ar)
 	}
-	if ok && mr.Drop && !mr.Opts.IsZero() {
-		res.Policy, res.PolicyID, res.Matched, res.Via, res.Blocked = p.Name, p.ID, mr.Rule, mr.Name, true
-		res.Notes = append(res.Notes, "drop session: these addresses are blocked only for the device that looks the name up"+
-			map[bool]string{true: " and the devices it shares with (" + strings.Join(mr.Opts.Share, ", ") + ")", false: ""}[len(mr.Opts.Share) > 0]+
-			", until the session TTL after its last blocked attempt; other devices are not affected")
-		return res
-	}
 	if ok && mr.Drop {
 		res.Policy, res.PolicyID, res.Matched, res.Via, res.Blocked = p.Name, p.ID, mr.Rule, mr.Name, true
 		res.Notes = append(res.Notes, "blocked by a drop: rule: connections to these addresses are rejected for the policy's devices")
@@ -483,8 +476,12 @@ func (e *Engine) TestDomain(name string) DomainTest {
 			res.Notes = append(res.Notes, "this match needs the DNS inspector, which is not running (kernel without NFQUEUE?)")
 		}
 		if mr.Route {
-			if rt := e.domainSet(p).Route(mr.Rule); rt != nil {
-				res.Notes = append(res.Notes, routeNotes(rt, mr.Name, e.sessionTTL())...)
+			steps := e.domainSet(p).StepsFor(mr.Name, name)
+			if len(steps) > 1 {
+				res.Notes = append(res.Notes, fmt.Sprintf("%d route/drop rules match: a device's lookup applies them top to bottom, so for an address the last one wins", len(steps)))
+			}
+			for _, st := range steps {
+				res.Notes = append(res.Notes, stepNotes(st, e.sessionTTL(), mr.Name, name)...)
 			}
 		}
 		if len(mr.Cond) > 0 {
@@ -751,36 +748,56 @@ func (e *Engine) LeakChecks() []LeakCheck {
 	return out
 }
 
-// routeNotes explains what a conditional rule does with a name.
-func routeNotes(rt *match.Route, name string, defTTL time.Duration) []string {
-	what := func(a *match.Action) string {
-		if a == nil {
-			return "nothing (not routed by this policy)"
-		}
-		ttl := defTTL
-		if a.Opts.TTL > 0 {
-			ttl = a.Opts.TTL
-		}
+// stepNotes explains what a route/drop session rule does with a name.
+func stepNotes(st match.Step, defTTL time.Duration, names ...string) []string {
+	what := func(kind string, o match.Opts) string {
 		verb := "routed through the tunnel"
-		if a.Kind == match.ActDrop {
+		if kind == match.ActDrop {
 			verb = "blocked"
 		}
-		s := fmt.Sprintf("%s for that device (a %s session, %s", verb, a.Kind, match.FormatTTL(ttl))
-		if a.Opts.OnLookup {
+		if o.Permanent() {
+			switch o.SetMode() {
+			case match.SetOff:
+				return "no longer " + verb + " for that device (set=0 ends its " + kind + " session)"
+			case match.SetToggle:
+				return verb + " for that device if they were not, and no longer if they were (set=toggle; until the next toggle)"
+			}
+			s := verb + " for that device until a set=0 or set=toggle lookup (a permanent " + kind + " session"
+			if len(o.Share) > 0 {
+				s += "; shared with " + strings.Join(o.Share, ", ")
+			}
+			return s + ")"
+		}
+		ttl := defTTL
+		if o.TTL > 0 {
+			ttl = o.TTL
+		}
+		s := fmt.Sprintf("%s for that device (a %s session, %s", verb, kind, match.FormatTTL(ttl))
+		if o.OnLookup {
 			s += " from the lookup"
 		} else {
 			s += " after its last connection"
 		}
-		if len(a.Opts.Share) > 0 {
-			s += "; shared with " + strings.Join(a.Opts.Share, ", ")
+		if len(o.Share) > 0 {
+			s += "; shared with " + strings.Join(o.Share, ", ")
 		}
 		return s + ")"
 	}
+	act := func(a *match.Action) string {
+		if a == nil {
+			return "nothing (not handled by this rule)"
+		}
+		return what(a.Kind, a.Opts)
+	}
+	if st.Drop != nil {
+		return []string{"drop[...] rule " + st.Raw() + ": a device's lookup of this name makes its addresses " + what(match.ActDrop, st.Drop.Opts) + "; other devices are not affected"}
+	}
+	rt := st.Route
 	if rt.If == nil {
-		return []string{"route: rule: a device's lookup of this name makes its addresses " + what(rt.Pick(true, name)) + "; they are not added to the policy's sets"}
+		return []string{"route: rule: a device's lookup of this name makes its addresses " + act(rt.Pick(true, names...)) + "; they are not added to the policy's sets"}
 	}
 	return []string{
-		"conditional rule: when a device has a live connection to an address of the if: names, its lookup of this name makes the addresses " + what(rt.Pick(true, name)),
-		"otherwise: " + what(rt.Pick(false, name)) + "; the addresses are not added to the policy's sets",
+		"conditional rule: when a device has a live connection to an address of the if: names, its lookup of this name makes the addresses " + act(rt.Pick(true, names...)),
+		"otherwise: " + act(rt.Pick(false, names...)) + "; the addresses are not added to the policy's sets",
 	}
 }

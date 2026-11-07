@@ -336,6 +336,9 @@ func parseSession(s string) (Pattern, error) {
 	if q.Negate || q.Drop || q.Session || q.Kind == ASN || q.Kind == CIDR {
 		return p, fmt.Errorf("session: must be followed by a domain rule (a session starts with a DNS lookup)")
 	}
+	if o.Permanent() {
+		return p, fmt.Errorf("session[...]: a negative ttl and set= are for route and drop actions")
+	}
 	q.Raw, q.Session, q.Opts = s, true, o
 	return q, nil
 }
@@ -435,13 +438,18 @@ func (p Pattern) Native() bool { return p.Kind == Suffix && !p.Negate }
 type Set struct {
 	once               sync.Once
 	inc, exc, drp, ses index
+	plainDrop          []Pattern // drop: rules without options (blocked for everyone)
 	Include            []Pattern
 	Exclude            []Pattern
 	Drop               []Pattern // drop: domain rules
 	Session            []Pattern // session: domain rules
 	Routes             []*Route  // if:...;then:... and route: rules
-	DropASNs           []int     // drop:asn:
-	DropCIDRs          []string  // drop:cidr:
+	// Steps are the rules that start route or drop sessions (if:/route:
+	// rules and drop[...]: rules), in the order written: a lookup
+	// matching several applies them all, top to bottom.
+	Steps     []Step
+	DropASNs  []int    // drop:asn:
+	DropCIDRs []string // drop:cidr:
 }
 
 // LineError is a parse error for one rule.
@@ -468,6 +476,7 @@ func Compile(rules []string) (*Set, []LineError) {
 				continue
 			}
 			s.Routes = append(s.Routes, rt)
+			s.Steps = append(s.Steps, Step{Line: i, Route: rt})
 			continue
 		}
 		p, err := Parse(r)
@@ -485,6 +494,10 @@ func Compile(rules []string) (*Set, []LineError) {
 			s.DropCIDRs = append(s.DropCIDRs, p.Value)
 		case p.Drop:
 			s.Drop = append(s.Drop, p)
+			if !p.Opts.IsZero() {
+				q := p
+				s.Steps = append(s.Steps, Step{Line: i, Drop: &q})
+			}
 		case p.Session:
 			s.Session = append(s.Session, p)
 		default:
@@ -492,6 +505,60 @@ func Compile(rules []string) (*Set, []LineError) {
 		}
 	}
 	return s, errs
+}
+
+// Step is a rule that starts route or drop sessions: an if:/route: rule
+// or a drop[...]: rule.
+type Step struct {
+	Line  int      `json:"line"`
+	Route *Route   `json:"route,omitempty"`
+	Drop  *Pattern `json:"drop,omitempty"`
+}
+
+// Raw is the rule's text.
+func (st Step) Raw() string {
+	if st.Route != nil {
+		return st.Route.Raw
+	}
+	return st.Drop.Raw
+}
+
+// Match reports whether the rule has the name (in any branch).
+func (st Step) Match(name string) bool {
+	if st.Route != nil {
+		return st.Route.MatchName(name)
+	}
+	return st.Drop.Match(name)
+}
+
+// StepsFor lists the steps any of the names matches, top to bottom.
+func (s *Set) StepsFor(names ...string) []Step {
+	var out []Step
+	for _, st := range s.Steps {
+		for _, n := range names {
+			if n != "" && st.Match(n) {
+				out = append(out, st)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// firstStep returns the first step a name matches (drop[...] rules only
+// with dropOnly) and that name.
+func (s *Set) firstStep(names []string, dropOnly bool) (Step, string, bool) {
+	for _, st := range s.Steps {
+		if dropOnly && st.Drop == nil {
+			continue
+		}
+		for _, n := range names {
+			if st.Match(n) {
+				return st, n, true
+			}
+		}
+	}
+	return Step{}, "", false
 }
 
 // MustCompile compiles rules already validated, dropping bad ones.
@@ -507,8 +574,10 @@ type Result struct {
 	Rule    string `json:"rule,omitempty"`    // the include (or drop) rule that matched
 	Drop    bool   `json:"drop,omitempty"`    // a drop: rule matched: block, do not route
 	Session bool   `json:"session,omitempty"` // a session: rule matched: route for the asking device only
-	Route   bool   `json:"route,omitempty"`   // a route: expression matched: sessions if its if: holds for the device
-	Opts    Opts   `json:"opts,omitempty"`    // session options of the session: or route: rule
+	// Route: route/drop session rules matched (Set.StepsFor lists them; the
+	// device's conditions pick their actions); Rule is the first.
+	Route bool `json:"route,omitempty"`
+	Opts  Opts `json:"opts,omitempty"` // options of the session: rule
 	// Cond lists the if: atoms the names matched: the answer is routed
 	// like a plain rule, and its addresses count for those conditions.
 	Cond     []CondHit `json:"cond,omitempty"`
@@ -530,8 +599,13 @@ func (s *Set) MatchAny(names ...string) Result {
 	}
 	for _, n := range names {
 		if i := s.drp.first(n); i >= 0 {
-			return Result{Matched: true, Drop: true, Name: n, Rule: s.Drop[i].Raw, Opts: s.Drop[i].Opts}
+			return Result{Matched: true, Drop: true, Name: n, Rule: s.plainDrop[i].Raw}
 		}
+	}
+	// drop[...] rules: they and every other route/drop rule matching
+	// apply, top to bottom.
+	if st, n, ok := s.firstStep(names, true); ok {
+		return Result{Matched: true, Route: true, Name: n, Rule: st.Raw()}
 	}
 	for _, n := range names {
 		if i := s.ses.first(n); i >= 0 {
@@ -560,13 +634,9 @@ func (s *Set) MatchAny(names ...string) Result {
 	if len(hits) > 0 {
 		return Result{Matched: true, Name: first, Rule: firstRule, Cond: hits}
 	}
-	for _, n := range names {
-		for _, r := range s.Routes {
-			if r.MatchName(n) {
-				// The device's condition picks the branch (see Route.Pick).
-				return Result{Matched: true, Route: true, Name: n, Rule: r.Raw}
-			}
-		}
+	if st, n, ok := s.firstStep(names, false); ok {
+		// The device's conditions pick the branches (see Route.Pick).
+		return Result{Matched: true, Route: true, Name: n, Rule: st.Raw()}
 	}
 	for _, n := range names {
 		if i := s.inc.first(n); i >= 0 {
@@ -643,7 +713,12 @@ func (x *index) first(name string) int {
 }
 
 func (s *Set) build() {
-	s.inc, s.exc, s.drp, s.ses = newIndex(s.Include), newIndex(s.Exclude), newIndex(s.Drop), newIndex(s.Session)
+	for _, p := range s.Drop {
+		if p.Opts.IsZero() {
+			s.plainDrop = append(s.plainDrop, p)
+		}
+	}
+	s.inc, s.exc, s.drp, s.ses = newIndex(s.Include), newIndex(s.Exclude), newIndex(s.plainDrop), newIndex(s.Session)
 }
 
 // Empty reports whether the set has no include rules (session: rules count).

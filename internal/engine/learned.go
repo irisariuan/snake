@@ -381,7 +381,11 @@ func (e *Engine) sessionView(p config.Policy, kind, q string, limit int) Learned
 			continue
 		}
 		created, seen := s.Created, s.Seen
-		v.Addrs = append(v.Addrs, LearnedAddr{Addr: s.Addr, Expires: int(s.Expires.Sub(now).Seconds()), Name: s.Name, Rule: s.Rule,
+		exp := int(s.Expires.Sub(now).Seconds())
+		if s.Permanent {
+			exp = 0 // never
+		}
+		v.Addrs = append(v.Addrs, LearnedAddr{Addr: s.Addr, Expires: exp, Name: s.Name, Rule: s.Rule,
 			Client: s.Client, Device: devices[s.Client], FirstSeen: &created, LastSeen: &seen})
 	}
 	for _, rc := range rules {

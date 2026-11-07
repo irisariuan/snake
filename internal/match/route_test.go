@@ -167,7 +167,8 @@ func TestDropSessionRules(t *testing.T) {
 		t.Fatalf("drop sessions %+v", s.Drop)
 	}
 	r := s.MatchAny("x.ads.example.com")
-	if !r.Drop || r.Opts.TTL != 5*time.Minute || len(r.Opts.Share) != 1 {
+	st := s.StepsFor("x.ads.example.com")
+	if !r.Route || len(st) != 1 || st[0].Drop.Opts.TTL != 5*time.Minute || len(st[0].Drop.Opts.Share) != 1 {
 		t.Fatalf("match %+v", r)
 	}
 	if r := s.MatchAny("tracker.example"); !r.Drop || !r.Opts.IsZero() {
@@ -265,5 +266,63 @@ func TestIfThenElse(t *testing.T) {
 	}
 	if !IsLegacyRoute("route:a.com;if:b.com") || IsLegacyRoute("route:a.com") || IsLegacyRoute("if:b.com;then:route:a.com") {
 		t.Error("IsLegacyRoute")
+	}
+}
+
+func TestSetOption(t *testing.T) {
+	r, err := ParseRoute("if:a.example;then:route[ttl=-1;set=on]:b.example;else:drop[ttl=-5m,set=toggle]:b.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.Then.Opts.Permanent() || r.Then.Opts.SetMode() != SetOn || r.Else.Opts.SetMode() != SetToggle {
+		t.Fatalf("opts %+v %+v", r.Then.Opts, r.Else.Opts)
+	}
+	p, err := Parse("drop[ttl=-1;set=0;share=kids]:ads.example")
+	if err != nil || p.Raw != "drop[ttl=-1;set=0;share=kids]:ads.example" || p.Opts.SetMode() != SetOff {
+		t.Fatalf("%+v %v", p, err)
+	}
+	if p, _ := Parse("drop[set=1;ttl=-1]:x.example"); p.Raw != "drop[ttl=-1]:x.example" {
+		t.Fatalf("canonical %q (set=1 is the default)", p.Raw)
+	}
+	for want, rule := range map[string]string{
+		"needs a negative ttl":   "drop[set=0]:a.example",
+		"onlookup has no effect": "drop[ttl=-1;onlookup=1]:a.example",
+		"set must be":            "drop[ttl=-1;set=2]:a.example",
+		"for route and drop":     "session[ttl=-1]:a.example",
+		"seconds or a duration":  "drop[ttl=-x]:a.example",
+	} {
+		if _, err := Parse(rule); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: want %q, got %v", rule, want, err)
+		}
+	}
+}
+
+// Route/drop rules matching one lookup apply top to bottom.
+func TestStepsOrder(t *testing.T) {
+	s, errs := Compile([]string{
+		"drop[ttl=-1]:=x.both.example",
+		"plain.example",
+		"route[ttl=-1]:**.both.example",
+		"if:t.example;then:drop:**.both.example",
+		"drop:blocked.example",
+	})
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	var raws []string
+	for _, st := range s.StepsFor("x.both.example") {
+		raws = append(raws, st.Raw())
+	}
+	if strings.Join(raws, " | ") != "drop[ttl=-1]:=x.both.example | route[ttl=-1]:**.both.example | if:t.example;then:drop:**.both.example" {
+		t.Fatalf("steps %q", raws)
+	}
+	if r := s.MatchAny("x.both.example"); !r.Route || r.Rule != "drop[ttl=-1]:=x.both.example" {
+		t.Fatalf("match %+v", r)
+	}
+	if r := s.MatchAny("y.both.example"); !r.Route || r.Rule != "route[ttl=-1]:**.both.example" {
+		t.Fatalf("match %+v", r)
+	}
+	if r := s.MatchAny("blocked.example"); !r.Drop || r.Route {
+		t.Fatalf("plain drop %+v", r)
 	}
 }

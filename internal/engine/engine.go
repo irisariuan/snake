@@ -47,8 +47,10 @@ type Paths struct {
 	IPSetSave string
 	ASNDir    string
 	Learnings string
-	Socket    string
-	PID       string
+	// Sessions holds the permanent (ttl=-1) device sessions.
+	Sessions string
+	Socket   string
+	PID      string
 	// Disabled is the emergency-disable flag file; present = disabled.
 	Disabled string
 }
@@ -62,6 +64,7 @@ func DefaultPaths(base string) Paths {
 		IPSetSave: filepath.Join(base, "ipsets.save"),
 		ASNDir:    filepath.Join(base, "asn"),
 		Learnings: filepath.Join(base, "learnings.json"),
+		Sessions:  filepath.Join(base, "sessions.json"),
 		Socket:    "/var/run/snake.sock",
 		PID:       "/var/run/snake.pid",
 		Disabled:  filepath.Join(base, "disabled"),
@@ -191,6 +194,7 @@ func (e *Engine) Load() error {
 	e.rtc.ConnMask = c.Settings.ConnMarkMask
 	e.asnCache = &asn.Cache{Dir: e.P.ASNDir, MaxAge: time.Duration(c.Settings.ASNRefresh) * time.Hour}
 	e.mu.Unlock()
+	e.loadPermanent()
 	return e.openLearnings()
 }
 
@@ -821,17 +825,14 @@ func (e *Engine) sniPolicies(cfg *config.Config, states []netfilter.PolicyState,
 			sp.Session = func(client, dst netip.Addr, rule, name string, opts match.Opts) error {
 				return e.AddSessions(id, client.Unmap().String(), []string{dst.Unmap().String()}, SessionRule, rule, name, opts)
 			}
-			sp.Route = func(client, dst netip.Addr, rule, name string) (string, error) {
-				return e.RouteAction(id, client.Unmap().String(), []string{dst.Unmap().String()}, rule, name, name)
-			}
 			sp.Cond = func(dst netip.Addr, hits []match.CondHit) {
 				e.recordCond(id, []string{dst.Unmap().String()}, hits)
 			}
 		}
-		if st.DropSessions {
+		if st.Sessions || st.DropSessions {
 			id := p.ID
-			sp.DropSession = func(client, dst netip.Addr, rule, name string, opts match.Opts) error {
-				return e.AddSessions(id, client.Unmap().String(), []string{dst.Unmap().String()}, SessionDrop, rule, name, opts)
+			sp.Route = func(client, dst netip.Addr, rule, name string) (string, error) {
+				return e.RouteAction(id, client.Unmap().String(), []string{dst.Unmap().String()}, rule, name, name)
 			}
 		}
 		sp.MACs, sp.Nets = splitClients(st.Clients)
@@ -940,15 +941,12 @@ func (e *Engine) dnsRules(states []netfilter.PolicyState, caps Caps) []dnsinspec
 			r.Session = func(client string, addrs []string, rule, name string, opts match.Opts) error {
 				return e.AddSessions(id, client, addrs, SessionRule, rule, name, opts)
 			}
-			r.Route = func(client string, addrs []string, rule, name, matched string) (string, error) {
-				return e.RouteAction(id, client, addrs, rule, name, matched)
-			}
 			r.Cond = func(addrs []string, hits []match.CondHit) { e.recordCond(id, addrs, hits) }
 		}
-		if st.DropSessions {
+		if st.Sessions || st.DropSessions {
 			id := p.ID
-			r.DropSession = func(client string, addrs []string, rule, name string, opts match.Opts) error {
-				return e.AddSessions(id, client, addrs, SessionDrop, rule, name, opts)
+			r.Route = func(client string, addrs []string, rule, name, matched string) (string, error) {
+				return e.RouteAction(id, client, addrs, rule, name, matched)
 			}
 		}
 		out = append(out, r)

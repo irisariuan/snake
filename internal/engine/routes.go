@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -119,12 +120,12 @@ func readLive(r io.Reader, client string, out map[string]bool) {
 	}
 }
 
-// condHolds evaluates a rule's if: part for a device.
-func (e *Engine) condHolds(policy int, rt *match.Route, client string) bool {
+// condHolds evaluates a rule's if: part for a device, from its live
+// destinations.
+func (e *Engine) condHolds(policy int, rt *match.Route, live map[string]bool) bool {
 	if rt.If == nil {
 		return true
 	}
-	live := e.liveDsts(client)
 	c := &e.cond
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -138,32 +139,54 @@ func (e *Engine) condHolds(policy int, rt *match.Route, client string) bool {
 	})
 }
 
-// RouteAction handles a lookup matching a branch of an if: (or route:)
-// rule: the device's condition picks the branch (then: or else:, then
-// finally:), whose action starts route or drop sessions for the device.
-// matched is the name the rule matched (name, or a CNAME of it). It
-// reports the action taken (match.ActRoute, match.ActDrop or "").
+// RouteAction handles a lookup matching route/drop session rules (if:,
+// route: and drop[...]: rules): every rule matching name or matched (the
+// name the rules matched: name or a CNAME of it) applies, top to bottom,
+// so for an address the last one wins. An if: rule's branch is picked by
+// the device's condition (then: or else:, then finally:). It reports what
+// the device's sessions do with the addresses afterwards (match.ActRoute,
+// match.ActDrop or "").
 func (e *Engine) RouteAction(policy int, client string, addrs []string, rule, name, matched string) (string, error) {
 	cfg := e.runtime()
 	if cfg == nil {
 		return "", nil
 	}
-	var rt *match.Route
+	var set *match.Set
 	for _, p := range cfg.Policies {
 		if p.ID == policy {
-			rt = e.domainSet(p).Route(rule)
+			set = e.domainSet(p)
 		}
 	}
-	if rt == nil {
+	if set == nil {
 		return "", nil
 	}
-	a := rt.Pick(e.condHolds(policy, rt, client), matched, name)
-	if a == nil {
-		return "", nil
+	var live map[string]bool
+	var errs []string
+	for _, st := range set.StepsFor(matched, name) {
+		kind, opts := match.ActDrop, match.Opts{}
+		if st.Route != nil {
+			if st.Route.If != nil && live == nil {
+				live = e.liveDsts(client)
+			}
+			a := st.Route.Pick(e.condHolds(policy, st.Route, live), matched, name)
+			if a == nil {
+				continue
+			}
+			kind, opts = a.Kind, a.Opts
+		} else {
+			opts = st.Drop.Opts
+		}
+		source := SessionRule
+		if kind == match.ActDrop {
+			source = SessionDrop
+		}
+		if err := e.AddSessions(policy, client, addrs, source, st.Raw(), name, opts); err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
-	source := SessionRule
-	if a.Kind == match.ActDrop {
-		source = SessionDrop
+	var err error
+	if len(errs) > 0 {
+		err = fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
-	return a.Kind, e.AddSessions(policy, client, addrs, source, rule, name, a.Opts)
+	return e.sessionState(policy, client, addrs), err
 }

@@ -21,28 +21,66 @@ import (
 // share=global|GROUP|DEVICE (repeatable: share=A,share=B) also routes the
 // session for other devices: every device of the policy (global), the
 // members of a device group, or a device (IP address, subnet or MAC).
+// A negative ttl (ttl=-1) never expires: such route/drop actions and
+// drop[...] rules switch a device + address on or off at each lookup, by
+// set=1 (on, the default), set=0 (off) or set=toggle (flip). When one
+// lookup matches several route/drop rules, they apply top to bottom.
+//
 // Options are separated by ";" or ",".
 
 // Opts are a session's options.
 type Opts struct {
-	TTL      time.Duration `json:"ttl,omitempty"` // 0: the global session TTL
+	TTL      time.Duration `json:"ttl,omitempty"` // 0: the global session TTL; <0: never expires (Forever)
 	OnLookup bool          `json:"onlookup,omitempty"`
 	// Share lists who else the session is routed for: "global", a group
 	// name, or a device (IP address, subnet, MAC), in the order written.
 	Share []string `json:"share,omitempty"`
+	// Set (with a negative TTL): SetOn (the default), SetOff or SetToggle.
+	Set string `json:"set,omitempty"`
+}
+
+// Forever is the TTL of sessions that never expire (ttl=-1).
+const Forever time.Duration = -1
+
+// set= values.
+const (
+	SetOn     = "1"
+	SetOff    = "0"
+	SetToggle = "toggle"
+)
+
+// Permanent reports whether the sessions never expire (ttl=-1).
+func (o Opts) Permanent() bool { return o.TTL < 0 }
+
+// SetMode is what a lookup does to a permanent session: SetOn, SetOff or
+// SetToggle ("" for timed sessions).
+func (o Opts) SetMode() string {
+	if !o.Permanent() {
+		return ""
+	}
+	if o.Set == "" {
+		return SetOn
+	}
+	return o.Set
 }
 
 // ShareGlobal shares a session with every device of the policy.
 const ShareGlobal = "global"
 
 // IsZero reports whether no option is set.
-func (o Opts) IsZero() bool { return o.TTL == 0 && !o.OnLookup && len(o.Share) == 0 }
+func (o Opts) IsZero() bool { return o.TTL == 0 && !o.OnLookup && len(o.Share) == 0 && o.Set == "" }
 
 // String is the canonical option list ("ttl=10m;onlookup=1").
 func (o Opts) String() string {
 	var parts []string
 	if o.TTL > 0 {
 		parts = append(parts, "ttl="+FormatTTL(o.TTL))
+	}
+	if o.TTL < 0 {
+		parts = append(parts, "ttl=-1")
+	}
+	if o.Set != "" && o.Set != SetOn {
+		parts = append(parts, "set="+o.Set)
 	}
 	if o.OnLookup {
 		parts = append(parts, "onlookup=1")
@@ -122,14 +160,39 @@ func parseOpts(text string) (Opts, error) {
 				seen[v] = true
 				o.Share = append(o.Share, v)
 			}
+		case "set":
+			switch strings.ToLower(v) {
+			case "1", "on", "true", "yes":
+				o.Set = SetOn
+			case "0", "off", "false", "no":
+				o.Set = SetOff
+			case "toggle":
+				o.Set = SetToggle
+			default:
+				return o, fmt.Errorf("set must be 1, 0 or toggle, not %q", v)
+			}
 		default:
-			return o, fmt.Errorf("unknown option %q (ttl, onlookup, share)", k)
+			return o, fmt.Errorf("unknown option %q (ttl, onlookup, share, set)", k)
 		}
+	}
+	if o.Set != "" && !o.Permanent() {
+		return o, fmt.Errorf("set= needs a negative ttl (ttl=-1): timed sessions end on their own")
+	}
+	if o.Permanent() && o.OnLookup {
+		return o, fmt.Errorf("onlookup has no effect with a negative ttl (it never expires)")
 	}
 	return o, nil
 }
 
 func parseTTL(v string) (time.Duration, error) {
+	if strings.HasPrefix(v, "-") {
+		if _, err := strconv.Atoi(v); err != nil {
+			if _, err := time.ParseDuration(v); err != nil {
+				return 0, fmt.Errorf("ttl %q: seconds or a duration such as 90s, 10m, 1h; negative: never expires", v)
+			}
+		}
+		return Forever, nil
+	}
 	var d time.Duration
 	if n, err := strconv.Atoi(v); err == nil {
 		d = time.Duration(n) * time.Second
@@ -137,7 +200,7 @@ func parseTTL(v string) (time.Duration, error) {
 		return 0, fmt.Errorf("ttl %q: seconds or a duration such as 90s, 10m, 1h", v)
 	}
 	if d < 10*time.Second || d > 7*24*time.Hour {
-		return 0, fmt.Errorf("ttl %q must be between 10s and 7 days", v)
+		return 0, fmt.Errorf("ttl %q must be between 10s and 7 days (or negative: never expires)", v)
 	}
 	return d, nil
 }

@@ -568,15 +568,31 @@ renews it. After it ends, the device's next lookup starts a new one.
 ### Session options
 
 `CMD[SETTING=VALUE;SETTING=VALUE;...]:` sets options on `session:`,
-`route:` and `drop:` rules:
+`route:` and `drop:` rules and actions:
 
 | Option | Meaning |
 |---|---|
-| `ttl=TIME` | this rule's session lifetime instead of `session_ttl`: seconds, or `90s`, `10m`, `1h` (10 s to 7 days) |
+| `ttl=TIME` | this rule's session lifetime instead of `session_ttl`: seconds, or `90s`, `10m`, `1h` (10 s to 7 days). **Negative** (`ttl=-1`, `route` and `drop` only): the session never expires, see `set` |
+| `set=1\|0\|toggle` | with a negative `ttl`, what a lookup does to the device's session for each answered address: `1` (default) turns it **on**, `0` turns it **off** (ends a route session for `route`, a drop session for `drop`), `toggle` flips it. Without a negative `ttl` it is rejected |
 | `onlookup=0\|1` | `0` (default): the TTL counts from the device's last connection to the address. `1`: it counts from the lookup that started the session; a new lookup renews it, open connections do not |
 | `share=VALUE` | also route the session for other devices; repeat it for a list (`share=A,share=B`). `global`: every device the policy covers; a **device group** name (`kids`, or `group:kids`); or a **device**: IP address, subnet or MAC. The shared copies start, renew and end with the session, and a live connection from a shared device (one given by address; `global` counts any device) keeps it alive |
 
 Options are separated by `;` or `,`.
+
+**Permanent sessions (`ttl=-1`).** They stay until a `set=0` or
+`set=toggle` lookup ends them (or *Flush learned*), whatever the
+connections do, and are saved in `sessions.json` so they survive restarts.
+`toggle` flips at **every** matching lookup, and devices look names up again
+on their own, so it suits names a device looks up on purpose (a "switch"
+name) rather than busy sites. A timed rule never shortens a permanent
+session.
+
+**Several rules, one address.** When one lookup matches several `route` /
+`drop` rules (`route:`, `if:` rules and `drop[...]:` rules), all of them
+apply **top to bottom**, so for an address the last one wins: a route
+replaces a drop session for the device and address and vice versa, and a
+`set=0` below a `set=1` turns it off again. Plain `drop:` (no options) still
+blocks before any of them.
 
 **Drop sessions.** A `drop:` rule with options (`drop[...]:`, domain rules
 only) blocks per device instead of for everyone: when a device looks up a
@@ -591,9 +607,15 @@ sessions.
 
 ```
 session[ttl=2m;onlookup=1]:**.example.org
-route[ttl=30m]:**.akamaized.net;if:netflix.com
+if:netflix.com;then:route[ttl=30m]:**.akamaized.net
 # the whole living room gets the CDN once one device starts Netflix
-route[share=living-room,share=10.6.0.2]:**.nflxvideo.net;if:netflix.com
+if:netflix.com;then:route[share=living-room,share=10.6.0.2]:**.nflxvideo.net
+# example.tv: a lookup while the device is on netflix.com routes it with no
+# expiry; a lookup while it is not ends that
+if:netflix.com;then:route[ttl=-1;set=1]:example.tv;else:route[ttl=-1;set=0]:example.tv
+# all of ads.example blocked for good, except one name (top to bottom)
+drop[ttl=-1]:ads.example
+drop[ttl=-1;set=0]:=ok.ads.example
 ```
 
 ### Conditional rules (`if:`, `then:`, `else:`, `finally:`)

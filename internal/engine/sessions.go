@@ -2,9 +2,11 @@ package engine
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -23,7 +25,8 @@ import (
 //   - WebRTC peers: the addresses a device's STUN revealed during its
 //     session window.
 //
-// They are not added to the policy's sets and not saved. A session lasts
+// They are not added to the policy's sets and not saved (except permanent
+// ones, ttl=-1, which end only by a set=0/toggle lookup). A session lasts
 // SessionTTL after the device's last connection to the address: the
 // daemon renews sessions with live connections (conntrack) on every scan,
 // so a new connection within the TTL renews it, and the countdown only
@@ -64,6 +67,9 @@ type Session struct {
 	// Share: other devices the session is routed for (share= option):
 	// "global", group names, devices.
 	Share []string `json:"share,omitempty"`
+	// Permanent sessions (ttl=-1) never expire: a set=0 or set=toggle
+	// lookup ends them. They are saved across restarts.
+	Permanent bool `json:"permanent,omitempty"`
 }
 
 func (se *Session) ttl(def time.Duration) time.Duration {
@@ -79,6 +85,8 @@ type sessionStore struct {
 	// active: policies whose session chains exist, per family (from the
 	// last apply). Chains of other policies are not written.
 	active map[int]sessionChains
+	// saved: the permanent sessions as last written to disk.
+	saved string
 	// dropHits: packet counts of drop session rules at the last scan
 	// (blocked attempts renew a drop session).
 	dropHits map[sessionKey]uint64
@@ -109,7 +117,9 @@ func (e *Engine) sessionTTL() time.Duration {
 
 // AddSessions starts (or renews) sessions of a policy for one device. New
 // pairs are installed before it returns, so the caller can release the
-// DNS answer or connection knowing the route is in place.
+// DNS answer or connection knowing the route is in place. With a negative
+// ttl (opts.Permanent), the sessions never expire and opts.SetMode says
+// whether the lookup turns them on, off or flips them.
 func (e *Engine) AddSessions(policy int, client string, addrs []string, source, rule, name string, opts match.Opts) error {
 	c := net.ParseIP(client)
 	if c == nil {
@@ -122,48 +132,105 @@ func (e *Engine) AddSessions(policy int, client string, addrs []string, source, 
 		ttl = opts.TTL
 	}
 	exp := now.Add(ttl)
+	drop := source == SessionDrop
 	s := &e.sess
 	s.mu.Lock()
 	s.init()
-	added := false
+	changed := false
 	for _, a := range addrs {
 		ip := net.ParseIP(a)
 		if ip == nil || (ip.To4() == nil) != (c.To4() == nil) {
 			continue // the families must match
 		}
 		k := sessionKey{policy, client, ip.String()}
-		if se, ok := s.m[k]; ok && (se.Source == SessionDrop) != (source == SessionDrop) {
+		se, ok := s.m[k]
+		same := ok && (se.Source == SessionDrop) == drop
+		if opts.Permanent() {
+			on := opts.SetMode() == match.SetOn || (opts.SetMode() == match.SetToggle && !same)
+			if !on {
+				// set=0, or toggling an existing session: ends it (a
+				// session of the other kind is left alone).
+				if same {
+					delete(s.m, k)
+					changed = true
+				}
+				continue
+			}
+		}
+		if ok && !same {
 			// Route after drop (or drop after route), e.g. the other
 			// branch of an if: rule: the latest decision replaces it.
 			delete(s.m, k)
+			ok = false
 		}
-		if se, ok := s.m[k]; ok {
-			// A lookup renews every session, onlookup or not.
+		if ok {
 			se.Seen = now
-			if exp.After(se.Expires) || se.OnLookup {
+			if opts.Permanent() {
+				if !se.Permanent {
+					se.Permanent, se.Expires, changed = true, time.Time{}, true
+				}
+				se.TTL, se.OnLookup = opts.TTL, false
+			} else if se.Permanent {
+				// A timed rule does not shorten a permanent session.
+				continue
+			} else if exp.After(se.Expires) || se.OnLookup {
+				// A lookup renews every session, onlookup or not.
 				se.Expires = exp
 			}
 			if rule != "" {
-				se.Rule, se.Name, se.TTL, se.OnLookup = rule, name, opts.TTL, opts.OnLookup
+				se.Rule, se.Name = rule, name
+				if !se.Permanent {
+					se.TTL, se.OnLookup = opts.TTL, opts.OnLookup
+				}
 				if !sameStrings(se.Share, opts.Share) {
 					se.Share = append([]string(nil), opts.Share...)
-					added = true // the chain changes
+					changed = true // the chain changes
 				}
 			}
 			continue
 		}
-		s.m[k] = &Session{Policy: policy, Client: client, Addr: k.Addr, Source: source, Rule: rule, Name: name, Created: now, Seen: now, Expires: exp,
+		ns := &Session{Policy: policy, Client: client, Addr: k.Addr, Source: source, Rule: rule, Name: name, Created: now, Seen: now, Expires: exp,
 			TTL: opts.TTL, OnLookup: opts.OnLookup, Share: append([]string(nil), opts.Share...)}
-		added = true
+		if opts.Permanent() {
+			ns.Permanent, ns.Expires = true, time.Time{}
+		}
+		s.m[k] = ns
+		changed = true
 	}
-	if added {
+	if changed {
 		s.trim(policy)
 	}
 	s.mu.Unlock()
-	if !added {
+	if !changed {
 		return nil
 	}
 	return e.writeSessionChains(policy)
+}
+
+// sessionState says what the device's sessions do with these addresses
+// now: match.ActDrop, match.ActRoute or "" (the first address with a
+// session decides).
+func (e *Engine) sessionState(policy int, client string, addrs []string) string {
+	c := net.ParseIP(client)
+	if c == nil {
+		return ""
+	}
+	s := &e.sess
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range addrs {
+		ip := net.ParseIP(a)
+		if ip == nil {
+			continue
+		}
+		if se, ok := s.m[sessionKey{policy, c.String(), ip.String()}]; ok {
+			if se.Source == SessionDrop {
+				return match.ActDrop
+			}
+			return match.ActRoute
+		}
+	}
+	return ""
 }
 
 // trim keeps at most maxSessions per policy, dropping the soonest to expire.
@@ -177,7 +244,12 @@ func (s *sessionStore) trim(policy int) {
 	if len(mine) <= maxSessions {
 		return
 	}
-	sort.Slice(mine, func(i, j int) bool { return mine[i].Expires.Before(mine[j].Expires) })
+	sort.Slice(mine, func(i, j int) bool {
+		if mine[i].Permanent != mine[j].Permanent {
+			return mine[j].Permanent // permanent sessions go last
+		}
+		return mine[i].Expires.Before(mine[j].Expires)
+	})
 	for _, se := range mine[:len(mine)-maxSessions] {
 		delete(s.m, sessionKey{se.Policy, se.Client, se.Addr})
 	}
@@ -342,6 +414,7 @@ func (e *Engine) setSessionChains(active map[int]sessionChains) {
 // writeSessionChains rewrites the session chains of the given policies
 // (iptables-restore --noflush: declaring the chain flushes only it).
 func (e *Engine) writeSessionChains(ids ...int) error {
+	e.savePermanent()
 	if e.DryRun || e.Disabled() {
 		return nil
 	}
@@ -441,6 +514,9 @@ func (e *Engine) refreshSessions(conntrack io.Reader, now time.Time) {
 		}
 	}
 	for k, se := range s.m {
+		if se.Permanent {
+			continue // ends only by set=0 / set=toggle
+		}
 		renew := !se.OnLookup && se.Source != SessionDrop &&
 			(live[[2]string{k.Client, k.Addr}] || (len(se.Share) > 0 && sharedLive(se, byDst[k.Addr], groups)))
 		if !se.OnLookup && se.Source == SessionDrop && hits[k] {
@@ -586,4 +662,78 @@ func (e *Engine) resetDropHits(id int, v6 bool) {
 			delete(s.dropHits, k)
 		}
 	}
+}
+
+// savePermanent writes the permanent sessions to disk when they changed.
+func (e *Engine) savePermanent() {
+	if e.P.Sessions == "" || e.DryRun {
+		return
+	}
+	s := &e.sess
+	s.mu.Lock()
+	var perm []Session
+	for _, se := range s.m {
+		if se.Permanent {
+			perm = append(perm, *se)
+		}
+	}
+	sort.Slice(perm, func(i, j int) bool {
+		a, b := perm[i], perm[j]
+		if a.Policy != b.Policy {
+			return a.Policy < b.Policy
+		}
+		if a.Client != b.Client {
+			return a.Client < b.Client
+		}
+		return a.Addr < b.Addr
+	})
+	if perm == nil {
+		perm = []Session{}
+	}
+	b, err := json.MarshalIndent(perm, "", "  ")
+	if err != nil || string(b) == s.saved {
+		s.mu.Unlock()
+		return
+	}
+	s.saved = string(b)
+	s.mu.Unlock()
+	tmp := e.P.Sessions + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err == nil {
+		err = os.Rename(tmp, e.P.Sessions)
+		if err != nil {
+			logx.Warnf("sessions: save: %v", err)
+		}
+	}
+}
+
+// loadPermanent restores the permanent sessions saved by savePermanent
+// (their chains are written by the next apply).
+func (e *Engine) loadPermanent() {
+	if e.P.Sessions == "" {
+		return
+	}
+	b, err := os.ReadFile(e.P.Sessions)
+	if err != nil {
+		return
+	}
+	var perm []Session
+	if err := json.Unmarshal(b, &perm); err != nil {
+		logx.Warnf("sessions: %s: %v", e.P.Sessions, err)
+		return
+	}
+	s := &e.sess
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.init()
+	for _, se := range perm {
+		if net.ParseIP(se.Client) == nil || net.ParseIP(se.Addr) == nil || !se.Permanent {
+			continue
+		}
+		se := se
+		k := sessionKey{se.Policy, se.Client, se.Addr}
+		if _, ok := s.m[k]; !ok {
+			s.m[k] = &se
+		}
+	}
+	s.saved = string(b)
 }

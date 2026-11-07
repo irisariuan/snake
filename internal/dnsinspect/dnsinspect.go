@@ -40,19 +40,16 @@ type Rules struct {
 	// addresses are routed for the device that asked only, not added to
 	// the sets. nil: session: rules are treated as plain rules.
 	Session func(client string, addrs []string, rule, name string, opts match.Opts) error
-	// Route handles answers matching a branch of an if: (or route:) rule:
-	// the device's condition picks the branch, whose action starts route
-	// or drop sessions for it. It reports the action taken (match.ActRoute,
-	// match.ActDrop or ""). matched is the name the rule matched (the
+	// Route handles answers matching route/drop session rules (if:,
+	// route: and drop[...]: rules, applied top to bottom; an if: rule's
+	// branch is picked by the device's condition). It reports what the
+	// device's sessions now do with the addresses (match.ActRoute,
+	// match.ActDrop or ""). matched is the name the rules matched (the
 	// question or a CNAME). nil: such rules are not routed.
 	Route func(client string, addrs []string, rule, name, matched string) (string, error)
 	// Cond receives the addresses of answers matching if: atoms (which are
 	// routed like plain rules too).
 	Cond func(addrs []string, hits []match.CondHit)
-	// DropSession blocks the addresses of answers matching drop[...]:
-	// rules for the asking device (and share= devices) only, instead of
-	// the drop sets. nil: such rules block like plain drop: rules.
-	DropSession func(client string, addrs []string, rule, name string, opts match.Opts) error
 }
 
 // Answer is the relevant content of a DNS response.
@@ -451,26 +448,6 @@ func (i *Inspector) handle(raw []byte) func() {
 			if err := r.Session(client, addrs, res.Rule, ans.Question, res.Opts); err != nil {
 				atomic.AddUint64(&i.stats.Errors, 1)
 				logx.Warnf("dns inspector: session: %v", err)
-			}
-		}
-	}
-	if res.Drop && !res.Opts.IsZero() && r.DropSession != nil {
-		// A drop session: blocked for the asking device only. The router's
-		// own lookups start none.
-		if pk.Dst.IsLoopback() {
-			return nil
-		}
-		atomic.AddUint64(&i.stats.Matched, 1)
-		atomic.AddUint64(&i.stats.Dropped, 1)
-		client := pk.Dst.String()
-		addrs := make([]string, 0, len(ans.IPs))
-		for _, ip := range ans.IPs {
-			addrs = append(addrs, ip.String())
-		}
-		return func() {
-			if err := r.DropSession(client, addrs, res.Rule, ans.Question, res.Opts); err != nil {
-				atomic.AddUint64(&i.stats.Errors, 1)
-				logx.Warnf("dns inspector: drop session: %v", err)
 			}
 		}
 	}

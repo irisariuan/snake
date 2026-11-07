@@ -86,8 +86,8 @@ func TestRouteCondition(t *testing.T) {
 	if a := try(conn("192.168.50.23", "198.51.100.10")+conn("192.168.50.23", "198.51.100.20"), cdn); a != "drop" {
 		t.Errorf("not:=help.netflix.com ignored: %q", a)
 	}
-	if a := try(conn("192.168.50.23", "198.51.100.10"), "x.nflxvideo.net"); a != "" {
-		t.Errorf("then: has no nflxvideo.net, finally: neither: %q", a)
+	if a := try(conn("192.168.50.23", "198.51.100.10"), "x.nflxvideo.net"); a != "drop" {
+		t.Errorf("then: has no nflxvideo.net, finally: neither: nothing applies, the earlier drop stays: %q", a)
 	}
 	if a := try("", "info.netflix.example"); a != "route" {
 		t.Errorf("finally: without the condition: %q", a)
