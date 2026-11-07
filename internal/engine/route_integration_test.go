@@ -76,6 +76,9 @@ while True:
 		t.Fatal(err)
 	}
 	e := New(DefaultPaths(dir), fakeMerlin{})
+	// Read the connection table with the conntrack tool, as on kernels
+	// without /proc/net/nf_conntrack (GitHub's runners).
+	e.conntrackPath = filepath.Join(dir, "no-procfs")
 	if err := e.Load(); err != nil {
 		t.Fatal(err)
 	}

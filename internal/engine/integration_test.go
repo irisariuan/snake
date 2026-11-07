@@ -47,7 +47,12 @@ func (f fakeMerlin) RunInput(in, name string, args ...string) (string, error) {
 			return "2", nil
 		}
 		return "", nil
-	case "service", "modprobe", "conntrack":
+	case "conntrack":
+		if len(args) > 0 && args[0] == "-L" {
+			break // listing the connection table: real
+		}
+		return "", nil
+	case "service", "modprobe":
 		return "", nil
 	case "wg":
 		return "peerkey\t" + strconv.FormatInt(time.Now().Unix(), 10), nil
@@ -141,8 +146,10 @@ func TestIntegrationApply(t *testing.T) {
 	if strings.Contains(sets, "SNK_1_r4") {
 		t.Error("former WebRTC peer set SNK_1_r4 still created")
 	}
-	if save := sh(t, "iptables-save -t mangle"); !strings.Contains(save, "-A SNAKE_P1 -j SNAKE_Q1") {
-		t.Error("WebRTC policy has no session chain")
+	// With NFQUEUE, WebRTC learns peers as sessions (session chain);
+	// without it, the port fallback learns none.
+	if save := sh(t, "iptables-save -t mangle"); e.Caps().NFQueue != strings.Contains(save, "-A SNAKE_P1 -j SNAKE_Q1") {
+		t.Errorf("session chain present = %v with NFQUEUE = %v", !e.Caps().NFQueue, e.Caps().NFQueue)
 	}
 	if !strings.Contains(sh(t, "ipset list SNK_1_n4"), "23.246.0.0/18") {
 		t.Error("CIDR not loaded")

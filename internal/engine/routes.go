@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -74,15 +75,33 @@ func (e *Engine) pruneCond(now time.Time) {
 	}
 }
 
-// liveDsts lists the destinations the device has live connections to.
-func (e *Engine) liveDsts(client string) map[string]bool {
-	out := map[string]bool{}
+// conntrackTable returns the kernel's connection table: the procfs file
+// when the kernel has it, otherwise the conntrack tool's extended listing
+// (same line format; some kernels, e.g. Ubuntu's, have no procfs file).
+func (e *Engine) conntrackTable() (io.ReadCloser, bool) {
 	path := e.conntrackPath
 	if path == "" {
 		path = "/proc/net/nf_conntrack"
 	}
-	f, err := os.Open(path)
-	if err != nil {
+	if f, err := os.Open(path); err == nil {
+		return f, true
+	}
+	var b strings.Builder
+	ok := false
+	for _, fam := range []string{"ipv4", "ipv6"} {
+		if out, err := e.R.Run("conntrack", "-L", "-o", "extended", "-f", fam); err == nil {
+			b.WriteString(out + "\n")
+			ok = true
+		}
+	}
+	return io.NopCloser(strings.NewReader(b.String())), ok
+}
+
+// liveDsts lists the destinations the device has live connections to.
+func (e *Engine) liveDsts(client string) map[string]bool {
+	out := map[string]bool{}
+	f, ok := e.conntrackTable()
+	if !ok {
 		return out
 	}
 	defer f.Close()

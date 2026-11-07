@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -427,8 +426,8 @@ func (e *Engine) refreshSessions(conntrack io.Reader, now time.Time) {
 // refreshSessionsNow reads the kernel's connection table.
 func (e *Engine) refreshSessionsNow() {
 	e.pruneCond(time.Now())
-	f, err := os.Open("/proc/net/nf_conntrack")
-	if err != nil {
+	f, ok := e.conntrackTable()
+	if !ok {
 		e.refreshSessions(nil, time.Now()) // still expire
 		return
 	}
