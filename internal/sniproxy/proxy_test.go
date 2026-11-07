@@ -431,7 +431,7 @@ func TestOriginalDstWithoutRedirect(t *testing.T) {
 
 func TestProxyRefuseECH(t *testing.T) {
 	strict := netflix()
-	strict.RefuseECH = true
+	strict.ECH = ECHDrop
 	strict.MACs = map[string]bool{"aa:bb:cc:dd:ee:ff": true}
 	open := Policy{ID: 2, Name: "ech", Set: match.MustCompile([]string{"cloudflare-ech.com"}), Mark: 0x20000}
 	var mac atomic.Value
@@ -475,5 +475,49 @@ func TestProxyRefuseECH(t *testing.T) {
 	}
 	if st := h.p.Stats(); st.ECH != 2 || st.ECHRefused != 1 {
 		t.Fatalf("stats %+v", st)
+	}
+}
+
+// ech: passthrough leaves ECH connections alone: the policy's rules,
+// drop: rules included, are not applied to them, while a later policy that
+// relays ECH can still route them by the public name.
+func TestProxyPassthroughECH(t *testing.T) {
+	pass := Policy{ID: 1, Name: "pass", ECH: ECHPassthrough, Mark: 0x10000,
+		Set: match.MustCompile([]string{"cloudflare-ech.com", "drop:ech.example.net", "netflix.com"})}
+	h := newHarness(t, []Policy{pass})
+	ext := []byte{0xfe, 0x0d, 0, 1, 0}
+	for _, outer := range []string{"cloudflare-ech.com", "ech.example.net"} {
+		hello := buildHello(sniExt(outer), ext)
+		if got, err := h.send(t, hello); err != nil || !bytes.Equal(got, hello) {
+			t.Fatalf("%s: not relayed: %v", outer, err)
+		}
+		if m := h.mark(t); m != 0 {
+			t.Fatalf("%s: routed by a passthrough policy (mark %#x)", outer, m)
+		}
+	}
+	// Plain TLS is still routed and blocked by the policy as usual.
+	if _, err := h.send(t, buildHello(sniExt("www.netflix.com"))); err != nil {
+		t.Fatal(err)
+	}
+	if m := h.mark(t); m != 0x10000 {
+		t.Fatalf("plain hello: mark %#x", m)
+	}
+	if st := h.p.Stats(); st.ECH != 2 || st.ECHPassed != 2 || st.Dropped != 0 || st.ECHRefused != 0 {
+		t.Fatalf("stats %+v", st)
+	}
+
+	// A later relay policy routes the public name; passthrough does not
+	// stop it.
+	relay := Policy{ID: 2, Name: "relay", ECH: ECHRelay, Mark: 0x20000, Set: match.MustCompile([]string{"cloudflare-ech.com"})}
+	h2 := newHarness(t, []Policy{pass, relay})
+	hello := buildHello(sniExt("cloudflare-ech.com"), ext)
+	if _, err := h2.send(t, hello); err != nil {
+		t.Fatal(err)
+	}
+	if m := h2.mark(t); m != 0x20000 {
+		t.Fatalf("relay policy after passthrough: mark %#x", m)
+	}
+	if st := h2.p.Stats(); st.ECHPassed != 0 {
+		t.Fatalf("counted as passed through although routed: %+v", st)
 	}
 }

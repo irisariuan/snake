@@ -291,7 +291,7 @@ function viewStatus(b) {
     el('span', { class: 'muted small' }, 'WAN ' + (s.wan_ip || '?') + ' · uptime ' + s.uptime + ' · applied ' + ago(s.last_apply) + ' · IPv6 ' + (s.caps.ipv6 ? 'yes' : 'no') + ' · NFQUEUE ' + (s.caps.nfqueue ? 'yes' : 'no') + ' · ipset netlink ' + (s.caps.ipset_netlink ? 'yes' : 'no') +
       (s.dns_inspector ? ' · DNS inspector: ' + s.dns_inspector.answers + ' answers, ' + s.dns_inspector.matched + ' matched' + (s.dns_inspector.dropped ? ' (' + s.dns_inspector.dropped + ' blocked)' : '') + ', ' + s.dns_inspector.added + ' IPs added' : '') +
       (s.sni_proxy ? ' · SNI proxy ' + (s.sni_proxy.listen ? s.sni_proxy.listen : 'not running') + ': ' + s.sni_proxy.conns + ' conns, ' + s.sni_proxy.matched + ' matched, ' + s.sni_proxy.active + ' open' +
-        (s.sni_proxy.ech ? ', ' + s.sni_proxy.ech + ' ECH' + (s.sni_proxy.ech_refused ? ' (' + s.sni_proxy.ech_refused + ' refused)' : '') : '') + (s.sni_proxy.dropped ? ', ' + s.sni_proxy.dropped + ' blocked' : '') + (s.sni_proxy.errors ? ', ' + s.sni_proxy.errors + ' failed' : '') : ''))));
+        (s.sni_proxy.ech ? ', ' + s.sni_proxy.ech + ' ECH' + ([s.sni_proxy.ech_refused ? s.sni_proxy.ech_refused + ' dropped' : '', s.sni_proxy.ech_passed ? s.sni_proxy.ech_passed + ' passed through' : ''].filter(Boolean).map(function (x) { return ' (' + x + ')'; }).join('')) : '') + (s.sni_proxy.dropped ? ', ' + s.sni_proxy.dropped + ' blocked' : '') + (s.sni_proxy.errors ? ', ' + s.sni_proxy.errors + ' failed' : '') : ''))));
   if (s.sni_proxy && s.sni_proxy.last_error && (!s.sni_proxy.listen || (Date.now() - new Date(s.sni_proxy.last_error_at).getTime()) < 600000))
     b.appendChild(el('div', { class: 'small tw:text-warn tw:mb-2' }, 'SNI proxy: ' + s.sni_proxy.last_error));
 
@@ -637,7 +637,7 @@ function stripMeta(text) { return text.split('\n').filter(function (l) { return 
 // ---------- policies ----------
 function defaultPolicy() {
   return { id: 0, name: '', enabled: true, tunnels: [], kill_switch: true, expected_country: '', domains: [], lists: [], ignore_cname: false, asns: [], cidrs: [], devices: [], exclude_devices: [],
-    leak: { dns_via_tunnel: true, dns_server: '9.9.9.9', dns_protocol: 'udp', hijack_dns: true, block_dot: true, block_doh: true, block_quic: false, sniff_sni: false, refuse_ech: false, ipv6: 'tunnel', webrtc: 'track' } };
+    leak: { dns_via_tunnel: true, dns_server: '9.9.9.9', dns_protocol: 'udp', hijack_dns: true, block_dot: true, block_doh: true, block_quic: false, sniff_sni: false, ech: 'relay', ipv6: 'tunnel', webrtc: 'track' } };
 }
 function viewPolicies(b) {
   if (state.edit) return viewEditor(b);
@@ -665,7 +665,7 @@ function viewPolicies(b) {
       if (gs.block_doh === 'always' || (gs.block_doh !== 'never' && p.leak.block_doh)) prot.push('doh');
       if (gs.block_dot === 'always' || (gs.block_dot !== 'never' && p.leak.block_dot)) prot.push('dot');
       if (p.leak.block_quic) prot.push('quic');
-      if (p.leak.sniff_sni) prot.push(p.leak.refuse_ech ? 'sni (no ech)' : 'sni');
+      if (p.leak.sniff_sni) prot.push({ drop: 'sni (ech: drop)', passthrough: 'sni (ech: pass)' }[p.leak.ech] || 'sni');
       prot.push('v6:' + p.leak.ipv6);
       prot.push('rtc:' + p.leak.webrtc);
       return el('tr', null,
@@ -715,7 +715,7 @@ function viewEditor(b) {
       items: state.cfg.rule_lists.map(function (l) { return { id: l.name, label: l.name, detail: ruleCount(l) + ' rules, ' + l.asns.length + ' ASNs, ' + l.cidrs.length + ' CIDRs' + (l.description ? ' · ' + l.description : '') }; }),
     },
   });
-  var rulesCard = el('div', { class: 'card tw:col-span-full' },
+  var rulesCard = el('div', { class: 'card' },
     el('div', { class: 'row tw:justify-between' }, el('b', null, 'Rules'),
       el('span', { class: 'row' },
         btn('Import file…', function () { pickFile(function (text) { importText(text).then(function (r) { rulesEd.set(stripMeta(r.text)); }); }); }),
@@ -747,19 +747,21 @@ function viewEditor(b) {
       overridden('block_dot', chk(L, 'block_dot', 'Block DNS-over-TLS / QUIC (port 853)', 'Android "Private DNS" falls back to normal DNS.')),
       chk(L, 'block_quic', 'Block QUIC (UDP 443)', 'Optional; forces HTTP/2 over TCP.'),
       chk(L, 'sniff_sni', 'Route HTTPS by TLS server name (SNI proxy)', 'For devices using DoH/DoT, whose lookups the router cannot see. HTTPS connections no set matched pass through a proxy on the router that reads the server name (nothing is decrypted) and sends matches through the tunnel. Costs router CPU. Unclaimed QUIC is rejected so browsers fall back to TCP. Encrypted Client Hello hides the real name: those connections are routed by their public name (add e.g. cloudflare-ech.com to route them).'),
-      chk(L, 'refuse_ech', 'Refuse Encrypted Client Hello', 'With the option above: reset ECH connections of this policy\'s devices instead of routing them by their public name, so a hidden name cannot get past drop: rules. Sites behind ECH-enabled CDNs (much of Cloudflare) then fail to load in browsers using DoH; browsers do not retry without ECH.'),
+      echMode(L),
       el('label', { class: 'f' }, 'IPv6'),
       el('select', { onchange: function (e) { L.ipv6 = e.target.value; } },
         [['tunnel', 'Route via tunnel if it has IPv6, otherwise block'], ['block', 'Always block IPv6 for policy traffic'], ['off', 'Off (IPv6 may leak)']].map(function (o) { return el('option', { value: o[0], selected: L.ipv6 === o[0] }, o[1]); })),
       el('label', { class: 'f' }, 'WebRTC'),
       el('select', { onchange: function (e) { L.webrtc = e.target.value; } },
         [['track', 'Track: route this service\'s WebRTC peers via the tunnel'], ['off', 'Off']].map(function (o) { return el('option', { value: o[0], selected: L.webrtc === o[0] }, o[1]); })),
-      el('div', { class: 'small muted' }, 'While a device talks to this policy\'s destinations, STUN it sends reveals the peers/relays of its calls; those are routed through the tunnel too. Other apps\' WebRTC stays on WAN.')),
-    el('div', { class: 'card tw:col-span-full' },
+      el('div', { class: 'small muted' }, 'While a device talks to this policy\'s destinations, STUN it sends reveals the peers/relays of its calls; those are routed through the tunnel too. Other apps\' WebRTC stays on WAN.'))));
+  // Full-width cards sit below the grid: inside it, a card spanning every
+  // column keeps all columns, and the row above showed an empty slot.
+  b.appendChild(el('div', { class: 'card tw:mt-3' },
       el('b', null, 'Devices'),
       el('div', { class: 'small muted tw:mb-1.5' }, 'Include nothing to cover every device. Included devices only (no rules) → those whole devices go through the tunnel; with rules → only the matching destinations, only for them. Excluded devices are never handled by this policy: not routed, not blocked by its drop: rules, not under its leak protection.'),
-      devBox),
-    rulesCard));
+      devBox));
+  b.appendChild(rulesCard);
 
   b.appendChild(el('div', { class: 'row tw:mt-2.5' },
     btn('Cancel', function () { state.edit = null; render(); }),
@@ -792,6 +794,23 @@ function tunnelOptions() {
     });
   });
   return opts;
+}
+// What the SNI proxy does with a policy's Encrypted Client Hello connections.
+var ECH_MODES = [
+  ['relay', 'Relay: route by the public name (default)', 'ECH hides the real server name behind a public one (e.g. cloudflare-ech.com). The connection is routed by that public name like any other: add it to this policy\'s rules to send ECH traffic through the tunnel, otherwise it goes via WAN. drop: rules for the public name apply.'],
+  ['drop', 'Drop: reset ECH connections', 'Resets them, so a hidden name cannot get past this policy\'s drop: rules. Sites behind ECH-enabled CDNs (much of Cloudflare) then fail to load in browsers using DoH; browsers do not retry without ECH.'],
+  ['passthrough', 'Passthrough: leave them alone', 'Relays them via WAN untouched: this policy does not route them and its drop: rules do not apply to them. A later policy set to Relay can still route them by the public name.'],
+];
+function echMode(L) {
+  if (!L.ech) L.ech = L.refuse_ech ? 'drop' : 'relay';
+  var help = el('div', { class: 'small muted' });
+  function describe() { help.textContent = (ECH_MODES.filter(function (m) { return m[0] === L.ech; })[0] || ECH_MODES[0])[2]; }
+  describe();
+  return el('div', null,
+    el('label', { class: 'f' }, 'Encrypted Client Hello (with the SNI proxy)'),
+    el('select', { 'aria-label': 'Encrypted Client Hello', onchange: function (e) { L.ech = e.target.value; L.refuse_ech = L.ech === 'drop'; describe(); } },
+      ECH_MODES.map(function (m) { return el('option', { value: m[0], selected: L.ech === m[0] }, m[1]); })),
+    help);
 }
 function knownDevices() {
   var map = {};

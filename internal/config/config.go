@@ -127,9 +127,12 @@ type Leak struct {
 	// matched by their TLS server name, through snake's transparent SNI
 	// proxy, so domain rules also work for devices using DoH/DoT.
 	SniffSNI bool `json:"sniff_sni"`
-	// RefuseECH (with SniffSNI) resets Encrypted Client Hello connections
-	// of the policy's devices instead of routing them by their public
-	// name, so the real name cannot slip past drop: rules.
+	// ECH (with SniffSNI) is what the SNI proxy does with Encrypted Client
+	// Hello connections of the policy's devices, whose real server name
+	// is hidden behind a public one: ECHDrop, ECHRelay or ECHPassthrough.
+	ECH string `json:"ech"`
+	// RefuseECH is the older form of ECH == ECHDrop. It is read when ECH
+	// is empty and kept in sync, so older versions keep the behaviour.
 	RefuseECH bool   `json:"refuse_ech"`
 	IPv6      string `json:"ipv6"`   // tunnel | block | off
 	WebRTC    string `json:"webrtc"` // track | off
@@ -323,6 +326,20 @@ const (
 	BlockPolicy = "policy"
 	BlockAlways = "always"
 	BlockNever  = "never"
+)
+
+// ECH modes: what the SNI proxy does with Encrypted Client Hello
+// connections, whose real server name is hidden behind a public one
+// (e.g. cloudflare-ech.com).
+const (
+	// ECHDrop resets them, so a hidden name cannot get past drop: rules.
+	ECHDrop = "drop"
+	// ECHRelay routes them by the public name, like any other connection:
+	// a rule for it sends them through the policy's tunnel (the default).
+	ECHRelay = "relay"
+	// ECHPassthrough relays them via WAN untouched: the policy's rules,
+	// drop: rules included, are not applied to them.
+	ECHPassthrough = "passthrough"
 )
 
 // Upstream DNS protocols for "resolve via tunnel".
@@ -755,6 +772,14 @@ func (c *Config) Normalize() {
 			p.Leak.DNSTLSName = KnownResolverNames[p.Leak.DNSServer]
 		}
 		p.Leak.DNSDoHPath = strings.TrimSpace(p.Leak.DNSDoHPath)
+		p.Leak.ECH = strings.ToLower(strings.TrimSpace(p.Leak.ECH))
+		if p.Leak.ECH == "" {
+			p.Leak.ECH = ECHRelay
+			if p.Leak.RefuseECH {
+				p.Leak.ECH = ECHDrop
+			}
+		}
+		p.Leak.RefuseECH = p.Leak.ECH == ECHDrop
 		if p.Leak.DNSProtocol == DNSDoH && p.Leak.DNSDoHPath == "" {
 			p.Leak.DNSDoHPath = "/dns-query"
 		}
@@ -1003,6 +1028,11 @@ func (c *Config) Validate() error {
 		case WebRTCTrack, WebRTCOff:
 		default:
 			add(pre+"webrtc mode %q invalid", p.Leak.WebRTC)
+		}
+		switch p.Leak.ECH {
+		case "", ECHDrop, ECHRelay, ECHPassthrough:
+		default:
+			add(pre+"ech mode %q invalid (drop, relay or passthrough)", p.Leak.ECH)
 		}
 		if p.Leak.DNSViaTunnel {
 			if ip := net.ParseIP(p.Leak.DNSServer); ip == nil || ip.To4() == nil {

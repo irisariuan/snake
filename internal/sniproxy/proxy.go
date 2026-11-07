@@ -16,11 +16,14 @@
 // still verifies the real server's certificate.
 //
 // With Encrypted Client Hello (ECH) the real server name is encrypted; only
-// the outer, public name (e.g. cloudflare-ech.com) is visible. Such
-// connections are routed by that public name like any other: a rule for it
-// sends them through the policy's tunnel, otherwise they go via WAN. A
-// policy can instead refuse them (RefuseECH), for clients it applies to, so
-// its drop: rules cannot be bypassed by hiding the name.
+// the outer, public name (e.g. cloudflare-ech.com) is visible. Each policy
+// chooses what happens to its clients' ECH connections (Policy.ECH):
+//   - drop: reset, so its drop: rules cannot be bypassed by hiding the name
+//     (one such policy for the client is enough);
+//   - relay: routed by the public name like any other connection: a rule
+//     for it sends them through the policy's tunnel;
+//   - passthrough: the policy ignores them; with no relay policy matching,
+//     they go via WAN untouched.
 package sniproxy
 
 import (
@@ -64,10 +67,17 @@ type Policy struct {
 	// connection opens the client's session window, like a connection to a
 	// learned destination does.
 	Session4, Session6 string
-	// RefuseECH resets Encrypted Client Hello connections of the policy's
-	// clients instead of routing them by their public name.
-	RefuseECH bool
+	// ECH is what happens to the policy's clients' Encrypted Client Hello
+	// connections: ECHDrop, ECHRelay ("" = relay) or ECHPassthrough.
+	ECH string
 }
+
+// ECH modes (config.ECHDrop, ... ; repeated to keep the package standalone).
+const (
+	ECHDrop        = "drop"
+	ECHRelay       = "relay"
+	ECHPassthrough = "passthrough"
+)
 
 // Config is the proxy's desired state.
 type Config struct {
@@ -89,8 +99,9 @@ type Stats struct {
 	Matched    uint64         `json:"matched"`
 	Dropped    uint64         `json:"dropped"`     // matched a drop: rule
 	NoSNI      uint64         `json:"no_sni"`      // not TLS or no server name: sent via WAN
-	ECH        uint64         `json:"ech"`         // Encrypted Client Hello: routed by the outer (public) name
-	ECHRefused uint64         `json:"ech_refused"` // ECH connections reset (a policy has refuse_ech)
+	ECH        uint64         `json:"ech"`         // Encrypted Client Hello connections seen
+	ECHRefused uint64         `json:"ech_refused"` // ECH connections reset (a policy has ech: drop)
+	ECHPassed  uint64         `json:"ech_passed"`  // ECH connections relayed untouched (ech: passthrough)
 	Errors     uint64         `json:"errors"`      // upstream dial failures
 	Refused    uint64         `json:"refused"`     // over the connection limit, or not redirected
 	ByPolicy   map[int]uint64 `json:"by_policy,omitempty"`
@@ -135,6 +146,7 @@ type Proxy struct {
 	noSNI   atomic.Uint64
 	ech     atomic.Uint64
 	echRef  atomic.Uint64
+	echPass atomic.Uint64
 	errs    atomic.Uint64
 	refused atomic.Uint64
 	statMu  sync.Mutex
@@ -222,7 +234,7 @@ func (p *Proxy) Stats() Stats {
 	p.mu.Unlock()
 	s := Stats{
 		Listen: listen, Active: p.active.Load(), Conns: p.conns.Load(), Matched: p.matched.Load(),
-		Dropped: p.dropped.Load(), NoSNI: p.noSNI.Load(), ECH: p.ech.Load(), ECHRefused: p.echRef.Load(), Errors: p.errs.Load(), Refused: p.refused.Load(),
+		Dropped: p.dropped.Load(), NoSNI: p.noSNI.Load(), ECH: p.ech.Load(), ECHRefused: p.echRef.Load(), ECHPassed: p.echPass.Load(), Errors: p.errs.Load(), Refused: p.refused.Load(),
 	}
 	p.statMu.Lock()
 	if len(p.byPol) > 0 {
@@ -297,10 +309,15 @@ func reset(c *net.TCPConn) {
 // match finds the first policy whose rules match name and that applies to
 // the client.
 func (p *Proxy) match(name string, client netip.Addr) (Policy, match.Result, bool) {
+	return matchIn(name, p.applicable(client))
+}
+
+// matchIn finds the first of pols whose rules match name.
+func matchIn(name string, pols []Policy) (Policy, match.Result, bool) {
 	if name == "" {
 		return Policy{}, match.Result{}, false
 	}
-	for _, pol := range p.applicable(client) {
+	for _, pol := range pols {
 		if res := pol.Set.MatchAny(name); res.Matched {
 			return pol, res, true
 		}
@@ -350,14 +367,24 @@ func inNets(nets []netip.Prefix, a netip.Addr) bool {
 	return false
 }
 
-// refusesECH returns a policy applying to the client that refuses ECH.
-func (p *Proxy) refusesECH(client netip.Addr) (Policy, bool) {
+// echPolicies splits the policies applying to the client by ECH mode: a
+// policy that drops ECH (first one), the policies that route ECH by the
+// public name, and whether any passes it through.
+func (p *Proxy) echPolicies(client netip.Addr) (drop *Policy, relay []Policy, passthrough bool) {
 	for _, pol := range p.applicable(client) {
-		if pol.RefuseECH {
-			return pol, true
+		switch pol.ECH {
+		case ECHDrop:
+			if drop == nil {
+				pol := pol
+				drop = &pol
+			}
+		case ECHPassthrough:
+			passthrough = true
+		default:
+			relay = append(relay, pol)
 		}
 	}
-	return Policy{}, false
+	return drop, relay, passthrough
 }
 
 func (p *Proxy) handle(c *net.TCPConn) {
@@ -409,18 +436,29 @@ func (p *Proxy) handle(c *net.TCPConn) {
 	}
 	_ = c.SetReadDeadline(time.Time{})
 
+	var mark uint32
+	var pol Policy
+	var res match.Result
+	var ok bool
 	if hello.ECH {
 		p.ech.Add(1)
-		if pol, ok := p.refusesECH(client); ok {
+		drop, relay, passthrough := p.echPolicies(client)
+		if drop != nil {
 			p.echRef.Add(1)
-			logx.Debugf("sni proxy: %s -> %s (%s) refused: Encrypted Client Hello (policy %s)", client, dst, hello.ServerName, pol.Name)
+			logx.Debugf("sni proxy: %s -> %s (%s) refused: Encrypted Client Hello (policy %s)", client, dst, hello.ServerName, drop.Name)
 			reset(c)
 			return
 		}
-		// Otherwise routed by the outer (public) name below.
+		// Routed by the outer (public) name, by the policies that relay
+		// ECH; passthrough policies leave it alone.
+		pol, res, ok = matchIn(hello.ServerName, relay)
+		if !ok && passthrough {
+			p.echPass.Add(1)
+			logx.Debugf("sni proxy: %s -> %s (%s) passed through: Encrypted Client Hello", client, dst, hello.ServerName)
+		}
+	} else {
+		pol, res, ok = p.match(hello.ServerName, client)
 	}
-	var mark uint32
-	pol, res, ok := p.match(hello.ServerName, client)
 	switch {
 	case hello.ServerName == "":
 		p.noSNI.Add(1)

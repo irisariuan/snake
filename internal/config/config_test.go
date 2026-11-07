@@ -394,3 +394,28 @@ func TestExcludeDevices(t *testing.T) {
 		}
 	}
 }
+
+func TestECHModes(t *testing.T) {
+	c := load(t)
+	// Old configs: refuse_ech true becomes drop, false becomes relay.
+	c.Policies[0].Leak.ECH, c.Policies[0].Leak.RefuseECH = "", true
+	c.Policies[1].Leak.ECH, c.Policies[1].Leak.RefuseECH = "", false
+	// Set: ech wins and refuse_ech follows it (older versions read it).
+	c.Policies[2].Leak.ECH, c.Policies[2].Leak.RefuseECH = " Passthrough ", true
+	c.Normalize()
+	for i, want := range []struct {
+		mode   string
+		refuse bool
+	}{{ECHDrop, true}, {ECHRelay, false}, {ECHPassthrough, false}} {
+		if l := c.Policies[i].Leak; l.ECH != want.mode || l.RefuseECH != want.refuse {
+			t.Errorf("policy %d: ech %q refuse_ech %v, want %q %v", i, l.ECH, l.RefuseECH, want.mode, want.refuse)
+		}
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c.Policies[0].Leak.ECH = "block"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), `ech mode "block" invalid`) {
+		t.Fatalf("err = %v", err)
+	}
+}

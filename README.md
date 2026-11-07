@@ -500,17 +500,21 @@ What it costs and where it stops:
   destinations still goes through the tunnel.
 * **Encrypted Client Hello (ECH)** encrypts the real server name behind a
   public one (e.g. `cloudflare-ech.com` for every ECH site on Cloudflare).
-  Such connections are routed by that **public name**: add it to a policy
-  (`cloudflare-ech.com`) to send them through its tunnel, which then carries
-  all ECH traffic to that CDN, or leave it out and they go via WAN. Once the
-  destination is learned, other connections to that CDN address follow it
-  too. The Status tab counts ECH connections.
-  *Refuse Encrypted Client Hello* (`refuse_ech`, off by default) resets
-  them instead, for the policy's devices, so a hidden name cannot get past
-  `drop:` rules. ECH adds no risk to the router or the network, so only turn
-  this on if you rely on `drop:` rules for blocking: browsers using DoH do
-  not retry without ECH, so sites behind ECH-enabled CDNs (much of
-  Cloudflare) stop loading on those devices.
+  Each policy chooses what happens to its devices' ECH connections
+  (*Encrypted Client Hello* in the policy editor, `ech` in the config):
+
+  | Mode | What happens |
+  |---|---|
+  | **Relay** (`relay`, default) | Routed by the **public name** like any other connection: add it to the policy (`cloudflare-ech.com`) to send them through its tunnel, which then carries all ECH traffic to that CDN, or leave it out and they go via WAN. `drop:` rules for the public name apply. Once the destination is learned, other connections to that CDN address follow it too. |
+  | **Drop** (`drop`) | **Reset**, so a hidden name cannot get past the policy's `drop:` rules. Browsers using DoH do not retry without ECH, so sites behind ECH-enabled CDNs (much of Cloudflare) stop loading on those devices. ECH adds no risk to the router or the network: only choose this if you rely on `drop:` rules for blocking. |
+  | **Passthrough** (`passthrough`) | **Left alone**: relayed via WAN untouched. The policy does not route them by the public name and its `drop:` rules do not apply to them. |
+
+  When several policies cover a device, one set to Drop is enough to reset
+  its ECH connections. Otherwise only its Relay policies route them by the
+  public name, in policy order; Passthrough policies are skipped. The Status
+  tab counts ECH connections, and how many were dropped or passed through.
+  Older configs convert by themselves: `refuse_ech: true` becomes Drop,
+  anything else Relay (`refuse_ech` is kept in step for older versions).
 * **Only TLS on port 443.** Other ports, plain HTTP, and non-TLS protocols
   on 443 (sent via WAN after 5 seconds of silence) are not routed by name.
 * **IPv6** is sniffed only when `ip6tables` has NAT. Without it, IPv6 HTTPS

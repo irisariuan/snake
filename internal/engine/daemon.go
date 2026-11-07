@@ -622,8 +622,11 @@ func (e *Engine) LeakChecks() []LeakCheck {
 				switch {
 				case sniffing:
 					ech := "Encrypted Client Hello connections are routed by their public name"
-					if p.Leak.RefuseECH {
+					switch p.Leak.ECH {
+					case config.ECHDrop:
 						ech = "Encrypted Client Hello connections are refused"
+					case config.ECHPassthrough:
+						ech = "Encrypted Client Hello connections are passed through via WAN, untouched by this policy (its drop: rules do not apply to them)"
 					}
 					ok("HTTPS the domain sets miss is routed by TLS server name (SNI proxy %s); unclaimed QUIC is rejected so it falls back to TCP; %s", st.SNI.Listen, ech)
 					if st.Caps.IPv6 && !st.Caps.IPv6NAT {

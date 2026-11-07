@@ -48,6 +48,11 @@ func TestBuiltSite(t *testing.T) {
 			t.Errorf("%s page references an external asset", c.name)
 		}
 	}
+	// The firmware's state.js and general.js use jQuery's $; without it
+	// the menu fails ("$ is not defined", then "bandName" errors).
+	if j, st := strings.Index(asp, `src="/js/jquery.js"`), strings.Index(asp, `src="/state.js"`); j < 0 || j > st {
+		t.Error("asp page must load /js/jquery.js before /state.js")
+	}
 	// Merlin's web server runs <% ... %> in .asp pages as server code.
 	if strings.Contains(s.JS+s.CSS, "<%") || strings.Contains(s.JS+s.CSS, "%>") {
 		t.Error("inlined UI contains <% or %>, which the router's web server would execute")

@@ -91,6 +91,7 @@ func hookRestartVerify() error {
 	if err := start(); err == nil && daemonHealthy(60*time.Second) {
 		v, _ := update.BinaryVersion(binPath)
 		logx.Infof("update: daemon %s is running", v)
+		remountWebUI()
 		return nil
 	}
 	u := newUpdater(repoFromConfig)
@@ -107,7 +108,19 @@ func hookRestartVerify() error {
 	logx.Errorf("update: daemon %s did not start, rolled back to %s", bad, v)
 	_ = stop(false)
 	time.Sleep(time.Second)
-	return start()
+	err = start()
+	remountWebUI()
+	return err
+}
+
+// remountWebUI rewrites the router's Addons page with the installed
+// binary's web UI. The page holds the UI inline, so without this it kept
+// the previous version's UI until the next reboot. This helper may be the
+// previous binary, so it runs the installed one.
+func remountWebUI() {
+	if out, err := exec.Command(binPath, "webui-mount").CombinedOutput(); err != nil {
+		logx.Warnf("update: re-mount web UI page: %v: %s", err, strings.TrimSpace(string(out)))
+	}
 }
 
 // autoUpdate checks for releases a few minutes after start and then twice
