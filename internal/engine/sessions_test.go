@@ -148,3 +148,46 @@ func containsPair(ps [][2]string, p [2]string) bool {
 	}
 	return false
 }
+
+// drop[...]: blocks for the asking device (and share= devices); blocked
+// attempts (rule counters) renew it; it ends a TTL after the last one.
+func TestDropSessions(t *testing.T) {
+	e, rec := sessionEngine(t)
+	if _, err := e.UpdateConfig(func(c *config.Config) error {
+		c.Policies[0].Domains = []string{"example.com", "drop[ttl=60;share=192.168.50.40]:ads.example.net"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rec.Joined(), "-A SNAKE_FWD -i br+ -j SNAKE_D1") {
+		t.Fatalf("no drop session chain jump:\n%s", rec.Joined())
+	}
+	r := e.domainSet(e.runtime().Policies[0]).MatchAny("x.ads.example.net")
+	rec.Commands = nil
+	if err := e.AddSessions(1, "192.168.50.23", []string{"203.0.113.9"}, SessionDrop, r.Rule, "x.ads.example.net", r.Opts); err != nil {
+		t.Fatal(err)
+	}
+	w := rec.Joined()
+	for _, want := range []string{"*filter\n:SNAKE_D1 - [0:0]",
+		"-A SNAKE_D1 -s 192.168.50.23 -d 203.0.113.9 -p tcp -j REJECT --reject-with tcp-reset",
+		"-A SNAKE_D1 -s 192.168.50.40 -d 203.0.113.9 -j REJECT --reject-with icmp-port-unreachable"} {
+		if !strings.Contains(w, want) {
+			t.Errorf("missing %q in\n%s", want, w)
+		}
+	}
+	if strings.Contains(w, "-g SNAKE_M1") {
+		t.Error("drop session written as a route")
+	}
+	// Blocked attempts renew it.
+	start := time.Now()
+	rec.Responses = map[string]string{"iptables-save -c -t filter": "[3:180] -A SNAKE_D1 -s 192.168.50.40/32 -d 203.0.113.9/32 -p tcp -j REJECT --reject-with tcp-reset\n"}
+	e.refreshSessions(strings.NewReader(""), start.Add(50*time.Second))
+	e.refreshSessions(strings.NewReader(""), start.Add(100*time.Second)) // counter unchanged since
+	if len(e.Sessions(1)) != 1 {
+		t.Fatal("blocked attempt did not renew the drop session")
+	}
+	e.refreshSessions(strings.NewReader(""), start.Add(115*time.Second))
+	if len(e.Sessions(1)) != 0 {
+		t.Fatal("drop session kept after its TTL")
+	}
+}

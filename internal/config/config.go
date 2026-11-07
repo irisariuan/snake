@@ -1004,6 +1004,9 @@ func (c *Config) Validate() error {
 		for _, r := range set.Routes {
 			opts = append(opts, r.Opts)
 		}
+		for _, dp := range set.Drop {
+			opts = append(opts, dp.Opts)
+		}
 		for _, o := range opts {
 			for _, sh := range o.Share {
 				if sh != match.ShareGlobal && !match.ShareDevice(sh) && !groups[sh] {
@@ -1155,7 +1158,7 @@ func (p Policy) HasDrops() bool {
 }
 
 func isDrop(rule string) bool {
-	return len(rule) >= len(match.DropPrefix) && strings.EqualFold(rule[:len(match.DropPrefix)], match.DropPrefix)
+	return len(rule) >= len("drop") && strings.EqualFold(rule[:4], "drop") && len(rule) > 4 && (rule[4] == ':' || rule[4] == '[')
 }
 
 // DomainRules compiles the policy's domain rules.

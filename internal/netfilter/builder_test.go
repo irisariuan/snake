@@ -495,3 +495,26 @@ func TestSessionChain(t *testing.T) {
 		t.Errorf("session chain left behind:\n%s", m)
 	}
 }
+
+// Drop sessions: a filter chain per policy, reached for its devices after
+// excluded ones, rejecting each device + address pair.
+func TestDropSessionChain(t *testing.T) {
+	c, st := states(t)
+	st[0].DropSessions = true
+	st[0].Excluded = []string{"192.168.50.77"}
+	pairs := func(id int, v6 bool) [][2]string {
+		if v6 {
+			return nil
+		}
+		return [][2]string{{"-s 192.168.50.23", "203.0.113.9"}, {"", "203.0.113.10"}}
+	}
+	f4 := Build(c.Settings, st, Options{IPv6: true, IPv6NAT: true, DropPairs: pairs}).Restore["4/filter"]
+	mustContain(t, f4,
+		":SNAKE_D1 - [0:0]",
+		"-A SNAKE_FWD -i br+ -j SNAKE_D1",
+		"-A SNAKE_D1 -s 192.168.50.77 -j RETURN",
+		"-A SNAKE_D1 -s 192.168.50.23 -d 203.0.113.9 -p tcp -j REJECT --reject-with tcp-reset",
+		"-A SNAKE_D1 -s 192.168.50.23 -d 203.0.113.9 -j REJECT --reject-with icmp-port-unreachable",
+		"-A SNAKE_D1 -d 203.0.113.10 -p tcp -j REJECT --reject-with tcp-reset",
+	)
+}

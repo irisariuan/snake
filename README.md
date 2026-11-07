@@ -228,6 +228,7 @@ One rule per line:
 | `drop:asn:1234`, `drop:cidr:198.51.100.0/24` | **block** an autonomous system or an address range / single IP (`drop:ip:` also works) |
 | `session:**.akamaized.net` | **device session**: any domain rule after `session:`; its answers are routed only for the device that looked the name up ([below](#device-sessions)) |
 | `session[ttl=10m;onlookup=1]:x.example` | session with [options](#session-options) |
+| `drop[share=kids]:ads.example.com` | **drop session**: blocked only for the device that looked the name up, plus the `share=` devices ([options](#session-options)) |
 | `route:**.akamaized.net;if:netflix.com` | **conditional sessions** ([below](#conditional-rules-route-if)) |
 | `com` | rejected: a bare top-level domain would route everything (`**.com` if you really mean it) |
 | `# comment` | ignored; a trailing ` # comment` is allowed too (except in regexes) |
@@ -566,8 +567,8 @@ renews it. After it ends, the device's next lookup starts a new one.
 
 ### Session options
 
-`CMD[SETTING=VALUE;SETTING=VALUE;...]:` sets options on `session:` and
-`route:` rules:
+`CMD[SETTING=VALUE;SETTING=VALUE;...]:` sets options on `session:`,
+`route:` and `drop:` rules:
 
 | Option | Meaning |
 |---|---|
@@ -576,6 +577,17 @@ renews it. After it ends, the device's next lookup starts a new one.
 | `share=VALUE` | also route the session for other devices; repeat it for a list (`share=A,share=B`). `global`: every device the policy covers; a **device group** name (`kids`, or `group:kids`); or a **device**: IP address, subnet or MAC. The shared copies start, renew and end with the session, and a live connection from a shared device (one given by address; `global` counts any device) keeps it alive |
 
 Options are separated by `;` or `,`.
+
+**Drop sessions.** A `drop:` rule with options (`drop[...]:`, domain rules
+only) blocks per device instead of for everyone: when a device looks up a
+matching name, the answered addresses are rejected for **that device** (and
+the `share=` devices), and other devices still reach them, e.g. another site
+on the same CDN address. A blocked device cannot keep a connection open, so
+its TTL counts from its **last blocked attempt** (read from the rule's
+packet counters) or, with `onlookup=1`, from the lookup. Plain `drop:`
+without options keeps blocking for all the policy's devices. Drop sessions
+use a filter chain per policy (`SNAKE_D<id>`) and are listed with the
+sessions.
 
 ```
 session[ttl=2m;onlookup=1]:**.example.org

@@ -35,6 +35,7 @@ import (
 const (
 	SessionRule   = "rule"   // session: domain rule
 	SessionWebRTC = "webrtc" // WebRTC peer learned from STUN
+	SessionDrop   = "drop"   // drop[...]: rule: blocked for the device, not routed
 )
 
 // maxSessions bounds the sessions per policy (the oldest give way).
@@ -75,9 +76,20 @@ func (se *Session) ttl(def time.Duration) time.Duration {
 type sessionStore struct {
 	mu sync.Mutex
 	m  map[sessionKey]*Session
-	// active: policies whose session chain exists, per family (from the
+	// active: policies whose session chains exist, per family (from the
 	// last apply). Chains of other policies are not written.
-	active map[int][2]bool
+	active map[int]sessionChains
+	// dropHits: packet counts of drop session rules at the last scan
+	// (blocked attempts renew a drop session).
+	dropHits map[sessionKey]uint64
+}
+
+// sessionChains says which session chains a policy has, per family
+// (index 0 IPv4, 1 IPv6), and the excluded devices its drop chain starts
+// with.
+type sessionChains struct {
+	Route, Drop [2]bool
+	Excluded    []string
 }
 
 func (s *sessionStore) init() {
@@ -171,7 +183,12 @@ func (s *sessionStore) trim(policy int) {
 // device that started the session ("-s IP"), and the devices it is shared
 // with ("-s IP/subnet", "-m mac --mac-source MAC", or "" for every device
 // of the policy).
-func (e *Engine) sessionPairs(id int, v6 bool) [][2]string {
+func (e *Engine) sessionPairs(id int, v6 bool) [][2]string { return e.pairsOf(id, v6, false) }
+
+// dropPairs lists the rules of a policy's drop session chain, like sessionPairs.
+func (e *Engine) dropPairs(id int, v6 bool) [][2]string { return e.pairsOf(id, v6, true) }
+
+func (e *Engine) pairsOf(id int, v6, drop bool) [][2]string {
 	groups := e.groupMembers()
 	s := &e.sess
 	s.mu.Lock()
@@ -179,7 +196,7 @@ func (e *Engine) sessionPairs(id int, v6 bool) [][2]string {
 	seen := map[[2]string]bool{}
 	var out [][2]string
 	for k, se := range s.m {
-		if k.Policy != id || isV6(k.Addr) != v6 {
+		if k.Policy != id || isV6(k.Addr) != v6 || (se.Source == SessionDrop) != drop {
 			continue
 		}
 		for _, spec := range shareSpecs(se, v6, groups) {
@@ -304,7 +321,7 @@ func (e *Engine) Sessions(policy int) []Session {
 
 // setSessionChains records which policies have a session chain (per
 // family) after an apply, and forgets sessions of the others.
-func (e *Engine) setSessionChains(active map[int][2]bool) {
+func (e *Engine) setSessionChains(active map[int]sessionChains) {
 	s := &e.sess
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -329,31 +346,44 @@ func (e *Engine) writeSessionChains(ids ...int) error {
 	s.mu.Unlock()
 	var errs []string
 	for _, v6 := range []bool{false, true} {
-		var b strings.Builder
-		n := 0
+		var mg, fl strings.Builder
 		for _, id := range ids {
-			if !active[id][b2i(v6)] {
-				continue
-			}
-			qc := netfilter.SessionChain(id)
-			b.WriteString(":" + qc + " - [0:0]\n")
-			for _, pr := range e.sessionPairs(id, v6) {
-				src := ""
-				if pr[0] != "" {
-					src = pr[0] + " "
+			ch := active[id]
+			if ch.Route[b2i(v6)] {
+				qc := netfilter.SessionChain(id)
+				mg.WriteString(":" + qc + " - [0:0]\n")
+				for _, pr := range e.sessionPairs(id, v6) {
+					src := ""
+					if pr[0] != "" {
+						src = pr[0] + " "
+					}
+					fmt.Fprintf(&mg, "-A %s %s-d %s -g %s\n", qc, src, pr[1], netfilter.MarkChain(id))
 				}
-				fmt.Fprintf(&b, "-A %s %s-d %s -g %s\n", qc, src, pr[1], netfilter.MarkChain(id))
 			}
-			n++
+			if ch.Drop[b2i(v6)] {
+				dc := netfilter.DropSessionChain(id)
+				fl.WriteString(":" + dc + " - [0:0]\n")
+				for _, r := range netfilter.DropSessionRules(ch.Excluded, e.dropPairs(id, v6), v6) {
+					fl.WriteString("-A " + dc + " " + r + "\n")
+				}
+				e.resetDropHits(id, v6) // counters restart with the chain
+			}
 		}
-		if n == 0 {
+		var in string
+		if mg.Len() > 0 {
+			in += "*mangle\n" + mg.String() + "COMMIT\n"
+		}
+		if fl.Len() > 0 {
+			in += "*filter\n" + fl.String() + "COMMIT\n"
+		}
+		if in == "" {
 			continue
 		}
 		bin := "iptables-restore"
 		if v6 {
 			bin = "ip6tables-restore"
 		}
-		if _, err := e.R.RunInput("*mangle\n"+b.String()+"COMMIT\n", bin, "--noflush"); err != nil {
+		if _, err := e.R.RunInput(in, bin, "--noflush"); err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
@@ -395,11 +425,23 @@ func (e *Engine) refreshSessions(conntrack io.Reader, now time.Time) {
 		}
 	}
 	groups := e.groupMembers()
+	attempts := e.dropAttempts()
 	def := e.sessionTTL()
 	changed := map[int]bool{}
 	s.mu.Lock()
+	hits := map[sessionKey]bool{}
 	for k, se := range s.m {
-		if (live[[2]string{k.Client, k.Addr}] || (len(se.Share) > 0 && sharedLive(se, byDst[k.Addr], groups))) && !se.OnLookup {
+		if se.Source == SessionDrop && attempts[sessionKey{Policy: k.Policy, Addr: k.Addr}] {
+			hits[k] = true
+		}
+	}
+	for k, se := range s.m {
+		renew := !se.OnLookup && se.Source != SessionDrop &&
+			(live[[2]string{k.Client, k.Addr}] || (len(se.Share) > 0 && sharedLive(se, byDst[k.Addr], groups)))
+		if !se.OnLookup && se.Source == SessionDrop && hits[k] {
+			renew = true // a blocked attempt
+		}
+		if renew {
 			se.Seen = now
 			if exp := now.Add(se.ttl(def)); exp.After(se.Expires) {
 				se.Expires = exp
@@ -446,4 +488,97 @@ func (e *Engine) clearSessions(policy int) {
 	}
 	s.mu.Unlock()
 	_ = e.writeSessionChains(policy)
+}
+
+// dropAttempts reads the drop session chains' packet counters and returns
+// the (policy, address) pairs with blocked attempts since the last scan.
+func (e *Engine) dropAttempts() map[sessionKey]bool {
+	out := map[sessionKey]bool{}
+	if e.DryRun {
+		return out
+	}
+	s := &e.sess
+	s.mu.Lock()
+	var fams []bool
+	for _, v6 := range []bool{false, true} {
+		for _, ch := range s.active {
+			if ch.Drop[b2i(v6)] {
+				fams = append(fams, v6)
+				break
+			}
+		}
+	}
+	s.mu.Unlock()
+	counts := map[sessionKey]uint64{}
+	for _, v6 := range fams {
+		bin := "iptables-save"
+		if v6 {
+			bin = "ip6tables-save"
+		}
+		save, err := e.R.Run(bin, "-c", "-t", "filter")
+		if err != nil {
+			continue
+		}
+		parseDropCounters(save, counts)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dropHits == nil {
+		s.dropHits = map[sessionKey]uint64{}
+	}
+	for k, n := range counts {
+		if n > s.dropHits[k] {
+			out[k] = true
+		}
+		s.dropHits[k] = n
+	}
+	return out
+}
+
+// parseDropCounters sums "[pkts:bytes] -A SNAKE_D<id> ... -d ADDR ..."
+// lines of iptables-save -c per (policy, address).
+func parseDropCounters(save string, counts map[sessionKey]uint64) {
+	for _, l := range strings.Split(save, "\n") {
+		if !strings.HasPrefix(l, "[") {
+			continue
+		}
+		end := strings.Index(l, "]")
+		if end < 0 {
+			continue
+		}
+		var pkts, bytes uint64
+		if _, err := fmt.Sscanf(l[1:end], "%d:%d", &pkts, &bytes); err != nil {
+			continue
+		}
+		f := strings.Fields(l[end+1:])
+		if len(f) < 2 || f[0] != "-A" || !strings.HasPrefix(f[1], "SNAKE_D") {
+			continue
+		}
+		var id int
+		if _, err := fmt.Sscanf(f[1], "SNAKE_D%d", &id); err != nil {
+			continue
+		}
+		for i := 2; i+1 < len(f); i++ {
+			if f[i] == "-d" {
+				a := strings.TrimSuffix(strings.TrimSuffix(f[i+1], "/32"), "/128")
+				if ip := net.ParseIP(a); ip != nil {
+					counts[sessionKey{Policy: id, Addr: ip.String()}] += pkts
+				}
+				break
+			}
+		}
+	}
+}
+
+// resetDropHits forgets the counters of a policy's drop chain in a family
+// (they restart when the chain is rewritten).
+func (e *Engine) resetDropHits(id int, v6 bool) {
+	s := &e.sess
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k := range s.dropHits {
+		if k.Policy == id && isV6(k.Addr) == v6 {
+			delete(s.dropHits, k)
+		}
+	}
 }

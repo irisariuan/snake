@@ -410,6 +410,7 @@ func (e *Engine) states(cfg *config.Config, caps Caps) []netfilter.PolicyState {
 		}
 		// session: rules, and WebRTC peers learned from STUN, are sessions.
 		st.Sessions = p.HasSessions() || st.WebRTCMode == netfilter.RTCQueue
+		st.DropSessions = e.domainSet(p).HasDropSessions()
 		out = append(out, st)
 	}
 	return out
@@ -576,18 +577,26 @@ func (e *Engine) Apply(reason string) error {
 	// SNI proxy: started before the rules redirect to it. If it cannot
 	// listen, no redirect is installed (HTTPS would otherwise break).
 	sniPort := e.configureSNI(cfg, states, caps, &errs)
-	sessActive := map[int][2]bool{}
+	sessActive := map[int]sessionChains{}
 	var sessIDs []int
 	for _, st := range states {
-		if st.Sessions {
-			sessActive[st.Policy.ID] = [2]bool{true, caps.IPv6 && st.IPv6Mode != netfilter.V6Off}
-			sessIDs = append(sessIDs, st.Policy.ID)
+		if !st.Sessions && !st.DropSessions {
+			continue
 		}
+		ch := sessionChains{Excluded: st.Excluded}
+		if st.Sessions {
+			ch.Route = [2]bool{true, caps.IPv6 && st.IPv6Mode != netfilter.V6Off}
+		}
+		if st.DropSessions {
+			ch.Drop = [2]bool{true, caps.IPv6}
+		}
+		sessActive[st.Policy.ID] = ch
+		sessIDs = append(sessIDs, st.Policy.ID)
 	}
 	e.setSessionChains(sessActive)
 	plan := netfilter.Build(s, states, netfilter.Options{IPv6: caps.IPv6, IPv6NAT: caps.IPv6NAT, DNSQueue: dnsQueue, Existing: existing,
 		TunnelAddrs: tunnelAddrs(usedTunnels(cfg)), WANAddrs: e.wanAddrs(), SNIPort: sniPort, LANAddr: e.lanAddr(),
-		SessionPairs: e.sessionPairs})
+		SessionPairs: e.sessionPairs, DropPairs: e.dropPairs})
 	if err := nf.Apply(plan); err != nil {
 		errs = append(errs, err.Error())
 	} else if len(sessIDs) > 0 {
@@ -819,6 +828,12 @@ func (e *Engine) sniPolicies(cfg *config.Config, states []netfilter.PolicyState,
 				e.recordCond(id, []string{dst.Unmap().String()}, hits)
 			}
 		}
+		if st.DropSessions {
+			id := p.ID
+			sp.DropSession = func(client, dst netip.Addr, rule, name string, opts match.Opts) error {
+				return e.AddSessions(id, client.Unmap().String(), []string{dst.Unmap().String()}, SessionDrop, rule, name, opts)
+			}
+		}
 		sp.MACs, sp.Nets = splitClients(st.Clients)
 		sp.ExcludeMACs, sp.ExcludeNets = splitClients(st.Excluded)
 		if len(st.Clients) > 0 && len(sp.MACs)+len(sp.Nets) == 0 {
@@ -929,6 +944,12 @@ func (e *Engine) dnsRules(states []netfilter.PolicyState, caps Caps) []dnsinspec
 				return e.RouteSessions(id, client, addrs, rule, name, opts)
 			}
 			r.Cond = func(addrs []string, hits []match.CondHit) { e.recordCond(id, addrs, hits) }
+		}
+		if st.DropSessions {
+			id := p.ID
+			r.DropSession = func(client string, addrs []string, rule, name string, opts match.Opts) error {
+				return e.AddSessions(id, client, addrs, SessionDrop, rule, name, opts)
+			}
 		}
 		out = append(out, r)
 	}

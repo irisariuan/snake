@@ -87,3 +87,22 @@ func TestRouteAnswer(t *testing.T) {
 		t.Fatalf("route %q, added %d -> %d", routes, added, i.Stats().Added)
 	}
 }
+
+func TestDropSessionAnswer(t *testing.T) {
+	rec := &system.Recorder{}
+	var got []string
+	i := &Inspector{IPSet: netfilter.IPSet{R: rec}, CacheTTL: time.Hour}
+	i.SetRules([]Rules{{ID: 1, Name: "p", Set: match.MustCompile([]string{"drop[share=kids]:ads.example.com"}), Set4: "SNK_1_d4", DropSet4: "SNK_1_x4",
+		DropSession: func(client string, addrs []string, rule, name string, opts match.Opts) error {
+			got = append(got, client+" "+strings.Join(addrs, ",")+" "+strings.Join(opts.Share, ","))
+			return nil
+		}}})
+	w := i.handle(answerPacket("x.ads.example.com", net.IPv4(203, 0, 113, 9)))
+	if w == nil {
+		t.Fatal("answer released before the block was in place")
+	}
+	w()
+	if len(got) != 1 || got[0] != "192.168.50.10 203.0.113.9 kids" || strings.Contains(rec.Joined(), "SNK_1_x4") {
+		t.Fatalf("drop session %q, sets %q", got, rec.Joined())
+	}
+}

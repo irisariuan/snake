@@ -120,6 +120,13 @@ func Normalize(s string) string {
 	if strings.HasPrefix(s, "!") {
 		neg, s = "!", strings.TrimSpace(s[1:])
 	}
+	if opts, has, rest, ok := splitCmd(s, "drop"); ok && has {
+		// drop[options]: a drop session (domain rules only).
+		if o, err := parseOpts(opts); err == nil {
+			return neg + cmdPrefix("drop", o) + Normalize(strings.TrimSpace(rest))
+		}
+		return neg + "drop[" + opts + "]:" + Normalize(strings.TrimSpace(rest))
+	}
 	if len(s) >= len(DropPrefix) && strings.EqualFold(s[:len(DropPrefix)], DropPrefix) {
 		inner := strings.TrimSpace(s[len(DropPrefix):])
 		lo := strings.ToLower(inner)
@@ -175,7 +182,7 @@ func Parse(raw string) (Pattern, error) {
 		p.Negate = true
 		s = s[1:]
 	}
-	if strings.HasPrefix(s, DropPrefix) {
+	if strings.HasPrefix(s, DropPrefix) || strings.HasPrefix(s, "drop[") {
 		if p.Negate {
 			return p, fmt.Errorf("! and drop: cannot be combined; write !name to exempt a name from drop rules")
 		}
@@ -255,7 +262,25 @@ func Parse(raw string) (Pattern, error) {
 }
 
 // parseDrop parses "drop:<rule>", "drop:asn:N" or "drop:cidr:X".
+// "drop[options]:<domain rule>" is a drop session: the answered addresses
+// are blocked for the asking device (and share= devices) only.
 func parseDrop(s string) (Pattern, error) {
+	if opts, has, rest, ok := splitCmd(s, "drop"); ok && has {
+		o, err := parseOpts(opts)
+		if err != nil {
+			return Pattern{Raw: s, Drop: true}, fmt.Errorf("drop[...]: %v", err)
+		}
+		lo := strings.ToLower(rest)
+		if strings.HasPrefix(lo, "asn:") || strings.HasPrefix(lo, "cidr:") || strings.HasPrefix(lo, "ip:") {
+			return Pattern{Raw: s, Drop: true}, fmt.Errorf("drop[...] options need a domain rule (a drop session starts with a DNS lookup); drop:asn:/cidr: block for every device")
+		}
+		q, err := parseDrop(DropPrefix + rest)
+		if err != nil {
+			return q, err
+		}
+		q.Raw, q.Opts = s, o
+		return q, nil
+	}
 	inner := s[len(DropPrefix):]
 	p := Pattern{Raw: s, Drop: true}
 	switch {
@@ -505,7 +530,7 @@ func (s *Set) MatchAny(names ...string) Result {
 	}
 	for _, n := range names {
 		if i := s.drp.first(n); i >= 0 {
-			return Result{Matched: true, Drop: true, Name: n, Rule: s.Drop[i].Raw}
+			return Result{Matched: true, Drop: true, Name: n, Rule: s.Drop[i].Raw, Opts: s.Drop[i].Opts}
 		}
 	}
 	for _, n := range names {
@@ -682,11 +707,22 @@ func (s *Set) DropSuffixes(degraded bool) []string {
 	}
 	var out []string
 	for _, p := range s.Drop {
-		if p.Kind == Suffix {
+		if p.Kind == Suffix && p.Opts.IsZero() { // drop sessions are per device
 			out = append(out, p.Value)
 		}
 	}
 	return out
+}
+
+// HasDropSessions reports whether some drop: rules have options (drop
+// sessions, blocked per device).
+func (s *Set) HasDropSessions() bool {
+	for _, p := range s.Drop {
+		if !p.Opts.IsZero() {
+			return true
+		}
+	}
+	return false
 }
 
 // NativeSuffixes returns rules dnsmasq can handle by itself. When the set has
@@ -731,7 +767,7 @@ func (s *Set) NeedsInspector() bool {
 		}
 	}
 	for _, p := range s.Drop {
-		if p.Kind != Suffix {
+		if p.Kind != Suffix || !p.Opts.IsZero() {
 			return true
 		}
 	}

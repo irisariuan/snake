@@ -442,6 +442,13 @@ func (e *Engine) TestDomain(name string) DomainTest {
 		}
 		res.Addrs = append(res.Addrs, ar)
 	}
+	if ok && mr.Drop && !mr.Opts.IsZero() {
+		res.Policy, res.PolicyID, res.Matched, res.Via, res.Blocked = p.Name, p.ID, mr.Rule, mr.Name, true
+		res.Notes = append(res.Notes, "drop session: these addresses are blocked only for the device that looks the name up"+
+			map[bool]string{true: " and the devices it shares with (" + strings.Join(mr.Opts.Share, ", ") + ")", false: ""}[len(mr.Opts.Share) > 0]+
+			", until the session TTL after its last blocked attempt; other devices are not affected")
+		return res
+	}
 	if ok && mr.Drop {
 		res.Policy, res.PolicyID, res.Matched, res.Via, res.Blocked = p.Name, p.ID, mr.Rule, mr.Name, true
 		res.Notes = append(res.Notes, "blocked by a drop: rule: connections to these addresses are rejected for the policy's devices")

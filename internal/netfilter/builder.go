@@ -40,6 +40,9 @@ type PolicyState struct {
 	// Sessions: the policy routes device sessions (session: rules, WebRTC
 	// peers) through its session chain.
 	Sessions bool
+	// DropSessions: the policy blocks drop sessions (drop[...]: rules)
+	// through its drop session chain.
+	DropSessions bool
 }
 
 // Options describe router capabilities and existing state.
@@ -68,6 +71,9 @@ type Options struct {
 	// [source match ("-s IP", "-m mac --mac-source MAC", "" = any device
 	// of the policy), address].
 	SessionPairs func(id int, v6 bool) [][2]string
+	// DropPairs returns the policy's drop sessions in a family, in the
+	// same form: connections from the device to the address are rejected.
+	DropPairs func(id int, v6 bool) [][2]string
 	// LANAddr is the router's LAN IPv4 address. DNS hijacking on routed
 	// client interfaces (VPN servers) DNATs to it: dnsmasq may not listen
 	// on those interfaces' own addresses.
@@ -355,6 +361,23 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 					filter.add(into, append(w, "-p tcp -m set --match-set", set, "dst -j REJECT --reject-with tcp-reset")...)
 					filter.add(into, append(w, "-m set --match-set", set, "dst -j REJECT --reject-with", reject)...)
 				}
+			}
+		}
+		// Drop sessions: rejected for the device (and share= devices) only.
+		// Reached for the policy's devices, after excluded ones; on IPv6
+		// too, whatever the policy does with IPv6 traffic.
+		if st.DropSessions {
+			dc := DropSessionChain(p.ID)
+			filter.chain(dc)
+			var pairs [][2]string
+			if opt.DropPairs != nil {
+				pairs = opt.DropPairs(p.ID, v6)
+			}
+			for _, r := range DropSessionRules(st.Excluded, pairs, v6) {
+				filter.add(dc, r)
+			}
+			for _, w := range who(st.Clients) {
+				filter.add(ChainFwd, append(w, "-j", dc)...)
 			}
 		}
 		if v6 && st.IPv6Mode == V6Off {
@@ -666,6 +689,30 @@ func clientMatches(clients []string, v6 bool) []string {
 		if m, ok := clientMatch(c, v6, true); ok {
 			out = append(out, m)
 		}
+	}
+	return out
+}
+
+// DropSessionRules is the content of a drop session chain: a RETURN for
+// each excluded device, then two REJECT rules (TCP reset, ICMP for the
+// rest) per [source match, address] pair.
+func DropSessionRules(excluded []string, pairs [][2]string, v6 bool) []string {
+	reject := "icmp-port-unreachable"
+	if v6 {
+		reject = "icmp6-port-unreachable"
+	}
+	var out []string
+	for _, c := range excluded {
+		if m, ok := clientMatch(c, v6, true); ok {
+			out = append(out, m+" -j RETURN")
+		}
+	}
+	for _, pr := range pairs {
+		src := ""
+		if pr[0] != "" {
+			src = pr[0] + " "
+		}
+		out = append(out, src+"-d "+pr[1]+" -p tcp -j REJECT --reject-with tcp-reset", src+"-d "+pr[1]+" -j REJECT --reject-with "+reject)
 	}
 	return out
 }

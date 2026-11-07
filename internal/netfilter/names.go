@@ -54,6 +54,11 @@ const (
 // PolicyChain is the per-policy match chain.
 func PolicyChain(id int) string { return fmt.Sprintf("%s%d", chainPolicy, id) }
 
+// DropSessionChain is a policy's drop session chain (filter): connections
+// from a device to an address it looked up via a drop[...]: rule (and from
+// the devices the rule shares with) are rejected.
+func DropSessionChain(id int) string { return fmt.Sprintf("SNAKE_D%d", id) }
+
 // SessionChain is a policy's session chain: one rule per device + address
 // routed for that device only (session: rules, WebRTC peers).
 func SessionChain(id int) string { return fmt.Sprintf("SNAKE_Q%d", id) }

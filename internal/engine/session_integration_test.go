@@ -118,6 +118,39 @@ while True:
 	if !get("snakeb", "203.0.113.80") {
 		t.Error("sharing one session routed the other for device B")
 	}
+	// Drop sessions (.82, .83: no session routes them).
+	if _, err := e.UpdateConfig(func(c *config.Config) error {
+		c.Policies[0].Domains = append(c.Policies[0].Domains, "drop[ttl=5m]:ads.example.net")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sh(t, "ip netns exec snakesrv sh -c 'ip addr add 203.0.113.82/32 dev lo; ip addr add 203.0.113.83/32 dev lo'; ip route add 203.0.113.82 via 198.18.0.2; ip route add 203.0.113.83 via 198.18.0.2")
+	if !get("snakea", "203.0.113.82") || !get("snakeb", "203.0.113.82") {
+		t.Fatal(".82 not reachable before the drop session")
+	}
+	// Device A looked up the dropped name: blocked for A only.
+	if err := e.AddSessions(1, "192.168.77.2", []string{"203.0.113.82"}, SessionDrop, "drop[ttl=5m]:ads.example.net", "x.ads.example.net", match.Opts{TTL: 5 * time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	if get("snakea", "203.0.113.82") {
+		t.Error("drop session did not block the device that looked the name up")
+	}
+	if !get("snakeb", "203.0.113.82") {
+		t.Error("drop session blocked another device")
+	}
+	// The blocked attempt shows in the rule counters (renews the session).
+	if !e.dropAttempts()[sessionKey{Policy: 1, Addr: "203.0.113.82"}] {
+		t.Error("blocked attempt not seen in the drop session counters")
+	}
+	// Shared with B: blocked for both.
+	if err := e.AddSessions(1, "192.168.77.2", []string{"203.0.113.83"}, SessionDrop, "drop[share=192.168.77.3]:ads.example.net", "y.ads.example.net",
+		match.Opts{Share: []string{"192.168.77.3"}}); err != nil {
+		t.Fatal(err)
+	}
+	if get("snakea", "203.0.113.83") || get("snakeb", "203.0.113.83") {
+		t.Error("shared drop session did not block both devices")
+	}
 	// TTL over with no connection: the route ends.
 	e.refreshSessions(strings.NewReader(""), time.Now().Add(2*time.Minute))
 	if !get("snakea", "203.0.113.80") {

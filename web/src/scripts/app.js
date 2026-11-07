@@ -388,6 +388,7 @@ var SYNTAX = [
   ['!rule', 'exclusion: vetoes matches of the rules (drop: rules too)'],
   ['drop:rule', 'block: connections to what any domain rule after drop: matches are rejected; beats include rules'],
   ['drop:asn:1234 / drop:cidr:1.2.3.0/24', 'block an autonomous system or address range'],
+  ['drop[ttl=10m;share=kids]:rule', 'drop session: blocked only for the device that looked the name up (and share= devices), until the TTL after its last blocked attempt (onlookup=1: after the lookup); plain drop: blocks for every device'],
   ['session:rule', 'device session: what any domain rule after session: matches is routed only for the device that looked it up, until the session TTL after its last connection; not added to the policy\'s sets. Beats include rules; drop: and ! beat it'],
   ['session[ttl=10m;onlookup=1]:rule', 'options: ttl (seconds or 90s, 10m, 1h) overrides the session TTL; onlookup=1 counts it from the lookup (lookups renew it, connections do not)'],
   ['session[share=global,share=kids,share=10.6.0.2]:rule', 'share the session with other devices (repeatable): global = every device of the policy, a device group, or a device (IP, subnet, MAC); a connection from any of them keeps it alive'],
@@ -428,7 +429,7 @@ function hlLine(line) {
     }).join('') + span('com', rc[1]);
   }
   if ((m = /^(session(?:\[[^\]]*\])?:)(.*)$/i.exec(t))) { out += span('sess', m[1]); t = m[2]; }
-  if ((m = /^(drop:)(.*)$/i.exec(t))) {
+  if ((m = /^(drop(?:\[[^\]]*\])?:)(.*)$/i.exec(t))) {
     out += span('drop', m[1]); t = m[2];
     if ((m = /^(asn:|cidr:|ip:)(.*)$/i.exec(t))) { var dc = splitComment(m[2]); return out + span('kw', m[1]) + span('num', dc[0]) + span('com', dc[1]); }
   }

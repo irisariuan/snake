@@ -152,3 +152,31 @@ func TestShareOption(t *testing.T) {
 		t.Error("bad share accepted")
 	}
 }
+
+func TestDropSessionRules(t *testing.T) {
+	s, errs := Compile([]string{"drop[share=kids;ttl=5m]:ads.example.com", "drop:tracker.example", "example.com"})
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if !s.HasDropSessions() || s.Drop[0].Raw != "drop[ttl=5m;share=kids]:ads.example.com" {
+		t.Fatalf("drop sessions %+v", s.Drop)
+	}
+	r := s.MatchAny("x.ads.example.com")
+	if !r.Drop || r.Opts.TTL != 5*time.Minute || len(r.Opts.Share) != 1 {
+		t.Fatalf("match %+v", r)
+	}
+	if r := s.MatchAny("tracker.example"); !r.Drop || !r.Opts.IsZero() {
+		t.Fatalf("plain drop %+v", r)
+	}
+	if d := strings.Join(s.DropSuffixes(false), ","); d != "tracker.example" {
+		t.Fatalf("dnsmasq drop suffixes %q (drop sessions are per device)", d)
+	}
+	if !s.NeedsInspector() {
+		t.Error("drop sessions need the inspector")
+	}
+	for _, bad := range []string{"drop[share=kids]:asn:1234", "drop[ttl=2]:a.com", "!drop[ttl=5m]:a.com"} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}

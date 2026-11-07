@@ -77,6 +77,10 @@ type Policy struct {
 	Route func(client, dst netip.Addr, rule, name string, opts match.Opts) (bool, error)
 	// Cond receives destinations of connections matching if: atoms.
 	Cond func(dst netip.Addr, hits []match.CondHit)
+	// DropSession blocks a connection matching a drop[...]: rule and its
+	// destination for that client (and share= devices) only, instead of
+	// the drop set.
+	DropSession func(client, dst netip.Addr, rule, name string, opts match.Opts) error
 	// ECH is what happens to the policy's clients' Encrypted Client Hello
 	// connections: ECHDrop, ECHRelay ("" = relay) or ECHPassthrough.
 	ECH string
@@ -496,7 +500,13 @@ func (p *Proxy) handle(c *net.TCPConn) {
 		p.noSNI.Add(1)
 	case ok && res.Drop:
 		p.dropped.Add(1)
-		p.learn(dst.Addr(), pol.DropSet4, pol.DropSet6)
+		if !res.Opts.IsZero() && pol.DropSession != nil {
+			if err := pol.DropSession(client, dst.Addr(), res.Rule, hello.ServerName, res.Opts); err != nil {
+				logx.Warnf("sni proxy: drop session for %s -> %s (%s): %v", client, dst, hello.ServerName, err)
+			}
+		} else {
+			p.learn(dst.Addr(), pol.DropSet4, pol.DropSet6)
+		}
 		logx.Debugf("sni proxy: %s -> %s (%s) blocked by %s rule %s", client, dst, hello.ServerName, pol.Name, res.Rule)
 		reset(c)
 		return
