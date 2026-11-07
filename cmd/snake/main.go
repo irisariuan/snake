@@ -755,6 +755,7 @@ func install() error {
 
 func uninstall(purge bool) error {
 	_ = stop(true)
+	engine.NewWireGuard(system.Exec{}).RemoveAll() // snake's own WireGuard interfaces
 	for _, h := range hookFiles() {
 		removeHook(h)
 	}

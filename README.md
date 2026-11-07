@@ -33,7 +33,9 @@ Inspired by and able to import from Ranger802004's
 
 * Asuswrt-Merlin 386.x or newer (Addons API, `ipset`, `dnsmasq` with ipset support)
 * One or more VPN clients configured in *VPN → VPN Client* (WireGuard `wgc1-5`
-  and/or OpenVPN `ovpnc1-5`; mixing types in one failover list is fine)
+  and/or OpenVPN `ovpnc1-5`; mixing types in one failover list is fine), and/or
+  up to 20 more WireGuard tunnels that snake runs itself
+  ([below](#more-than-ten-vpns-snakes-own-wireguard-tunnels))
 * JFFS custom scripts (the installer turns them on)
 
 In each VPN client you want snake to use, set **"Redirect Internet traffic
@@ -82,6 +84,52 @@ created an Addons menu, the page is under **Tools → snake**.
 
 Uninstall with `snake uninstall`. This removes rules, routes, sets, hooks and
 the page; add `--purge` to delete the config too.
+
+## More than ten VPNs: snake's own WireGuard tunnels
+
+The firmware has five WireGuard and five OpenVPN clients. For more, snake
+creates and runs up to 20 extra WireGuard tunnels itself, `wgx1`–`wgx20`, from
+the configuration files VPN providers hand out for WireGuard apps:
+
+1. Web UI → **Tunnels** → **+ Add WireGuard tunnel**.
+2. Paste the `.conf` file (or **Load .conf file…**), give it a name, and
+   **Save & apply**. snake creates the interface (named like the tunnel),
+   configures it with `wg`, and checks its health like a firmware client, even
+   before a policy uses it.
+3. Add it to a policy's tunnels. It can be mixed with `wgc`/`ovpnc` clients in
+   a failover list.
+
+```ini
+[Interface]
+PrivateKey = <your private key>
+Address = 10.64.1.2/32, fc00:bbbb::2/128
+DNS = 10.64.0.1              # ignored: each policy chooses its resolver
+
+[Peer]
+PublicKey = <server public key>
+Endpoint = jp-tyo.example.net:51820
+AllowedIPs = 0.0.0.0/0, ::/0 # keep: it limits what the tunnel accepts
+PersistentKeepalive = 25
+```
+
+* `PrivateKey`, `Address`, and a `[Peer]` with `PublicKey`, `Endpoint` and
+  `AllowedIPs` are required; `ListenPort`, `MTU` (default 1420),
+  `PresharedKey` and `PersistentKeepalive` are optional. Keepalive defaults
+  to 25 seconds: a tunnel only counts as healthy after a recent handshake,
+  and without keepalives an idle tunnel never handshakes. wg-quick's `Table`,
+  `FwMark`, `SaveConfig` and `PreUp`/`PostUp`/`PreDown`/`PostDown` are
+  accepted and ignored: no scripts are run.
+* The interface gets no routes of its own: like a firmware client in VPN
+  Director mode, it carries only what snake's policies send into it.
+* The config is kept in `config.json` (mode 0600) and the private key is
+  shown in the web UI, which needs the API token.
+* Changing a tunnel's peers reconfigures it with `wg syncconf`, which keeps
+  the session when it can. Disabling or deleting a tunnel removes its
+  interface on **Save & apply**; *Emergency disable* leaves the tunnels up but
+  sends no traffic into them. `snake uninstall` removes them.
+* Needs the firmware's WireGuard support (kernel module and `wg`, present
+  on any model that offers WireGuard clients) and the default 8-bit
+  `mark_mask`.
 
 ## Policies
 
@@ -530,8 +578,8 @@ and `POST /api/learned/{policy}/forget`
 
 ## Failover
 
-Each tunnel used by an enabled policy is checked every `health_interval`
-seconds (default 15):
+Each tunnel used by an enabled policy, and each enabled snake WireGuard
+tunnel, is checked every `health_interval` seconds (default 15):
 
 * Interface exists and is up. For WireGuard, the latest handshake is newer than
   `handshake_max_age`. For OpenVPN, `vpn_clientN_state` is 2 (connected).
@@ -582,7 +630,9 @@ mangle OUTPUT SNAKE_DNSO: dnsmasq's UDP answers → NFQUEUE → DNS inspector �
   ownership. Overlapping custom connection masks are rejected even when
   QoS is off, so enabling it later does not invalidate the configuration.
   Other addons must not claim snake's documented masks, tables or priorities.
-* ip rule priorities 4980–5499, routing tables 1000–1310.
+* ip rule priorities 4980–5499, routing tables 1000–1330 (probe tables
+  1301–1310 for the firmware clients, 1311–1330 for `wgx1`–`wgx20`, whose
+  probe rules use priorities 5401–5420).
 * All chains are loaded with `iptables-restore --noflush`, so each table is
   updated atomically. Chains of removed policies are deleted in the same
   transaction.

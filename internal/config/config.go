@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/irisariuan/snake/internal/match"
+	"github.com/irisariuan/snake/internal/wireguard"
 )
 
 // Tunnel names supported by Asuswrt-Merlin.
@@ -23,12 +24,50 @@ var TunnelNames = []string{
 	"ovpnc1", "ovpnc2", "ovpnc3", "ovpnc4", "ovpnc5",
 }
 
+// WireGuardPrefix names the WireGuard tunnels snake runs itself, beyond
+// the firmware's VPN clients: wgx1 ... wgx<MaxWireGuard>. The name is
+// also the kernel interface.
+const WireGuardPrefix = "wgx"
+
+// MaxWireGuard is the number of WireGuard tunnels snake can run itself.
+const MaxWireGuard = 20
+
+// MaxTunnels is the number of tunnel slots (firmware clients + snake's
+// own WireGuard tunnels): probe marks, probe tables and rule priorities
+// are reserved for each.
+var MaxTunnels = len(TunnelNames) + MaxWireGuard
+
+// WireGuardName returns the tunnel name of snake's own WireGuard slot n.
+func WireGuardName(n int) string { return WireGuardPrefix + strconv.Itoa(n) }
+
+// WireGuardSlot returns n for "wgx<n>", or 0.
+func WireGuardSlot(name string) int {
+	if !strings.HasPrefix(name, WireGuardPrefix) {
+		return 0
+	}
+	d := strings.TrimPrefix(name, WireGuardPrefix)
+	n, err := strconv.Atoi(d)
+	if err != nil || n < 1 || n > MaxWireGuard || strconv.Itoa(n) != d {
+		return 0
+	}
+	return n
+}
+
+// IsWireGuard reports whether a tunnel is WireGuard (firmware or snake's own).
+func IsWireGuard(name string) bool {
+	return strings.HasPrefix(name, "wgc") || WireGuardSlot(name) > 0
+}
+
 // TunnelIndex returns a stable 1-based index for a tunnel name, or 0.
+// Firmware clients are 1-10, snake's WireGuard tunnels 11-30.
 func TunnelIndex(name string) int {
 	for i, n := range TunnelNames {
 		if n == name {
 			return i + 1
 		}
+	}
+	if n := WireGuardSlot(name); n > 0 {
+		return len(TunnelNames) + n
 	}
 	return 0
 }
@@ -354,6 +393,9 @@ type Config struct {
 	Groups    []Group    `json:"groups"`
 	RuleLists []RuleList `json:"rule_lists"`
 	Policies  []Policy   `json:"policies"`
+	// WireGuard are tunnels snake creates and runs itself (wgx1...),
+	// for more VPNs than the firmware's ten clients.
+	WireGuard []WireGuard `json:"wireguard"`
 
 	migratedMask uint32 // set by Load, see MigratedMarkMask
 }
@@ -560,10 +602,19 @@ func (s Settings) PolicyMark(id int) uint32 {
 }
 
 // ProbeMark returns the fwmark used by health probes for a tunnel. Probe marks
-// occupy the top of the mark range so they never collide with policy ids.
+// occupy the top of the mark range so they never collide with policy ids:
+// the firmware clients the top ten values, snake's own WireGuard tunnels
+// the values below them.
 func (s Settings) ProbeMark(tunnel string) uint32 {
-	idx := TunnelIndex(tunnel)
-	return (s.MaxMarkValue() - uint32(len(TunnelNames)) + uint32(idx)) << s.MarkShift() & s.MarkMask
+	return s.probeValue(TunnelIndex(tunnel)) << s.MarkShift() & s.MarkMask
+}
+
+func (s Settings) probeValue(idx int) uint32 {
+	n := len(TunnelNames)
+	if idx <= n {
+		return s.MaxMarkValue() - uint32(n) + uint32(idx)
+	}
+	return s.MaxMarkValue() - uint32(idx)
 }
 
 // MaxPolicyID is the largest policy id allowed.
@@ -714,6 +765,10 @@ func (c *Config) Normalize() {
 	if c.Groups == nil {
 		c.Groups = []Group{}
 	}
+	if c.WireGuard == nil {
+		c.WireGuard = []WireGuard{}
+	}
+	c.normalizeWireGuard()
 	if c.Devices == nil {
 		c.Devices = []Device{}
 	}
@@ -845,6 +900,32 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	wgIDs := map[string]bool{}
+	for _, w := range c.WireGuard {
+		pre := "wireguard " + w.ID + ": "
+		n := WireGuardSlot(w.ID)
+		if w.ID == "" {
+			add("at most %d WireGuard tunnels", MaxWireGuard)
+			continue
+		}
+		if n == 0 {
+			add("wireguard tunnel id %q invalid (%s1-%s%d)", w.ID, WireGuardPrefix, WireGuardPrefix, MaxWireGuard)
+			continue
+		}
+		if wgIDs[w.ID] {
+			add("duplicate wireguard tunnel %q", w.ID)
+		}
+		wgIDs[w.ID] = true
+		if w.Name != "" && !nameRe.MatchString(w.Name) {
+			add(pre+"name %q invalid (1-40 chars: letters, digits, space, _.-+)", w.Name)
+		}
+		if _, err := wireguard.Parse(w.Conf); err != nil {
+			add(pre+"%v", err)
+		}
+		if s.probeValue(TunnelIndex(w.ID)) <= uint32(s.MaxPolicyID()) {
+			add(pre+"mark_mask has too few bits for snake's own WireGuard tunnels; use 0x%08x", DefaultMarkMask)
+		}
+	}
 	names := map[string]bool{}
 	ids := map[int]bool{}
 	for _, p := range c.Policies {
@@ -867,8 +948,11 @@ func (c *Config) Validate() error {
 			add("%sat least one tunnel is required", pre)
 		}
 		for _, t := range p.Tunnels {
-			if TunnelIndex(t) == 0 {
+			switch {
+			case TunnelIndex(t) == 0:
 				add(pre+"unknown tunnel %q", t)
+			case WireGuardSlot(t) > 0 && !wgIDs[t]:
+				add(pre+"tunnel %q is not set up (add it under Tunnels)", t)
 			}
 		}
 		if p.ExpectedCountry != "" && !ccRe.MatchString(p.ExpectedCountry) {

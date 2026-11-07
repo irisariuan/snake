@@ -32,6 +32,7 @@ import (
 	"github.com/irisariuan/snake/internal/sniproxy"
 	"github.com/irisariuan/snake/internal/system"
 	"github.com/irisariuan/snake/internal/webrtc"
+	"github.com/irisariuan/snake/internal/wireguard"
 )
 
 // Version is set at build time.
@@ -111,9 +112,10 @@ type Engine struct {
 	learnRoute  atomic.Value // map[string]int: server -> policy (0 = WAN), as installed
 	dns         *dnsinspect.Inspector
 	dnsOn       bool
-	fwd         dnsfwd.Manager  // DoT/DoH forwarders for resolve-via-tunnel
-	sni         *sniproxy.Proxy // transparent SNI proxy (sniff_sni)
-	sniErr      string          // why the SNI proxy is not running
+	fwd         dnsfwd.Manager     // DoT/DoH forwarders for resolve-via-tunnel
+	sni         *sniproxy.Proxy    // transparent SNI proxy (sniff_sni)
+	wg          *wireguard.Manager // snake's own WireGuard tunnels (wgx1...)
+	sniErr      string             // why the SNI proxy is not running
 	asnCache    *asn.Cache
 	active      map[int]string
 	cands       map[int][]Candidate
@@ -141,6 +143,7 @@ func New(p Paths, r system.Runner) *Engine {
 		rtc:       webrtc.NewTracker(netfilter.IPSet{R: r}, 0),
 		dns:       &dnsinspect.Inspector{IPSet: netfilter.IPSet{R: r}},
 		sni:       &sniproxy.Proxy{Sets: netfilter.IPSet{R: r}},
+		wg:        NewWireGuard(r),
 		active:    map[int]string{},
 		cands:     map[int][]Candidate{},
 		asnErrors: map[int]string{},
@@ -288,10 +291,18 @@ func (e *Engine) ipset() netfilter.IPSet {
 	return netfilter.IPSet{R: e.R, NL: e.nl}
 }
 
-// usedTunnels lists tunnels referenced by enabled policies.
+// usedTunnels lists the tunnels that are monitored: those referenced by
+// enabled policies, and snake's own enabled WireGuard tunnels (so a new
+// one shows its health before a policy uses it).
 func usedTunnels(c *config.Config) []string {
 	seen := map[string]bool{}
 	var out []string
+	for _, w := range c.WireGuard {
+		if w.Enabled && !seen[w.ID] {
+			seen[w.ID] = true
+			out = append(out, w.ID)
+		}
+	}
 	for _, p := range c.Policies {
 		if !p.Enabled {
 			continue
@@ -467,6 +478,13 @@ func (e *Engine) Apply(reason string) error {
 	nf := netfilter.Applier{R: e.R}
 	rt := routing.Manager{R: e.R}
 	var errs []string
+
+	// 0. snake's own WireGuard interfaces: the routes below point at them.
+	if !e.DryRun {
+		if err := e.wg.Sync(wireGuardTunnels(cfg)); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
 
 	// 1. ipsets
 	specs := setSpecs(cfg, states, caps.IPv6)

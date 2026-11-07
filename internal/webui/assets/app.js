@@ -4,6 +4,7 @@
   'use strict';
   var CTX = window.SNAKE_CTX || {};
   var TUNNELS = ['wgc1', 'wgc2', 'wgc3', 'wgc4', 'wgc5', 'ovpnc1', 'ovpnc2', 'ovpnc3', 'ovpnc4', 'ovpnc5'];
+  var MAX_WG = 20; // snake's own WireGuard tunnels: wgx1 ... wgx20
   var state = { tab: 'status', cfg: null, dirty: false, status: null, clients: [], edit: null, error: '' };
   var root;
 
@@ -89,6 +90,7 @@
   // ---------- data ----------
   function fixCfg(c) {
     c.policies = c.policies || []; c.groups = c.groups || []; c.devices = c.devices || []; c.rule_lists = c.rule_lists || [];
+    c.wireguard = c.wireguard || [];
     c.rule_lists.forEach(function (l) { ['domains', 'asns', 'cidrs'].forEach(function (k) { l[k] = l[k] || []; }); });
     c.policies.forEach(function (p) {
       ['tunnels', 'domains', 'asns', 'cidrs', 'devices', 'lists'].forEach(function (k) { p[k] = p[k] || []; });
@@ -120,10 +122,13 @@
       return load();
     }).catch(function (e) { state.error = e.message; render(); });
   }
-  function markDirty() { state.dirty = true; renderBanner(); }
+  // Redraw only on the first change: a text field's change event fires on
+  // blur, during the click on "Save & apply", and replacing the button then
+  // swallowed the click.
+  function markDirty() { if (state.dirty) return; state.dirty = true; renderBanner(); }
 
   // ---------- layout ----------
-  var TABS = [['status', 'Status'], ['policies', 'Policies'], ['lists', 'Rule lists'], ['devices', 'Devices & groups'], ['learn', 'Learnings'], ['diag', 'Diagnostics'], ['settings', 'Settings'], ['import', 'Import']];
+  var TABS = [['status', 'Status'], ['policies', 'Policies'], ['tunnels', 'Tunnels'], ['lists', 'Rule lists'], ['devices', 'Devices & groups'], ['learn', 'Learnings'], ['diag', 'Diagnostics'], ['settings', 'Settings'], ['import', 'Import']];
   var bannerBox;
   function render() {
     var scrollY = window.scrollY;
@@ -146,7 +151,7 @@
     if (!state.cfg) { root.appendChild(el('p', { class: 'muted' }, 'Loading...')); return; }
     var body = el('div');
     root.appendChild(body);
-    ({ status: viewStatus, policies: viewPolicies, lists: viewLists, devices: viewDevices, learn: viewLearnings, diag: viewDiag, settings: viewSettings, import: viewImport })[state.tab](body);
+    ({ status: viewStatus, policies: viewPolicies, tunnels: viewTunnels, lists: viewLists, devices: viewDevices, learn: viewLearnings, diag: viewDiag, settings: viewSettings, import: viewImport })[state.tab](body);
     window.scrollTo(0, scrollY);
   }
   // ---------- emergency switch ----------
@@ -178,6 +183,59 @@
       el('span', { class: 'row' }, btn('Discard', function () { state.dirty = false; state.edit = null; load(); }), btn('Save & apply', save, 'pri'))));
   }
 
+  // ---------- tunnels ----------
+  function isWG(t) { return t.indexOf('wgc') === 0 || /^wgx\d+$/.test(t); }
+  function wgTunnel(t) { return ((state.cfg && state.cfg.wireguard) || []).filter(function (w) { return w.id === t; })[0]; }
+  function tunLabel(t) { var w = wgTunnel(t); return w && w.name ? t + ' (' + w.name + ')' : t; }
+  function allTunnels() { return TUNNELS.concat(((state.cfg && state.cfg.wireguard) || []).map(function (w) { return w.id; })); }
+  function nextWGId() {
+    var used = {};
+    state.cfg.wireguard.forEach(function (w) { used[w.id] = true; });
+    for (var n = 1; n <= MAX_WG; n++) if (!used['wgx' + n]) return 'wgx' + n;
+    return '';
+  }
+  function wgUsers(id) { return state.cfg.policies.filter(function (p) { return p.tunnels.indexOf(id) >= 0; }).map(function (p) { return p.name; }); }
+  var WG_PLACEHOLDER = '[Interface]\nPrivateKey = …\nAddress = 10.2.0.2/32, fd00::2/128\n\n[Peer]\nPublicKey = …\nEndpoint = vpn.example.com:51820\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25';
+  function viewTunnels(b) {
+    var cfg = state.cfg, st = state.status || {};
+    b.appendChild(el('h3', null, 'Router VPN clients'));
+    b.appendChild(el('p', { class: 'muted small' }, 'wgc1-5 (WireGuard) and ovpnc1-5 (OpenVPN) are the firmware\'s VPN clients: set them up in VPN → VPN Client, with "Redirect Internet traffic through tunnel" set to "VPN Director" and no VPN Director rules. The firmware has no more than these ten.'));
+    b.appendChild(el('h3', null, 'snake WireGuard tunnels (' + cfg.wireguard.length + ' of ' + MAX_WG + ')'));
+    b.appendChild(el('p', { class: 'muted small' }, 'For more VPNs than the firmware allows: paste the WireGuard configuration file your VPN provider gives you (the same file you would import into a WireGuard app). snake creates the interface, keeps it up and checks its health; use it in policies like a router VPN client. snake routes traffic itself, so the file\'s DNS line is ignored (each policy chooses its resolver) and AllowedIPs only limits what the tunnel accepts: keep 0.0.0.0/0, ::/0. Changes take effect on "Save & apply".'));
+    cfg.wireguard.forEach(function (w, i) {
+      var h = st.tunnels && st.tunnels[w.id];
+      var users = wgUsers(w.id);
+      var ta = el('textarea', { style: 'min-height:170px', spellcheck: 'false', placeholder: WG_PLACEHOLDER, oninput: function (e) { w.conf = e.target.value; markDirty(); } }, w.conf || '');
+      b.appendChild(el('div', { class: 'card' },
+        el('div', { class: 'row', style: 'justify-content:space-between' },
+          el('span', { class: 'row' }, el('b', null, w.id),
+            el('input', { type: 'text', value: w.name, placeholder: 'Name, e.g. Tokyo', size: 24, maxlength: 40, onchange: function (e) { w.name = e.target.value.trim(); markDirty(); } }),
+            el('label', { class: 'chk' }, el('input', { type: 'checkbox', checked: w.enabled, onchange: function (e) { w.enabled = e.target.checked; markDirty(); render(); } }), el('span', null, 'Enabled'))),
+          !w.enabled ? badge('disabled') : h ? tunnelBadge(h) : badge('not running yet')),
+        el('div', { class: 'small muted', style: 'margin:4px 0' }, users.length ? 'Used by: ' + users.join(', ') : 'Not used by any policy yet: add it to a policy\'s tunnels.'),
+        h && w.enabled ? el('div', { class: 'small muted', style: 'margin:4px 0' }, 'Handshake ' + ago(h.handshake) + ' · exit ' + (h.exit_ip || '?') + ' ' + (h.country || '') + (h.has_ipv6 ? ' · IPv6' : '')) : null,
+        ta,
+        el('div', { class: 'row', style: 'margin-top:6px' },
+          btn('Load .conf file…', function () { pickFile(function (text, name) {
+            w.conf = text; ta.value = text;
+            if (!w.name && name) w.name = name.replace(/\.conf$/i, '').replace(/[^A-Za-z0-9 _.\-+]/g, ' ').trim().slice(0, 40);
+            markDirty(); render();
+          }); }),
+          btn('Delete', function () {
+            if (users.length) { toast('Remove ' + w.id + ' from these policies first: ' + users.join(', ')); return; }
+            if (!confirm('Delete WireGuard tunnel ' + tunLabel(w.id) + '? Its interface is removed on "Save & apply".')) return;
+            cfg.wireguard.splice(i, 1); markDirty(); render();
+          }, 'danger'))));
+    });
+    var id = nextWGId();
+    b.appendChild(el('div', { class: 'row' },
+      btn('+ Add WireGuard tunnel', function () {
+        if (!id) return;
+        cfg.wireguard.push({ id: id, name: '', enabled: true, conf: '' }); markDirty(); render();
+      }, 'pri'),
+      !id ? el('span', { class: 'muted small' }, 'All ' + MAX_WG + ' slots are in use.') : null));
+  }
+
   // ---------- status ----------
   function tunnelBadge(t) {
     if (!t) return badge('unknown');
@@ -206,11 +264,11 @@
     b.appendChild(el('div', { class: 'grid' }, tn.map(function (k) {
       var t = s.tunnels[k];
       return el('div', { class: 'card' },
-        el('div', { class: 'row', style: 'justify-content:space-between' }, el('b', null, k + ' (' + t.iface + ')'), tunnelBadge(t)),
+        el('div', { class: 'row', style: 'justify-content:space-between' }, el('b', null, (wgTunnel(k) ? tunLabel(k) : k + ' (' + t.iface + ')')), tunnelBadge(t)),
         el('div', { class: 'kv', style: 'margin-top:6px' },
           el('span', null, 'Exit'), el('span', null, (t.exit_ip || '?') + ' ' + (t.country || '')),
           el('span', null, 'Probe'), el('span', null, t.probe_ok ? ('ok ' + (t.probe_rtt || '')) : ('failing (' + t.probe_fails + ')')),
-          k.indexOf('wgc') === 0 ? [el('span', null, 'Handshake'), el('span', null, ago(t.handshake))] : [el('span', null, 'State'), el('span', null, t.client_state === '2' ? 'connected' : (t.client_state || '?'))],
+          isWG(k) ? [el('span', null, 'Handshake'), el('span', null, ago(t.handshake))] : [el('span', null, 'State'), el('span', null, t.client_state === '2' ? 'connected' : (t.client_state || '?'))],
           el('span', null, 'IPv6'), el('span', null, t.has_ipv6 ? 'yes' : 'no'),
           el('span', null, 'Geo'), el('span', null, t.geo_error ? t.geo_error : ago(t.geo_checked))));
     })));
@@ -219,7 +277,7 @@
     b.appendChild(el('div', { class: 'scroll' }, el('table', null,
       el('tr', null, ['Policy', 'Scope', 'Route', 'IPv6', 'WebRTC', 'Learned', 'Traffic'].map(function (h) { return el('th', null, h); })),
       (s.policies || []).map(function (p) {
-        var route = !p.enabled ? badge('disabled') : s.disabled ? badge('WAN (snake disabled)', 'bad') : p.active ? badge(p.active + (p.country ? ' ' + p.country : ''), 'ok') :
+        var route = !p.enabled ? badge('disabled') : s.disabled ? badge('WAN (snake disabled)', 'bad') : p.active ? badge(tunLabel(p.active) + (p.country ? ' ' + p.country : ''), 'ok') :
           p.kill_engaged ? badge('kill switch: blocked', 'warn') : badge('WAN (no tunnel)', 'bad');
         var sets = Object.keys(p.sets || {}).map(function (k) { return k.replace(/^SNK_\d+_/, '') + ':' + p.sets[k]; }).join(' ');
         var cands = (p.candidates || []).map(function (c) { return el('div', { class: 'small ' + (c.ok ? '' : 'muted') }, (c.ok ? '✓ ' : '✗ ') + c.tunnel + (c.reason ? ' (' + c.reason + ')' : '')); });
@@ -575,7 +633,7 @@
         return el('tr', null,
           el('td', null, el('input', { type: 'checkbox', checked: p.enabled, title: 'enabled', onchange: function (e) { p.enabled = e.target.checked; markDirty(); } })),
           el('td', null, el('b', null, p.name), p.expected_country ? el('div', { class: 'small muted' }, 'expects ' + p.expected_country) : null),
-          el('td', null, p.tunnels.join(' → ')),
+          el('td', null, p.tunnels.map(tunLabel).join(' → ')),
           el('td', { class: 'small' }, m.join(', ')),
           el('td', { class: 'small muted' }, prot.join(' · ')),
           el('td', { class: 'row' },
@@ -599,14 +657,14 @@
       tunBox.innerHTML = '';
       p.tunnels.forEach(function (t, i) {
         var h = state.status && state.status.tunnels[t];
-        tunBox.appendChild(el('li', null, el('b', null, (i + 1) + '. ' + t), h ? tunnelBadge(h) : badge('not monitored yet'),
+        tunBox.appendChild(el('li', null, el('b', null, (i + 1) + '. ' + tunLabel(t)), h ? tunnelBadge(h) : badge('not monitored yet'),
           btn('↑', function () { if (i > 0) { p.tunnels.splice(i - 1, 0, p.tunnels.splice(i, 1)[0]); drawTunnels(); } }),
           btn('✕', function () { p.tunnels.splice(i, 1); drawTunnels(); })));
       });
       if (!p.tunnels.length) tunBox.appendChild(el('li', { class: 'muted' }, 'Add at least one tunnel. Extra tunnels are failover backups, in order.'));
     }
     drawTunnels();
-    var tunSel = el('select', null, TUNNELS.map(function (t) { return el('option', { value: t }, t); }));
+    var tunSel = el('select', null, allTunnels().map(function (t) { var w = wgTunnel(t); return el('option', { value: t }, tunLabel(t) + (w && !w.enabled ? ' (disabled)' : '')); }));
 
     var devSel = el('select', { multiple: true, size: 8, style: 'width:100%' },
       (state.cfg.groups || []).map(function (g) { var v = 'group:' + g.name; return el('option', { value: v, selected: p.devices.indexOf(v) >= 0 }, 'Group: ' + g.name); }),
@@ -637,6 +695,7 @@
         chk(p, 'enabled', 'Enabled'),
         el('label', { class: 'f' }, 'Tunnels (priority order)'), tunBox,
         el('div', { class: 'row' }, tunSel, btn('Add tunnel', function () { if (p.tunnels.indexOf(tunSel.value) < 0) p.tunnels.push(tunSel.value); drawTunnels(); })),
+        el('div', { class: 'small muted' }, 'Need more than the router\'s ten VPN clients? Add WireGuard tunnels in the Tunnels tab.'),
         chk(p, 'kill_switch', 'Kill switch', 'When no tunnel is healthy, block this traffic instead of sending it via WAN.'),
         el('label', { class: 'f' }, 'Expected exit country (ISO code, optional)'),
         el('input', { type: 'text', value: p.expected_country, maxlength: 2, size: 4, placeholder: 'US', oninput: function (e) { p.expected_country = e.target.value.toUpperCase(); } }),

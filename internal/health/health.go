@@ -100,7 +100,7 @@ func (m *Monitor) Link(s config.Settings, tunnel string) Status {
 		st.Reason = "interface down"
 		return st
 	}
-	if strings.HasPrefix(tunnel, "wgc") {
+	if config.IsWireGuard(tunnel) {
 		st.Handshake = m.wgHandshake(st.Iface)
 		age := time.Since(st.Handshake)
 		if st.Handshake.IsZero() || age > time.Duration(s.HandshakeMaxAge)*time.Second {

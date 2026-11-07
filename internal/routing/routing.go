@@ -90,7 +90,7 @@ func (m Manager) Sync(s config.Settings, routes []PolicyRoute, probes []ProbeRou
 		used[table] = true
 		mark := fmt.Sprintf("0x%x/%s", s.ProbeMark(p.Tunnel), mask)
 		for _, v6 := range fams {
-			want[v6] = append(want[v6], rule{pref: netfilter.ProbePrefBase + idx, spec: []string{"fwmark", mark}, table: table})
+			want[v6] = append(want[v6], rule{pref: netfilter.ProbePref(idx, len(config.TunnelNames)), spec: []string{"fwmark", mark}, table: table})
 			iface := ""
 			if p.Up {
 				iface = p.Iface
@@ -106,7 +106,7 @@ func (m Manager) Sync(s config.Settings, routes []PolicyRoute, probes []ProbeRou
 			errs = append(errs, err.Error())
 		}
 	}
-	for t := netfilter.PolicyTableBase; t <= netfilter.ProbeTableBase+len(config.TunnelNames); t++ {
+	for t := netfilter.PolicyTableBase; t <= netfilter.ProbeTableBase+config.MaxTunnels; t++ {
 		if used[t] {
 			continue
 		}
@@ -238,7 +238,7 @@ func (m Manager) Teardown(ipv6 bool) {
 	}
 	for _, v6 := range fams {
 		m.deleteRules(v6)
-		for t := netfilter.PolicyTableBase; t <= netfilter.ProbeTableBase+len(config.TunnelNames); t++ {
+		for t := netfilter.PolicyTableBase; t <= netfilter.ProbeTableBase+config.MaxTunnels; t++ {
 			_, _ = m.ip(v6, "route", "flush", "table", strconv.Itoa(t))
 		}
 	}

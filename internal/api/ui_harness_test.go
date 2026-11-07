@@ -25,6 +25,8 @@ func TestUIHarness(t *testing.T) {
 	var c config.Config
 	_ = json.Unmarshal(b, &c)
 	c.ApplyDefaults()
+	// snake's own WireGuard tunnel (dummy keys).
+	c.WireGuard = []config.WireGuard{{ID: "wgx1", Name: "Tokyo", Enabled: true, Conf: "[Interface]\nPrivateKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nAddress = 10.64.1.2/32\nDNS = 10.64.0.1\n\n[Peer]\nPublicKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=\nEndpoint = jp-tyo.example.net:51820\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n"}}
 	c.Normalize()
 	_ = config.Save(filepath.Join(dir, "config.json"), &c)
 	rec := &system.Recorder{Responses: map[string]string{"nvram get wan0_ipaddr": "198.51.100.20",
@@ -44,6 +46,7 @@ func TestUIHarness(t *testing.T) {
 	}
 	e.DetectCaps()
 	e.Monitor().Set(health.Status{Tunnel: "wgc1", Iface: "wgc1", Exists: true, Up: true, LinkOK: true, ProbeOK: true, Healthy: true, ExitIP: "203.0.113.9", Country: "US", ProbeRTT: "38ms", Handshake: time.Now().Add(-40 * time.Second), GeoChecked: time.Now()})
+	e.Monitor().Set(health.Status{Tunnel: "wgx1", Iface: "wgx1", Exists: true, Up: true, LinkOK: true, ProbeOK: true, Healthy: true, ExitIP: "198.51.100.61", Country: "JP", ProbeRTT: "121ms", Handshake: time.Now().Add(-70 * time.Second), GeoChecked: time.Now()})
 	e.Monitor().Set(health.Status{Tunnel: "ovpnc2", Iface: "tun12", Exists: true, Reason: "interface down"})
 	e.Monitor().Set(health.Status{Tunnel: "wgc2", Iface: "wgc2", Exists: true, Up: true, LinkOK: true, ProbeOK: true, Healthy: true, ExitIP: "192.0.2.44", Country: "GB"})
 	e.Decide()
