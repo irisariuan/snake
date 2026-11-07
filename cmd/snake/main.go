@@ -54,6 +54,9 @@ Usage: snake <command> [args]
   status                  show tunnels and policies
   update [--check] [--yes] [--force]
                           install the latest GitHub release (restarts the daemon)
+  update --list           list published releases
+  update --version V [--yes]
+                          install release V, older or newer (restarts the daemon)
   rollback [--yes]        go back to the version before the last update
   apply [--dry-run]       re-apply rules (dry run prints the generated commands)
   reload                  reload config.json from disk and apply

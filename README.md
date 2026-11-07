@@ -64,8 +64,9 @@ created an Addons menu, the page is under **Tools → snake**.
 
 **Settings → Updates** in the web UI shows the running version and the latest
 [GitHub release](https://github.com/irisariuan/snake/releases), with
-**Install** and **Roll back** buttons. Over SSH: `snake update [--check]` and
-`snake rollback`.
+**Install**, **Roll back** and **Install another version…** buttons. Over
+SSH: `snake update [--check]`, `snake update --list`,
+`snake update --version <version>` and `snake rollback`.
 
 * The daemon checks for a new release a few minutes after it starts and then
   twice a day. Turn on **Install updates automatically** to install new
@@ -78,6 +79,18 @@ created an Addons menu, the page is under **Tools → snake**.
   syslog.
 * **Roll back** swaps the current and previous binaries, so rolling back twice
   returns you to where you started. Your configuration is not changed.
+* **Install another version…** lists every published release (newest
+  first, with the running version and the rollback copy marked) and installs
+  the one you pick, older or newer: for going back further than the one
+  version **Roll back** keeps. It is verified and checked like an update, the
+  running version becomes the rollback copy, and if the chosen version does
+  not start snake rolls back by itself. Over SSH: `snake update --list` and
+  `snake update --version v1.2.3`.
+* An older version ignores settings it does not know, and refuses a
+  configuration that uses features it lacks (it then fails to start and
+  snake rolls back). Going back to an older version, with either button,
+  turns **Install updates automatically** off; otherwise the next check
+  would install the latest release again.
 * Development builds (not a release tag) are never auto-updated. You can still
   install the latest release by hand.
 * To use releases from a fork, change **Release repository**.

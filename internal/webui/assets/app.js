@@ -1038,6 +1038,50 @@
       .catch(function (e) { toast(e.message); })
       .then(function () { state.updBusy = ''; render(); });
   }
+  // Install a chosen release: any published version, older or newer.
+  function loadReleases() {
+    state.rels = { loading: true }; render();
+    api('GET', '/api/update/releases').then(function (r) {
+      state.rels = { list: r || [] };
+      var pick = (r || []).filter(function (x) { return x.installable && !x.running; })[0];
+      state.relPick = pick ? pick.version : '';
+    }).catch(function (e) { state.rels = { error: e.message }; })
+      .then(function () { if (state.tab === 'settings') render(); });
+  }
+  function viewVersions(u, busy) {
+    var box = el('div', { style: 'margin:10px 0' });
+    var r = state.rels;
+    if (!r) {
+      box.appendChild(el('div', { class: 'row' }, btn('Install another version…', loadReleases),
+        el('span', { class: 'muted small' }, 'Pick any published release, for example to go back further than the one version kept for "Roll back".')));
+      return box;
+    }
+    box.appendChild(el('b', { class: 'small' }, 'Install another version'));
+    if (r.loading) { box.appendChild(el('p', { class: 'muted small' }, 'Loading releases…')); return box; }
+    if (r.error) { box.appendChild(el('div', { class: 'small', style: 'color:var(--warn)' }, r.error, ' ', btn('Retry', loadReleases))); return box; }
+    if (!r.list.length) { box.appendChild(el('p', { class: 'muted small' }, 'No releases published.')); return box; }
+    function label(x) {
+      var tags = [];
+      if (x.running) tags.push('running');
+      if (x.previous) tags.push('kept for rollback');
+      if (x.prerelease) tags.push('pre-release');
+      if (!x.installable) tags.push('no binary for this router');
+      return x.version + (x.published ? '  ·  ' + new Date(x.published).toLocaleDateString() : '') + (tags.length ? '  (' + tags.join(', ') + ')' : '');
+    }
+    var sel = el('select', { onchange: function (e) { state.relPick = e.target.value; render(); } },
+      r.list.map(function (x) { return el('option', { value: x.version, selected: x.version === state.relPick, disabled: !x.installable || x.running }, label(x)); }));
+    var pick = r.list.filter(function (x) { return x.version === state.relPick; })[0];
+    box.appendChild(el('div', { class: 'row', style: 'margin:6px 0' }, sel,
+      el('button', { type: 'button', class: 'btn ' + (pick && pick.older ? 'danger' : 'pri'), disabled: busy || !pick, onclick: function () {
+        var q = 'Install snake ' + pick.version + ' and restart the daemon?\n\nThe running version (' + u.current + ') is kept for "Roll back"; if ' + pick.version + ' does not start, snake rolls back by itself.';
+        if (pick.older) q += '\n\n' + pick.version + ' is older than ' + u.current + ': it ignores settings it does not know, and refuses a configuration that uses features it lacks (then snake rolls back).' +
+          (state.cfg.settings.auto_update ? ' Automatic updates are turned off, or the next check would install the latest release again.' : '');
+        updAction('/api/update?version=' + encodeURIComponent(pick.version), 'Installed', q);
+      } }, pick && pick.older ? 'Downgrade to ' + pick.version : 'Install ' + (pick ? pick.version : '')),
+      btn('Refresh', loadReleases)));
+    if (pick && pick.notes) box.appendChild(el('details', null, el('summary', { class: 'small' }, 'Release notes for ' + pick.version), el('pre', null, pick.notes)));
+    return box;
+  }
   function viewUpdates(bool, txt) {
     var u = state.upd;
     if (!u && !state.updLoading) loadUpdate(false);
@@ -1063,6 +1107,7 @@
       } }, 'Roll back to ' + u.previous) : null,
       state.updBusy ? el('span', { class: 'muted small' }, state.updBusy.replace(/ to$/, '') + '…') : null));
     if (u.available && u.notes) card.appendChild(el('details', null, el('summary', { class: 'small' }, 'Release notes'), el('pre', null, u.notes)));
+    card.appendChild(viewVersions(u, busy));
     card.appendChild(bool('auto_update', 'Install updates automatically', 'Checked twice a day. The daemon restarts after an update and rolls back by itself if the new version does not start.'));
     card.appendChild(txt('update_repo', 'Release repository (GitHub owner/name)'));
     return card;

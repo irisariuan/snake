@@ -15,10 +15,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -136,35 +138,91 @@ func (u *Updater) Check(ctx context.Context) (Info, error) {
 }
 
 func (u *Updater) latest(ctx context.Context) (*release, error) {
-	base := u.APIBase
-	if base == "" {
-		base = "https://api.github.com"
-	}
-	req, err := http.NewRequestWithContext(ctx, "GET", base+"/repos/"+u.repo()+"/releases/latest", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "snake-updater")
-	resp, err := u.client().Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("check for updates: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("no releases published in %s", u.repo())
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("check for updates: GitHub returned %s", resp.Status)
-	}
 	var rel release
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&rel); err != nil {
+	if err := u.get(ctx, "/releases/latest", &rel, "no releases published in "+u.repo()); err != nil {
 		return nil, fmt.Errorf("check for updates: %w", err)
 	}
 	if rel.TagName == "" {
 		return nil, errors.New("check for updates: release has no tag")
 	}
 	return &rel, nil
+}
+
+// get fetches a GitHub API document of the release repository.
+func (u *Updater) get(ctx context.Context, path string, v any, notFound string) error {
+	base := u.APIBase
+	if base == "" {
+		base = "https://api.github.com"
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", base+"/repos/"+u.repo()+path, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "snake-updater")
+	resp, err := u.client().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return errors.New(notFound)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GitHub returned %s", resp.Status)
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(v)
+}
+
+// Release is a published version that can be installed.
+type Release struct {
+	Version    string    `json:"version"`
+	Published  time.Time `json:"published,omitempty"`
+	Prerelease bool      `json:"prerelease,omitempty"`
+	Notes      string    `json:"notes,omitempty"`
+	URL        string    `json:"url,omitempty"`
+	// Installable: the release has a binary for this router's CPU and a
+	// checksum file (very old or broken releases may not).
+	Installable bool `json:"installable"`
+	Running     bool `json:"running,omitempty"`  // the version running now
+	Previous    bool `json:"previous,omitempty"` // the rollback copy
+	Older       bool `json:"older,omitempty"`    // older than the running version
+}
+
+// Releases lists the published releases, newest first (drafts excluded).
+func (u *Updater) Releases(ctx context.Context) ([]Release, error) {
+	var rels []release
+	if err := u.get(ctx, "/releases?per_page=100", &rels, "repository "+u.repo()+" not found"); err != nil {
+		return nil, fmt.Errorf("list releases: %w", err)
+	}
+	prev := u.PreviousVersion()
+	var out []Release
+	for _, r := range rels {
+		if r.Draft || r.TagName == "" {
+			continue
+		}
+		bin, sums := r.assets()
+		out = append(out, Release{Version: r.TagName, Published: r.PublishedAt, Prerelease: r.Prerelease, Notes: r.Body, URL: r.HTMLURL,
+			Installable: bin != "" && sums != "", Running: sameVersion(r.TagName, u.Current), Previous: prev != "" && sameVersion(r.TagName, prev),
+			Older: Newer(u.Current, r.TagName)})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return Newer(out[i].Version, out[j].Version) })
+	return out, nil
+}
+
+func sameVersion(a, b string) bool { return strings.TrimPrefix(a, "v") == strings.TrimPrefix(b, "v") }
+
+// assets returns the download URLs of this CPU's binary and the checksums.
+func (r *release) assets() (bin, sums string) {
+	for _, a := range r.Assets {
+		switch a.Name {
+		case Asset():
+			bin = a.URL
+		case SumsAsset:
+			sums = a.URL
+		}
+	}
+	return bin, sums
 }
 
 func (u *Updater) setBusy(b bool) bool {
@@ -194,15 +252,38 @@ func (u *Updater) Install(ctx context.Context) (string, error) {
 	u.imu.Lock()
 	rel := u.rel
 	u.imu.Unlock()
-	var binURL, sumsURL string
-	for _, a := range rel.Assets {
-		switch a.Name {
-		case Asset():
-			binURL = a.URL
-		case SumsAsset:
-			sumsURL = a.URL
-		}
+	return u.installRelease(ctx, rel)
+}
+
+// InstallVersion installs a chosen release, older or newer than the
+// running one, like Install: verified, and the current binary is kept as
+// the rollback copy.
+func (u *Updater) InstallVersion(ctx context.Context, version string) (string, error) {
+	if _, ok := parseVersion(version); !ok {
+		return "", fmt.Errorf("%q is not a release version (vX.Y.Z)", version)
 	}
+	if !u.setBusy(true) {
+		return "", errors.New("an update is already in progress")
+	}
+	defer u.setBusy(false)
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	var rel release
+	tag := version
+	if !strings.HasPrefix(tag, "v") {
+		tag = "v" + tag
+	}
+	if err := u.get(ctx, "/releases/tags/"+url.PathEscape(tag), &rel, "release "+tag+" not found in "+u.repo()); err != nil {
+		return "", err
+	}
+	if rel.Draft {
+		return "", fmt.Errorf("release %s is a draft", tag)
+	}
+	return u.installRelease(ctx, &rel)
+}
+
+func (u *Updater) installRelease(ctx context.Context, rel *release) (string, error) {
+	binURL, sumsURL := rel.assets()
 	if binURL == "" {
 		return "", fmt.Errorf("release %s has no %s asset", rel.TagName, Asset())
 	}

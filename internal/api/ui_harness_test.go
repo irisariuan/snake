@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -83,6 +84,18 @@ func TestUIHarness(t *testing.T) {
 	gh.HandleFunc("/repos/irisariuan/snake/releases/latest", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"tag_name": "v1.1.0", "html_url": "https://github.com/irisariuan/snake/releases/tag/v1.1.0",
 			"body": "## What's changed\n* Emergency disable switch\n* Self-update and rollback", "published_at": time.Now().Add(-26 * time.Hour)})
+	})
+	gh.HandleFunc("/repos/irisariuan/snake/releases", func(w http.ResponseWriter, r *http.Request) {
+		var rels []map[string]any
+		for i, v := range []string{"v1.1.0", "v1.0.0", "v0.9.0", "v0.8.0-rc1", "v0.7.0"} {
+			rel := map[string]any{"tag_name": v, "html_url": "https://github.com/irisariuan/snake/releases/tag/" + v, "body": "Changes in " + v,
+				"published_at": time.Now().Add(-time.Duration(i*20+1) * 24 * time.Hour), "prerelease": strings.Contains(v, "-rc")}
+			if v != "v0.7.0" { // too old: no binary for this CPU
+				rel["assets"] = []map[string]string{{"name": update.Asset(), "browser_download_url": "x"}, {"name": update.SumsAsset, "browser_download_url": "x"}}
+			}
+			rels = append(rels, rel)
+		}
+		_ = json.NewEncoder(w).Encode(rels)
 	})
 	ghl, _ := net.Listen("tcp", "127.0.0.1:0")
 	go func() { _ = http.Serve(ghl, gh) }()
