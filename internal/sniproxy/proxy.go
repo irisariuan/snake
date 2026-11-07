@@ -70,7 +70,13 @@ type Policy struct {
 	// Session starts a session for a connection matching a session: rule:
 	// its destination is routed for that client only, not learned into
 	// Set4/Set6. nil: session: rules are treated as plain rules.
-	Session func(client, dst netip.Addr, rule, name string) error
+	Session func(client, dst netip.Addr, rule, name string, opts match.Opts) error
+	// Route handles connections matching a route: rule's expression: a
+	// session for the client if the rule's if: condition holds for it
+	// (reported; otherwise the connection is not routed by this policy).
+	Route func(client, dst netip.Addr, rule, name string, opts match.Opts) (bool, error)
+	// Cond receives destinations of connections matching if: atoms.
+	Cond func(dst netip.Addr, hits []match.CondHit)
 	// ECH is what happens to the policy's clients' Encrypted Client Hello
 	// connections: ECHDrop, ECHRelay ("" = relay) or ECHPassthrough.
 	ECH string
@@ -463,6 +469,28 @@ func (p *Proxy) handle(c *net.TCPConn) {
 	} else {
 		pol, res, ok = p.match(hello.ServerName, client)
 	}
+	// Destinations of route: rules' if: atoms count for their conditions.
+	if hello.ServerName != "" {
+		for _, ap := range p.applicable(client) {
+			if ap.Cond != nil && ap.Set.HasConds() {
+				if hits := ap.Set.CondHits(hello.ServerName); len(hits) > 0 {
+					ap.Cond(dst.Addr(), hits)
+				}
+			}
+		}
+	}
+	if ok && res.Route {
+		routed := false
+		if pol.Route != nil {
+			var err error
+			if routed, err = pol.Route(client, dst.Addr(), res.Rule, hello.ServerName, res.Opts); err != nil {
+				logx.Warnf("sni proxy: route for %s -> %s (%s): %v", client, dst, hello.ServerName, err)
+			}
+		}
+		if !routed {
+			ok = false // condition false: not routed by this policy
+		}
+	}
 	switch {
 	case hello.ServerName == "":
 		p.noSNI.Add(1)
@@ -481,8 +509,10 @@ func (p *Proxy) handle(c *net.TCPConn) {
 		}
 		p.byPol[pol.ID]++
 		p.statMu.Unlock()
-		if res.Session && pol.Session != nil {
-			if err := pol.Session(client, dst.Addr(), res.Rule, hello.ServerName); err != nil {
+		if res.Route {
+			// Session started by Route above.
+		} else if res.Session && pol.Session != nil {
+			if err := pol.Session(client, dst.Addr(), res.Rule, hello.ServerName, res.Opts); err != nil {
 				logx.Warnf("sni proxy: session for %s -> %s (%s): %v", client, dst, hello.ServerName, err)
 			}
 		} else {

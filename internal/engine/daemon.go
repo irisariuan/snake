@@ -475,9 +475,23 @@ func (e *Engine) TestDomain(name string) DomainTest {
 		if !dnsOn && (mr.Name != name || e.domainSet(p).NeedsInspector()) {
 			res.Notes = append(res.Notes, "this match needs the DNS inspector, which is not running (kernel without NFQUEUE?)")
 		}
-		if mr.Session {
+		if mr.Route {
+			res.Notes = append(res.Notes, "route: rule: a device's lookup of this name starts sessions for it only while its if: condition holds for that device (a live connection to an address of the if: names); the addresses are not added to the policy's sets")
+		}
+		if len(mr.Cond) > 0 {
+			res.Notes = append(res.Notes, "matches the if: part of a route: rule: routed for every device, and connections to these addresses make that rule's condition hold for the device")
+		}
+		if mr.Session || mr.Route {
 			ttl := e.sessionTTL()
-			res.Notes = append(res.Notes, fmt.Sprintf("session: rule: these addresses are routed only for the device that looked the name up, until %s after its last connection to them; they are not added to the policy's sets", ttl))
+			if mr.Opts.TTL > 0 {
+				ttl = mr.Opts.TTL
+			}
+			if mr.Opts.OnLookup {
+				res.Notes = append(res.Notes, fmt.Sprintf("sessions last %s from the lookup (onlookup=1)", ttl))
+			}
+			if mr.Session {
+				res.Notes = append(res.Notes, fmt.Sprintf("session: rule: these addresses are routed only for the device that looked the name up, until %s after its last connection to them; they are not added to the policy's sets", ttl))
+			}
 			if n := len(e.Sessions(p.ID)); n > 0 {
 				res.Notes = append(res.Notes, fmt.Sprintf("the policy has %d active session(s) (Learnings → Policy addresses, kind session)", n))
 			}

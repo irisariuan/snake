@@ -529,7 +529,7 @@ func TestProxySessionRule(t *testing.T) {
 	var mu sync.Mutex
 	var got []string
 	pol := Policy{ID: 1, Name: "p", Set: match.MustCompile([]string{"netflix.com", "session:**.akamaized.net"}), Mark: 0x10000, Set4: "SNK_1_d4",
-		Session: func(client, dst netip.Addr, rule, name string) error {
+		Session: func(client, dst netip.Addr, rule, name string, _ match.Opts) error {
 			mu.Lock()
 			defer mu.Unlock()
 			got = append(got, client.String()+" "+dst.String()+" "+rule+" "+name)

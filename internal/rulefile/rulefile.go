@@ -72,10 +72,19 @@ func Parse(text string, convert bool) Result {
 	r.File.CIDRs = []string{}
 	seenASN := map[int]bool{}
 	text = strings.TrimPrefix(text, "\uFEFF")
-	for i, raw := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
-		n := i + 1
+	// Multi-line route: rules are one entry (their lines joined with "\n").
+	for _, lg := range match.Group(strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")) {
+		n, raw := lg.First+1, lg.Text
 		line := strings.TrimSpace(raw)
 		if line == "" {
+			continue
+		}
+		if match.IsRoute(line) {
+			if _, err := match.ParseRoute(line); err != nil {
+				r.Errors = append(r.Errors, Issue{Line: n, Text: raw, Message: err.Error()})
+				continue
+			}
+			r.File.Domains = append(r.File.Domains, match.Normalize(line))
 			continue
 		}
 		issue := func(msg string) Issue { return Issue{Line: n, Text: raw, Message: msg} }

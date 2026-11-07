@@ -2,6 +2,7 @@ package match
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 )
 
@@ -39,11 +40,11 @@ func TestIndexMatchesLinear(t *testing.T) {
 	s := MustCompile(rules)
 	// every name alone, and as chains
 	for _, a := range names {
-		if got, want := s.MatchAny(a), linear(s, a); got != want {
+		if got, want := s.MatchAny(a), linear(s, a); !reflect.DeepEqual(got, want) {
 			t.Errorf("%q: got %+v want %+v", a, got, want)
 		}
 		for _, b := range names[:6] {
-			if got, want := s.MatchAny(a, b), linear(s, a, b); got != want {
+			if got, want := s.MatchAny(a, b), linear(s, a, b); !reflect.DeepEqual(got, want) {
 				t.Errorf("%q,%q: got %+v want %+v", a, b, got, want)
 			}
 		}
@@ -53,7 +54,7 @@ func TestIndexMatchesLinear(t *testing.T) {
 		rot := append(append([]string{}, rules[i:]...), rules[:i]...)
 		r := MustCompile(rot)
 		for _, n := range names {
-			if got, want := r.MatchAny(n), linear(r, n); got != want {
+			if got, want := r.MatchAny(n), linear(r, n); !reflect.DeepEqual(got, want) {
 				t.Errorf("rotation %d %q: got %+v want %+v", i, n, got, want)
 			}
 		}

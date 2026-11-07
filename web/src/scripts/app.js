@@ -389,6 +389,9 @@ var SYNTAX = [
   ['drop:rule', 'block: connections to what any domain rule after drop: matches are rejected; beats include rules'],
   ['drop:asn:1234 / drop:cidr:1.2.3.0/24', 'block an autonomous system or address range'],
   ['session:rule', 'device session: what any domain rule after session: matches is routed only for the device that looked it up, until the session TTL after its last connection; not added to the policy\'s sets. Beats include rules; drop: and ! beat it'],
+  ['session[ttl=10m;onlookup=1]:rule', 'options: ttl (seconds or 90s, 10m, 1h) overrides the session TTL; onlookup=1 counts it from the lookup (lookups renew it, connections do not)'],
+  ['route:EXPR;if:EXPR', 'conditional sessions: if: names are routed for everyone; a device\'s lookup of a route: name starts sessions for it only while it has a live connection to an address of the if: names. Options as for session: route[ttl=…]:'],
+  ['not:X  and:(X, Y)  or:(X, Y)  (X, Y)', 'expressions in route: and if: (nestable; (X, Y) means and:); a rule may span lines: after a line ending in ;, before one starting with ;, and inside open ( )'],
   ['asn:2906', 'autonomous system (all its announced prefixes)'],
   ['cidr:23.246.0.0/18', 'address range or single IP (ip: also works)'],
   ['@name / @description / @source', 'list metadata (rule lists)'],
@@ -413,7 +416,17 @@ function hlLine(line) {
   }
   var out = esc(lead);
   if (t[0] === '!') { out += span('neg', '!'); t = t.slice(1); }
-  if ((m = /^(session:)(.*)$/i.exec(t))) { out += span('sess', m[1]); t = m[2]; }
+  if (/(^|[\s(,;])(route(\[[^\]]*\])?:|if:|and:|or:|not:)/i.test(t) || /^[();,]/.test(t)) {
+    // route: rules and their continuation lines: keywords and punctuation.
+    var rc = splitComment(t);
+    return out + rc[0].split(/(route(?:\[[^\]]*\])?:|if:|and:|or:|not:|[(),;])/i).map(function (part) {
+      if (!part) return '';
+      if (/^(route(\[[^\]]*\])?:|if:|and:|or:|not:)$/i.test(part)) return span('sess', part);
+      if (/^[(),;]$/.test(part)) return span('op', part);
+      return /^\s*\//.test(part) ? span('re', part) : span('dom', part);
+    }).join('') + span('com', rc[1]);
+  }
+  if ((m = /^(session(?:\[[^\]]*\])?:)(.*)$/i.exec(t))) { out += span('sess', m[1]); t = m[2]; }
   if ((m = /^(drop:)(.*)$/i.exec(t))) {
     out += span('drop', m[1]); t = m[2];
     if ((m = /^(asn:|cidr:|ip:)(.*)$/i.exec(t))) { var dc = splitComment(m[2]); return out + span('kw', m[1]) + span('num', dc[0]) + span('com', dc[1]); }

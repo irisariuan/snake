@@ -761,7 +761,7 @@ func (c *Config) Normalize() {
 			used[next] = true
 		}
 		p.Name = strings.TrimSpace(p.Name)
-		p.Domains = dedupKeepComments(mapStr(p.Domains, normalizeRule))
+		p.Domains = dedupKeepComments(mapStr(match.Lines(p.Domains), normalizeRule))
 		p.CIDRs = dedup(mapStr(p.CIDRs, strings.TrimSpace))
 		p.Devices = dedup(mapStr(p.Devices, normalizeDevice))
 		p.ExcludeDevices = dedup(mapStr(p.ExcludeDevices, normalizeDevice))
@@ -798,7 +798,7 @@ func (c *Config) Normalize() {
 	for i := range c.RuleLists {
 		l := &c.RuleLists[i]
 		l.Name = strings.TrimSpace(l.Name)
-		l.Domains = dedupKeepComments(mapStr(l.Domains, normalizeRule))
+		l.Domains = dedupKeepComments(mapStr(match.Lines(l.Domains), normalizeRule))
 		l.CIDRs = dedup(mapStr(l.CIDRs, strings.TrimSpace))
 		sort.Ints(l.ASNs)
 		l.ASNs = dedupInt(l.ASNs)
@@ -1120,7 +1120,8 @@ func (p Policy) HasDomains() bool {
 // HasSessions reports whether the policy has session: rules.
 func (p Policy) HasSessions() bool {
 	for _, d := range p.Domains {
-		if r := match.StripComment(d); len(r) >= len(match.SessionPrefix) && strings.EqualFold(r[:len(match.SessionPrefix)], match.SessionPrefix) {
+		r := match.StripComment(d)
+		if match.IsRoute(d) || (len(r) >= len("session") && strings.EqualFold(r[:len("session")], "session") && len(r) > 7 && (r[7] == ':' || r[7] == '[')) {
 			return true
 		}
 	}

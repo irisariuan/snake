@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/irisariuan/snake/internal/config"
+	"github.com/irisariuan/snake/internal/match"
 	"github.com/irisariuan/snake/internal/system"
 )
 
@@ -50,7 +51,7 @@ func TestSessions(t *testing.T) {
 		t.Fatalf("no session chain jump:\n%s", rec.Joined())
 	}
 	rec.Commands = nil
-	if err := e.AddSessions(1, "192.168.50.23", []string{"203.0.113.80", "2001:db8::1"}, SessionRule, "session:**.akamaized.net", "a1.akamaized.net"); err != nil {
+	if err := e.AddSessions(1, "192.168.50.23", []string{"203.0.113.80", "2001:db8::1"}, SessionRule, "session:**.akamaized.net", "a1.akamaized.net", match.Opts{}); err != nil {
 		t.Fatal(err)
 	}
 	w := chainWrites(rec)
@@ -59,7 +60,7 @@ func TestSessions(t *testing.T) {
 	}
 	// Known pair: no rewrite.
 	rec.Commands = nil
-	_ = e.AddSessions(1, "192.168.50.23", []string{"203.0.113.80"}, SessionRule, "", "")
+	_ = e.AddSessions(1, "192.168.50.23", []string{"203.0.113.80"}, SessionRule, "", "", match.Opts{})
 	if len(chainWrites(rec)) != 0 {
 		t.Fatal("rewrote the chain for a known session")
 	}
@@ -80,7 +81,7 @@ func TestSessions(t *testing.T) {
 		t.Fatalf("expired session not removed from the chain: %q", w)
 	}
 	// A policy without session rules loses its sessions at the next apply.
-	_ = e.AddSessions(1, "192.168.50.23", []string{"203.0.113.81"}, SessionRule, "", "")
+	_ = e.AddSessions(1, "192.168.50.23", []string{"203.0.113.81"}, SessionRule, "", "", match.Opts{})
 	if _, err := e.UpdateConfig(func(c *config.Config) error { c.Policies[0].Domains = []string{"example.com"}; return nil }); err != nil {
 		t.Fatal(err)
 	}

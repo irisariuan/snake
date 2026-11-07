@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/irisariuan/snake/internal/config"
+	"github.com/irisariuan/snake/internal/match"
 )
 
 // TestIntegrationExcludedDevice: with real packets, an excluded device is
@@ -87,7 +88,7 @@ while True:
 		t.Fatal("no session yet: both devices should reach the server over WAN")
 	}
 	// What the DNS inspector does when device A looks up a session name.
-	if err := e.AddSessions(1, "192.168.77.2", []string{"203.0.113.80"}, SessionRule, "session:**.example.net", "cdn.example.net"); err != nil {
+	if err := e.AddSessions(1, "192.168.77.2", []string{"203.0.113.80"}, SessionRule, "session:**.example.net", "cdn.example.net", match.Opts{}); err != nil {
 		t.Fatal(err)
 	}
 	if get("snakea", "203.0.113.80") {

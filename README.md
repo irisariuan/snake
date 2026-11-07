@@ -227,6 +227,8 @@ One rule per line:
 | `drop:ads.example.com` | **block**: any domain rule after `drop:` (`drop:**.tracker.net`, `drop:~adserver`, `drop:/re/`) |
 | `drop:asn:1234`, `drop:cidr:198.51.100.0/24` | **block** an autonomous system or an address range / single IP (`drop:ip:` also works) |
 | `session:**.akamaized.net` | **device session**: any domain rule after `session:`; its answers are routed only for the device that looked the name up ([below](#device-sessions)) |
+| `session[ttl=10m;onlookup=1]:x.example` | session with [options](#session-options) |
+| `route:**.akamaized.net;if:netflix.com` | **conditional sessions** ([below](#conditional-rules-route-if)) |
 | `com` | rejected: a bare top-level domain would route everything (`**.com` if you really mean it) |
 | `# comment` | ignored; a trailing ` # comment` is allowed too (except in regexes) |
 
@@ -561,6 +563,71 @@ renews it. After it ends, the device's next lookup starts a new one.
   be ended. **Flush learned** ends a policy's sessions.
 * Each policy has a session chain `SNAKE_Q<id>` with one rule per device +
   address (at most 4096 per policy), rewritten as sessions start and end.
+
+### Session options
+
+`CMD[SETTING=VALUE;SETTING=VALUE;...]:` sets options on `session:` and
+`route:` rules:
+
+| Option | Meaning |
+|---|---|
+| `ttl=TIME` | this rule's session lifetime instead of `session_ttl`: seconds, or `90s`, `10m`, `1h` (10 s to 7 days) |
+| `onlookup=0\|1` | `0` (default): the TTL counts from the device's last connection to the address. `1`: it counts from the lookup that started the session; a new lookup renews it, open connections do not |
+
+```
+session[ttl=2m;onlookup=1]:**.example.org
+route[ttl=30m]:**.akamaized.net;if:netflix.com
+```
+
+### Conditional rules (`route:`, `if:`)
+
+```
+route:EXPR;if:EXPR
+```
+
+* Names matching the **`if:`** part are routed like plain rules, for every
+  device, and snake remembers which addresses they resolved to.
+* When a device looks up a name the **`route:`** part matches, the
+  condition is evaluated **for that device, at that moment**: an `if:` name
+  counts when the device has a **live connection** to one of its addresses
+  (from the kernel's connection table). If the condition holds, the answer
+  starts [sessions](#device-sessions) for that device; otherwise this rule
+  does not route it.
+* Without `;if:...`, `route:` always starts sessions: `session:` with
+  expressions.
+
+Expressions combine domain rules (`example.com`, `.sub`, `=exact`, globs,
+`~keyword`, `/regex/`) with modifiers, nested freely:
+
+| Modifier | Meaning |
+|---|---|
+| `not:X` | X does not hold |
+| `and:(X, Y, ...)` | all hold |
+| `or:(X, Y, ...)` | any holds |
+| `(X, Y, ...)` | same as `and:` (`(X)` just groups) |
+
+In `route:` an expression tests the looked-up name; in `if:` each domain
+rule stands for "the device has a live connection to an address of a name it
+matches". Only the non-negated `if:` rules are routed; negated ones are
+still watched. A rule may span lines: it continues after a line ending in
+`;`, before a line starting with `;`, and while parentheses are open.
+
+```
+# Akamai and Netflix video addresses, per device, while it is on Disney+ or Hulu
+route[ttl=5m]:(or:(**.akamaized.net, **.nflxvideo.net), not:=ads.akamaized.net,
+  and:(not:~ads, ~cdn));
+if:or:(disneyplus.com, and:(hulu.com, not:=help.hulu.com))
+```
+
+* Precedence within a policy: `!` exclusions, `drop:`, `session:`, `if:`
+  names, `route:` names, then plain rules.
+* The condition is checked when the `route:` name is looked up. If a page
+  looks it up at the same moment as the `if:` site, before any connection
+  to that site exists, that lookup is not routed; the next one after the
+  connection opened is.
+* Addresses count for an `if:` rule for 24 h after the last answer that gave
+  them. Conditional rules need the DNS inspector; the SNI proxy applies them
+  to connections by server name too.
 
 ## WebRTC
 

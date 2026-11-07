@@ -39,7 +39,14 @@ type Rules struct {
 	// Session starts sessions for answers matching session: rules: the
 	// addresses are routed for the device that asked only, not added to
 	// the sets. nil: session: rules are treated as plain rules.
-	Session func(client string, addrs []string, rule, name string) error
+	Session func(client string, addrs []string, rule, name string, opts match.Opts) error
+	// Route handles answers matching a route: rule's expression: sessions
+	// for the device if the rule's if: condition holds for it (reported).
+	// nil: route: rules are not routed.
+	Route func(client string, addrs []string, rule, name string, opts match.Opts) (bool, error)
+	// Cond receives the addresses of answers matching if: atoms (which are
+	// routed like plain rules too).
+	Cond func(addrs []string, hits []match.CondHit)
 }
 
 // Answer is the relevant content of a DNS response.
@@ -386,9 +393,35 @@ func (i *Inspector) handle(raw []byte) func() {
 	i.mu.Lock()
 	rules := i.rules
 	i.mu.Unlock()
+	// Addresses of route: rules' if: atoms count for their conditions,
+	// whatever routes the answer (negated atoms are not routed at all).
+	recordConds(rules, ans)
 	r, res, ok := Decide(rules, ans)
 	if !ok {
 		return nil
+	}
+	if res.Route {
+		// Sessions for the asking device if its condition holds; never the
+		// sets.
+		if r.Route == nil || pk.Dst.IsLoopback() {
+			return nil
+		}
+		client := pk.Dst.String()
+		addrs := make([]string, 0, len(ans.IPs))
+		for _, ip := range ans.IPs {
+			addrs = append(addrs, ip.String())
+		}
+		return func() {
+			ok, err := r.Route(client, addrs, res.Rule, ans.Question, res.Opts)
+			if err != nil {
+				atomic.AddUint64(&i.stats.Errors, 1)
+				logx.Warnf("dns inspector: route: %v", err)
+			}
+			if ok {
+				atomic.AddUint64(&i.stats.Matched, 1)
+				atomic.AddUint64(&i.stats.Sessions, 1)
+			}
+		}
 	}
 	if res.Session && r.Session != nil {
 		// Routed for the asking device only: no sets, no records. The
@@ -405,7 +438,7 @@ func (i *Inspector) handle(raw []byte) func() {
 		}
 		logx.Debugf("dns: %s matched %q -> session of %s in policy %s", ans.Question, res.Rule, client, r.Name)
 		return func() {
-			if err := r.Session(client, addrs, res.Rule, ans.Question); err != nil {
+			if err := r.Session(client, addrs, res.Rule, ans.Question, res.Opts); err != nil {
 				atomic.AddUint64(&i.stats.Errors, 1)
 				logx.Warnf("dns inspector: session: %v", err)
 			}
@@ -579,4 +612,29 @@ func Query(server, name string, timeout time.Duration) (Answer, error) {
 		return out, fmt.Errorf("no answer for %s", name)
 	}
 	return out, nil
+}
+
+// recordConds hands the answer's addresses to every policy whose route:
+// rules' if: atoms match its names.
+func recordConds(rules []Rules, ans Answer) {
+	var addrs []string
+	for _, r := range rules {
+		if r.Cond == nil || !r.Set.HasConds() {
+			continue
+		}
+		names := []string{ans.Question}
+		if r.FollowCNAME {
+			names = append(names, ans.Chain...)
+		}
+		hits := r.Set.CondHits(names...)
+		if len(hits) == 0 {
+			continue
+		}
+		if addrs == nil {
+			for _, ip := range ans.IPs {
+				addrs = append(addrs, ip.String())
+			}
+		}
+		r.Cond(addrs, hits)
+	}
 }

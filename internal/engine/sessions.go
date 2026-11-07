@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/irisariuan/snake/internal/logx"
+	"github.com/irisariuan/snake/internal/match"
 	"github.com/irisariuan/snake/internal/netfilter"
 	"github.com/irisariuan/snake/internal/webrtc"
 )
@@ -56,6 +57,17 @@ type Session struct {
 	Created time.Time `json:"created"`
 	Seen    time.Time `json:"seen"` // last lookup, connection or refresh
 	Expires time.Time `json:"expires"`
+	// TTL is the rule's ttl option (0: session_ttl); OnLookup counts it
+	// from the last lookup instead of the last connection.
+	TTL      time.Duration `json:"ttl,omitempty"`
+	OnLookup bool          `json:"onlookup,omitempty"`
+}
+
+func (se *Session) ttl(def time.Duration) time.Duration {
+	if se.TTL > 0 {
+		return se.TTL
+	}
+	return def
 }
 
 type sessionStore struct {
@@ -84,14 +96,18 @@ func (e *Engine) sessionTTL() time.Duration {
 // AddSessions starts (or renews) sessions of a policy for one device. New
 // pairs are installed before it returns, so the caller can release the
 // DNS answer or connection knowing the route is in place.
-func (e *Engine) AddSessions(policy int, client string, addrs []string, source, rule, name string) error {
+func (e *Engine) AddSessions(policy int, client string, addrs []string, source, rule, name string, opts match.Opts) error {
 	c := net.ParseIP(client)
 	if c == nil {
 		return fmt.Errorf("session: bad device address %q", client)
 	}
 	client = c.String()
 	now := time.Now()
-	exp := now.Add(e.sessionTTL())
+	ttl := e.sessionTTL()
+	if opts.TTL > 0 {
+		ttl = opts.TTL
+	}
+	exp := now.Add(ttl)
 	s := &e.sess
 	s.mu.Lock()
 	s.init()
@@ -103,16 +119,18 @@ func (e *Engine) AddSessions(policy int, client string, addrs []string, source, 
 		}
 		k := sessionKey{policy, client, ip.String()}
 		if se, ok := s.m[k]; ok {
+			// A lookup renews every session, onlookup or not.
 			se.Seen = now
-			if exp.After(se.Expires) {
+			if exp.After(se.Expires) || se.OnLookup {
 				se.Expires = exp
 			}
 			if rule != "" {
-				se.Rule, se.Name = rule, name
+				se.Rule, se.Name, se.TTL, se.OnLookup = rule, name, opts.TTL, opts.OnLookup
 			}
 			continue
 		}
-		s.m[k] = &Session{Policy: policy, Client: client, Addr: k.Addr, Source: source, Rule: rule, Name: name, Created: now, Seen: now, Expires: exp}
+		s.m[k] = &Session{Policy: policy, Client: client, Addr: k.Addr, Source: source, Rule: rule, Name: name, Created: now, Seen: now, Expires: exp,
+			TTL: opts.TTL, OnLookup: opts.OnLookup}
 		added = true
 	}
 	if added {
@@ -258,13 +276,13 @@ func (e *Engine) refreshSessions(conntrack io.Reader, now time.Time) {
 			}
 		}
 	}
-	exp := now.Add(e.sessionTTL())
+	def := e.sessionTTL()
 	changed := map[int]bool{}
 	s.mu.Lock()
 	for k, se := range s.m {
-		if live[[2]string{k.Client, k.Addr}] {
+		if live[[2]string{k.Client, k.Addr}] && !se.OnLookup {
 			se.Seen = now
-			if exp.After(se.Expires) {
+			if exp := now.Add(se.ttl(def)); exp.After(se.Expires) {
 				se.Expires = exp
 			}
 			continue
@@ -288,6 +306,7 @@ func (e *Engine) refreshSessions(conntrack io.Reader, now time.Time) {
 
 // refreshSessionsNow reads the kernel's connection table.
 func (e *Engine) refreshSessionsNow() {
+	e.pruneCond(time.Now())
 	f, err := os.Open("/proc/net/nf_conntrack")
 	if err != nil {
 		e.refreshSessions(nil, time.Now()) // still expire

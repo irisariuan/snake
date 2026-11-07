@@ -118,23 +118,26 @@ type Engine struct {
 	wg          *wireguard.Manager // snake's own WireGuard tunnels (wgx1...)
 	ovpn        *openvpn.Manager   // snake's own OpenVPN clients (ovx1...)
 	sess        sessionStore       // device sessions (session: rules, WebRTC peers)
-	sniErr      string             // why the SNI proxy is not running
-	asnCache    *asn.Cache
-	active      map[int]string
-	cands       map[int][]Candidate
-	events      []Event
-	plan        netfilter.Plan
-	lastApply   time.Time
-	lastError   string
-	asnErrors   map[int]string
-	netHashes   map[string]string
-	rtcKey      string
-	started     time.Time
-	applyCount  int
-	linkKey     string
-	kick        chan struct{}
-	daemon      bool
-	disabled    atomic.Bool // emergency disable: see disable.go
+	cond        condStore          // addresses of route: rules' if: atoms
+	// conntrackPath is the kernel's connection table (tests replace it).
+	conntrackPath string
+	sniErr        string // why the SNI proxy is not running
+	asnCache      *asn.Cache
+	active        map[int]string
+	cands         map[int][]Candidate
+	events        []Event
+	plan          netfilter.Plan
+	lastApply     time.Time
+	lastError     string
+	asnErrors     map[int]string
+	netHashes     map[string]string
+	rtcKey        string
+	started       time.Time
+	applyCount    int
+	linkKey       string
+	kick          chan struct{}
+	daemon        bool
+	disabled      atomic.Bool // emergency disable: see disable.go
 }
 
 // New creates an engine.
@@ -164,7 +167,7 @@ func New(p Paths, r system.Runner) *Engine {
 	e.rtc.OnServer = e.onServer
 	e.rtc.OnScan = e.onScan
 	e.rtc.OnPeer = func(policy int, client string, peers []string) error {
-		return e.AddSessions(policy, client, peers, SessionWebRTC, "", "")
+		return e.AddSessions(policy, client, peers, SessionWebRTC, "", "", match.Opts{})
 	}
 	return e
 }
@@ -806,8 +809,14 @@ func (e *Engine) sniPolicies(cfg *config.Config, states []netfilter.PolicyState,
 		}
 		if st.Sessions {
 			id := p.ID
-			sp.Session = func(client, dst netip.Addr, rule, name string) error {
-				return e.AddSessions(id, client.Unmap().String(), []string{dst.Unmap().String()}, SessionRule, rule, name)
+			sp.Session = func(client, dst netip.Addr, rule, name string, opts match.Opts) error {
+				return e.AddSessions(id, client.Unmap().String(), []string{dst.Unmap().String()}, SessionRule, rule, name, opts)
+			}
+			sp.Route = func(client, dst netip.Addr, rule, name string, opts match.Opts) (bool, error) {
+				return e.RouteSessions(id, client.Unmap().String(), []string{dst.Unmap().String()}, rule, name, opts)
+			}
+			sp.Cond = func(dst netip.Addr, hits []match.CondHit) {
+				e.recordCond(id, []string{dst.Unmap().String()}, hits)
 			}
 		}
 		sp.MACs, sp.Nets = splitClients(st.Clients)
@@ -913,9 +922,13 @@ func (e *Engine) dnsRules(states []netfilter.PolicyState, caps Caps) []dnsinspec
 		}
 		if st.Sessions {
 			id := p.ID
-			r.Session = func(client string, addrs []string, rule, name string) error {
-				return e.AddSessions(id, client, addrs, SessionRule, rule, name)
+			r.Session = func(client string, addrs []string, rule, name string, opts match.Opts) error {
+				return e.AddSessions(id, client, addrs, SessionRule, rule, name, opts)
 			}
+			r.Route = func(client string, addrs []string, rule, name string, opts match.Opts) (bool, error) {
+				return e.RouteSessions(id, client, addrs, rule, name, opts)
+			}
+			r.Cond = func(addrs []string, hits []match.CondHit) { e.recordCond(id, addrs, hits) }
 		}
 		out = append(out, r)
 	}

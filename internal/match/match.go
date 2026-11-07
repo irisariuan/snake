@@ -21,7 +21,8 @@
 //	                     device that looked it up (any domain rule after
 //	                     session:); the addresses are not added to the
 //	                     policy's sets. Beats include rules; drop: and !
-//	                     beat it
+//	                     beat it. Options: session[ttl=10m;onlookup=1]:
+//	route:EXPR;if:EXPR   conditional sessions, see route.go
 //
 // Names are compared lowercase without the trailing dot. With CNAME following
 // (the default) a rule also matches when any name in the answer's CNAME chain
@@ -67,6 +68,7 @@ type Pattern struct {
 	Negate  bool   `json:"negate"`
 	Drop    bool   `json:"drop,omitempty"`
 	Session bool   `json:"session,omitempty"`
+	Opts    Opts   `json:"opts,omitempty"` // session[...] options
 	Value   string `json:"value"`
 	// Base is a literal domain suffix every match must end with ("" if none
 	// can be derived). It steers DNS resolution through the tunnel and is
@@ -107,6 +109,9 @@ func StripComment(s string) string {
 // Normalize canonicalises a rule's text (lowercase, scheme/path stripped for
 // plain domains). Regexes are left as written.
 func Normalize(s string) string {
+	if IsRoute(s) {
+		return normalizeRoute(s)
+	}
 	s = StripComment(s)
 	if s == "" {
 		return ""
@@ -129,8 +134,15 @@ func Normalize(s string) string {
 		}
 		return neg + DropPrefix + Normalize(inner)
 	}
-	if len(s) >= len(SessionPrefix) && strings.EqualFold(s[:len(SessionPrefix)], SessionPrefix) {
-		return neg + SessionPrefix + Normalize(strings.TrimSpace(s[len(SessionPrefix):]))
+	if opts, has, rest, ok := splitCmd(s, "session"); ok {
+		o, err := parseOpts(opts)
+		if err != nil || !has {
+			// Kept as written so Parse reports the bad option.
+			if err != nil {
+				return neg + "session[" + opts + "]:" + Normalize(strings.TrimSpace(rest))
+			}
+		}
+		return neg + cmdPrefix("session", o) + Normalize(strings.TrimSpace(rest))
 	}
 	if strings.HasPrefix(s, "/") || strings.HasPrefix(s, "re:") {
 		return neg + s
@@ -169,11 +181,14 @@ func Parse(raw string) (Pattern, error) {
 		}
 		return parseDrop(s)
 	}
-	if strings.HasPrefix(s, SessionPrefix) {
+	if _, _, _, ok := splitCmd(s, "session"); ok {
 		if p.Negate {
 			return p, fmt.Errorf("! and session: cannot be combined; write !name to exempt a name")
 		}
 		return parseSession(s)
+	}
+	if IsRoute(s) {
+		return p, fmt.Errorf("route: rules are compiled with the rule list (route:...;if:...)")
 	}
 	switch {
 	case strings.HasPrefix(s, "re:") || strings.HasPrefix(s, "/"):
@@ -278,10 +293,14 @@ func parseDrop(s string) (Pattern, error) {
 	return p, nil
 }
 
-// parseSession parses "session:<domain rule>".
+// parseSession parses "session:<domain rule>" or "session[opts]:<rule>".
 func parseSession(s string) (Pattern, error) {
-	inner := s[len(SessionPrefix):]
+	opts, _, inner, _ := splitCmd(s, "session")
 	p := Pattern{Raw: s, Session: true}
+	o, err := parseOpts(opts)
+	if err != nil {
+		return p, fmt.Errorf("session[...]: %v", err)
+	}
 	if inner == "" {
 		return p, fmt.Errorf("session: needs a domain rule, e.g. session:example.com")
 	}
@@ -292,7 +311,7 @@ func parseSession(s string) (Pattern, error) {
 	if q.Negate || q.Drop || q.Session || q.Kind == ASN || q.Kind == CIDR {
 		return p, fmt.Errorf("session: must be followed by a domain rule (a session starts with a DNS lookup)")
 	}
-	q.Raw, q.Session = s, true
+	q.Raw, q.Session, q.Opts = s, true, o
 	return q, nil
 }
 
@@ -395,6 +414,7 @@ type Set struct {
 	Exclude            []Pattern
 	Drop               []Pattern // drop: domain rules
 	Session            []Pattern // session: domain rules
+	Routes             []*Route  // route:...;if:... rules
 	DropASNs           []int     // drop:asn:
 	DropCIDRs          []string  // drop:cidr:
 }
@@ -407,11 +427,22 @@ type LineError struct {
 }
 
 // Compile parses rules, skipping blanks/comments and reporting bad lines.
+// A route: rule may span several entries (see Group).
 func Compile(rules []string) (*Set, []LineError) {
 	s := &Set{}
 	var errs []LineError
-	for i, r := range rules {
-		if StripComment(r) == "" {
+	for _, lg := range Group(rules) {
+		i, r := lg.First, lg.Text
+		if StripComment(r) == "" && !IsRoute(r) {
+			continue
+		}
+		if IsRoute(r) {
+			rt, err := ParseRoute(r)
+			if err != nil {
+				errs = append(errs, LineError{Index: i, Rule: r, Error: err.Error()})
+				continue
+			}
+			s.Routes = append(s.Routes, rt)
 			continue
 		}
 		p, err := Parse(r)
@@ -446,12 +477,17 @@ func MustCompile(rules []string) *Set {
 
 // Result explains a match decision.
 type Result struct {
-	Matched  bool   `json:"matched"`
-	Name     string `json:"name,omitempty"`     // the name in the chain that matched
-	Rule     string `json:"rule,omitempty"`     // the include (or drop) rule that matched
-	Drop     bool   `json:"drop,omitempty"`     // a drop: rule matched: block, do not route
-	Session  bool   `json:"session,omitempty"`  // a session: rule matched: route for the asking device only
-	Excluded string `json:"excluded,omitempty"` // the exclusion that vetoed it
+	Matched bool   `json:"matched"`
+	Name    string `json:"name,omitempty"`    // the name in the chain that matched
+	Rule    string `json:"rule,omitempty"`    // the include (or drop) rule that matched
+	Drop    bool   `json:"drop,omitempty"`    // a drop: rule matched: block, do not route
+	Session bool   `json:"session,omitempty"` // a session: rule matched: route for the asking device only
+	Route   bool   `json:"route,omitempty"`   // a route: expression matched: sessions if its if: holds for the device
+	Opts    Opts   `json:"opts,omitempty"`    // session options of the session: or route: rule
+	// Cond lists the if: atoms the names matched: the answer is routed
+	// like a plain rule, and its addresses count for those conditions.
+	Cond     []CondHit `json:"cond,omitempty"`
+	Excluded string    `json:"excluded,omitempty"` // the exclusion that vetoed it
 }
 
 // MatchAny tests every name (query name first, then the CNAME chain).
@@ -474,7 +510,36 @@ func (s *Set) MatchAny(names ...string) Result {
 	}
 	for _, n := range names {
 		if i := s.ses.first(n); i >= 0 {
-			return Result{Matched: true, Session: true, Name: n, Rule: s.Session[i].Raw}
+			return Result{Matched: true, Session: true, Name: n, Rule: s.Session[i].Raw, Opts: s.Session[i].Opts}
+		}
+	}
+	// if: atoms: always routed; the addresses count for their conditions.
+	var hits []CondHit
+	first, firstRule := "", ""
+	for _, r := range s.Routes {
+		if r.If == nil {
+			continue
+		}
+		for _, a := range r.If.Positive() {
+			for _, n := range names {
+				if a.Atom.Match(n) {
+					hits = append(hits, CondHit{Rule: r.Raw, Atom: a.ID})
+					if first == "" {
+						first, firstRule = n, r.Raw
+					}
+					break
+				}
+			}
+		}
+	}
+	if len(hits) > 0 {
+		return Result{Matched: true, Name: first, Rule: firstRule, Cond: hits}
+	}
+	for _, n := range names {
+		for _, r := range s.Routes {
+			if r.Route.MatchName(n) {
+				return Result{Matched: true, Route: true, Name: n, Rule: r.Raw, Opts: r.Opts}
+			}
 		}
 	}
 	for _, n := range names {
@@ -556,10 +621,51 @@ func (s *Set) build() {
 }
 
 // Empty reports whether the set has no include rules (session: rules count).
-func (s *Set) Empty() bool { return s == nil || len(s.Include)+len(s.Session) == 0 }
+func (s *Set) Empty() bool { return s == nil || len(s.Include)+len(s.Session)+len(s.Routes) == 0 }
 
-// HasSessions reports whether the set has session: rules.
-func (s *Set) HasSessions() bool { return s != nil && len(s.Session) > 0 }
+// HasSessions reports whether the set has session: or route: rules.
+func (s *Set) HasSessions() bool { return s != nil && len(s.Session)+len(s.Routes) > 0 }
+
+// HasConds reports whether some route: rule has an if: part.
+func (s *Set) HasConds() bool {
+	for _, r := range s.Routes {
+		if r.If != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// CondHits lists the if: atoms (negated ones too) any of the names
+// matches: the addresses of such an answer count for those conditions,
+// whatever routes it.
+func (s *Set) CondHits(names ...string) []CondHit {
+	var hits []CondHit
+	for _, r := range s.Routes {
+		if r.If == nil {
+			continue
+		}
+		for _, a := range r.If.All() {
+			for _, n := range names {
+				if a.Atom.Match(n) {
+					hits = append(hits, CondHit{Rule: r.Raw, Atom: a.ID})
+					break
+				}
+			}
+		}
+	}
+	return hits
+}
+
+// Route returns the route: rule with this text.
+func (s *Set) Route(raw string) *Route {
+	for _, r := range s.Routes {
+		if r.Raw == raw {
+			return r
+		}
+	}
+	return nil
+}
 
 // HasDrops reports whether the set has any drop: rule.
 func (s *Set) HasDrops() bool {
@@ -613,7 +719,7 @@ func (s *Set) PlainSuffixes() []string {
 // NeedsInspector reports whether some rules need DNS answer inspection.
 // session: rules always do: only the inspector knows which device asked.
 func (s *Set) NeedsInspector() bool {
-	if len(s.Session) > 0 {
+	if len(s.Session)+len(s.Routes) > 0 {
 		return true
 	}
 	if len(s.Exclude) > 0 {
@@ -638,7 +744,17 @@ func (s *Set) NeedsInspector() bool {
 func (s *Set) Bases() []string {
 	seen := map[string]bool{}
 	var out []string
-	for _, p := range append(append([]Pattern(nil), s.Include...), s.Session...) {
+	pats := append(append([]Pattern(nil), s.Include...), s.Session...)
+	for _, r := range s.Routes {
+		for _, x := range []*Expr{r.Route, r.If} {
+			if x != nil {
+				for _, a := range x.Positive() {
+					pats = append(pats, *a.Atom)
+				}
+			}
+		}
+	}
+	for _, p := range pats {
 		if p.Base != "" && !seen[p.Base] {
 			seen[p.Base] = true
 			out = append(out, p.Base)

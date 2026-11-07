@@ -1,6 +1,7 @@
 package dnsinspect
 
 import (
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -18,7 +19,7 @@ func TestSessionAnswer(t *testing.T) {
 	var got []string
 	i := &Inspector{IPSet: netfilter.IPSet{R: rec}, CacheTTL: time.Hour}
 	i.SetRules([]Rules{{ID: 1, Name: "p", Set: match.MustCompile([]string{"netflix.com", "session:**.akamaized.net"}), FollowCNAME: true, Set4: "SNK_1_d4",
-		Session: func(client string, addrs []string, rule, name string) error {
+		Session: func(client string, addrs []string, rule, name string, _ match.Opts) error {
 			got = append(got, client+" "+strings.Join(addrs, ",")+" "+rule+" "+name)
 			return nil
 		}}})
@@ -45,5 +46,44 @@ func TestSessionAnswer(t *testing.T) {
 	}
 	if s := i.Stats(); s.Sessions != 1 || s.Matched != 2 {
 		t.Fatalf("stats %+v", s)
+	}
+}
+
+func TestRouteAnswer(t *testing.T) {
+	rec := &system.Recorder{}
+	var conds, routes []string
+	allow := false
+	i := &Inspector{IPSet: netfilter.IPSet{R: rec}, CacheTTL: time.Hour}
+	i.SetRules([]Rules{{ID: 1, Name: "p", Set: match.MustCompile([]string{"route:**.akamaized.net;if:and:(netflix.com, not:=help.netflix.com)"}), FollowCNAME: true, Set4: "SNK_1_d4",
+		Cond: func(addrs []string, hits []match.CondHit) {
+			conds = append(conds, fmt.Sprintf("%s %d", strings.Join(addrs, ","), hits[0].Atom))
+		},
+		Route: func(client string, addrs []string, rule, name string, _ match.Opts) (bool, error) {
+			routes = append(routes, client+" "+strings.Join(addrs, ",")+" "+name)
+			return allow, nil
+		}}})
+	// if: name: recorded and routed like a plain rule.
+	if w := i.handle(answerPacket("www.netflix.com", net.IPv4(198, 51, 100, 10))); w != nil {
+		w()
+	}
+	// negated if: atom: recorded (atom 2) and routed by netflix.com.
+	if w := i.handle(answerPacket("help.netflix.com", net.IPv4(198, 51, 100, 20))); w != nil {
+		w()
+	}
+	if strings.Join(conds, "|") != "198.51.100.10 1|198.51.100.20 1" {
+		t.Fatalf("conditions recorded %q", conds)
+	}
+	if !strings.Contains(rec.Joined(), "SNK_1_d4") && i.Stats().Added == 0 {
+		t.Fatalf("if: answer not routed: %q", rec.Joined())
+	}
+	added := i.Stats().Added
+	// route: name: the condition decides; never the set.
+	w := i.handle(answerPacket("e1.akamaized.net", net.IPv4(203, 0, 113, 80)))
+	if w == nil {
+		t.Fatal("route answer released before the condition was checked")
+	}
+	w()
+	if len(routes) != 1 || routes[0] != "192.168.50.10 203.0.113.80 e1.akamaized.net" || i.Stats().Added != added {
+		t.Fatalf("route %q, added %d -> %d", routes, added, i.Stats().Added)
 	}
 }
