@@ -338,6 +338,8 @@ function viewStatus(b) {
       el('div', { class: 'kv tw:mt-1.5' },
         el('span', null, 'Exit'), el('span', null, (t.exit_ip || '?') + ' ' + (t.country || '')),
         el('span', null, 'Probe'), el('span', null, t.probe_ok ? ('ok ' + (t.probe_rtt || '')) : ('failing (' + t.probe_fails + ')')),
+        t.rtt_ms ? [el('span', null, 'Latency'), el('span', null, t.rtt_ms.toFixed(0) + ' ms avg' + (t.loss >= 0.005 ? ', ' + (t.loss * 100).toFixed(0) + '% loss' : ''))] : null,
+        t.throughput_mbps || t.speed_error ? [el('span', null, 'Speed'), el('span', null, t.throughput_mbps ? t.throughput_mbps.toFixed(1) + ' Mbit/s (' + ago(t.speed_checked) + ')' : '', t.speed_error ? el('div', { class: 'small tw:text-warn' }, t.speed_error) : null)] : null,
         isWG(k) ? [el('span', null, 'Handshake'), el('span', null, ago(t.handshake))] : k.indexOf('ovpnc') === 0 ? [el('span', null, 'State'), el('span', null, t.client_state === '2' ? 'connected' : (t.client_state || '?'))] : null,
         el('span', null, 'IPv6'), el('span', null, t.has_ipv6 ? 'yes' : 'no'),
         el('span', null, 'Geo'), el('span', null, t.geo_error ? t.geo_error : ago(t.geo_checked))));
@@ -350,7 +352,7 @@ function viewStatus(b) {
       var route = !p.enabled ? badge('disabled') : s.disabled ? badge('WAN (snake disabled)', 'bad') : p.active ? badge(tunLabel(p.active) + (p.country ? ' ' + p.country : ''), 'ok') :
         p.kill_engaged ? badge('kill switch: blocked', 'warn') : badge('WAN (no tunnel)', 'bad');
       var sets = Object.keys(p.sets || {}).map(function (k) { return k.replace(/^SNK_\d+_/, '') + ':' + p.sets[k]; }).join(' ');
-      var cands = (p.candidates || []).map(function (c) { return el('div', { class: 'small ' + (c.ok ? '' : 'muted') }, (c.ok ? '✓ ' : '✗ ') + c.tunnel + (c.reason ? ' (' + c.reason + ')' : '')); });
+      var cands = (p.candidates || []).map(function (c) { return el('div', { class: 'small ' + (c.ok ? '' : 'muted') }, (c.ok ? '✓ ' : '✗ ') + c.tunnel + (c.score ? ' · score ' + c.score.toFixed(2) : '') + (c.reason ? ' (' + c.reason + ')' : '')); });
       return el('tr', null,
         el('td', null, el('b', null, p.name), p.domain_mode ? el('div', { class: 'small ' + (p.domain_mode.indexOf('degraded') === 0 ? 'tw:text-warn' : 'muted') }, 'domains: ' + p.domain_mode) : null,
           (p.asn_errors || []).map(function (e) { return el('div', { class: 'small tw:text-warn' }, e); }),
@@ -690,7 +692,7 @@ function stripMeta(text) { return text.split('\n').filter(function (l) { return 
 
 // ---------- policies ----------
 function defaultPolicy() {
-  return { id: 0, name: '', enabled: true, tunnels: [], kill_switch: true, expected_country: '', domains: [], lists: [], ignore_cname: false, asns: [], cidrs: [], devices: [], exclude_devices: [],
+  return { id: 0, name: '', enabled: true, tunnels: [], selection: 'priority', kill_switch: true, expected_country: '', domains: [], lists: [], ignore_cname: false, asns: [], cidrs: [], devices: [], exclude_devices: [],
     leak: { dns_via_tunnel: true, dns_server: '9.9.9.9', dns_protocol: 'udp', hijack_dns: true, block_dot: true, block_doh: true, block_quic: false, sniff_sni: false, ech: 'relay', ipv6: 'tunnel', webrtc: 'track' } };
 }
 function viewPolicies(b) {
@@ -725,7 +727,8 @@ function viewPolicies(b) {
       return el('tr', null,
         el('td', null, el('input', { type: 'checkbox', checked: p.enabled, title: 'enabled', onchange: function (e) { p.enabled = e.target.checked; markDirty(); } })),
         el('td', null, el('b', null, p.name), p.expected_country ? el('div', { class: 'small muted' }, 'expects ' + p.expected_country) : null),
-        el('td', null, p.tunnels.map(tunLabel).join(' → ')),
+        el('td', null, p.tunnels.map(tunLabel).join(p.selection && p.selection !== 'priority' ? ', ' : ' → '),
+          p.selection && p.selection !== 'priority' ? el('div', { class: 'small muted' }, 'auto: ' + p.selection) : null),
         el('td', { class: 'small' }, m.join(', ')),
         el('td', { class: 'small muted' }, prot.join(' · ')),
         el('td', { class: 'row' },
@@ -787,6 +790,7 @@ function viewEditor(b) {
       el('label', { class: 'f' }, 'Name'), el('input', { type: 'text', value: p.name, oninput: function (e) { p.name = e.target.value; } }),
       chk(p, 'enabled', 'Enabled'),
       el('label', { class: 'f' }, 'Tunnels (failover order)'), tunBox,
+      selectionMode(p),
       el('div', { class: 'small muted' }, 'Need more than the router\'s ten VPN clients? Save WireGuard or OpenVPN configurations in the Tunnels tab; they run only while a policy uses them.'),
       chk(p, 'kill_switch', 'Kill switch', 'When no tunnel is healthy, block this traffic instead of sending it via WAN.'),
       el('label', { class: 'f' }, 'Expected exit country (ISO code, optional)'),
@@ -848,6 +852,27 @@ function tunnelOptions() {
     });
   });
   return opts;
+}
+// How a policy picks its active tunnel among the usable ones.
+var SELECTION_MODES = [
+  ['priority', 'Priority: list order (default)', 'Uses the first usable tunnel in the list above; the others are failover.'],
+  ['latency', 'Auto: lowest latency', 'Uses the usable tunnel with the lowest probe round trip (smoothed, counting failed probes against it). Good for games and calls.'],
+  ['speed', 'Auto: fastest download', 'Uses the usable tunnel with the highest measured throughput. Each tunnel downloads the speed test file (Settings) about once an hour, which uses some data. Good for streaming and downloads.'],
+  ['balanced', 'Auto: balanced', 'Weighs latency, loss and throughput together. Speed tests as above.'],
+];
+function selectionMode(p) {
+  if (!p.selection) p.selection = 'priority';
+  var help = el('div', { class: 'small muted' });
+  function describe() {
+    var m = (SELECTION_MODES.filter(function (m) { return m[0] === p.selection; })[0] || SELECTION_MODES[0]);
+    help.textContent = m[2] + (p.selection === 'priority' ? '' : ' List order breaks ties and is used until tunnels are measured. A working tunnel is only left for one clearly better (Settings → auto-switch margin and hold), since switching breaks the policy\'s open connections.');
+  }
+  describe();
+  return el('div', null,
+    el('label', { class: 'f' }, 'Tunnel selection'),
+    el('select', { 'aria-label': 'Tunnel selection', onchange: function (e) { p.selection = e.target.value; describe(); } },
+      SELECTION_MODES.map(function (m) { return el('option', { value: m[0], selected: p.selection === m[0] }, m[1]); })),
+    help);
 }
 // What the SNI proxy does with a policy's Encrypted Client Hello connections.
 var ECH_MODES = [
@@ -1033,7 +1058,11 @@ function viewSettings(b) {
       list('probe_targets', 'Probe targets (host:port, TCP through each tunnel)'),
       num('probe_failures', 'Consecutive probe failures before failover'),
       bool('auto_failback', 'Auto fail-back to higher-priority tunnel'),
-      num('failback_hold', 'Fail-back hold-down (s)', 'The primary must be healthy this long before traffic moves back.'),
+      num('failback_hold', 'Fail-back hold-down (s)', 'The primary must be healthy this long before traffic moves back. Automatic selection waits this long before moving to a tunnel that came back too.'),
+      num('auto_switch_margin', 'Auto-switch margin (%)', 'Automatic tunnel selection leaves a working tunnel only for one at least this much better.'),
+      num('auto_switch_hold', 'Auto-switch hold (s)', 'Automatic tunnel selection stays on a working tunnel at least this long before switching for performance.'),
+      txt('speed_test_url', 'Speed test URL', 'Downloaded through each tunnel of policies selecting by speed or balanced (at most 50 MB is read).'),
+      num('speed_test_interval', 'Speed test interval (s)', 'Also right after a tunnel becomes healthy.'),
       bool('flush_conntrack', 'Flush connections on failover', 'Needs the conntrack tool; makes clients reconnect through the new tunnel immediately.')),
     el('div', { class: 'card' }, el('b', null, 'Exit country check'),
       txt('geo_url', 'Geo-IP URL (fetched through each tunnel)'),

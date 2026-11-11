@@ -441,3 +441,34 @@ func TestLegacyRouteConverted(t *testing.T) {
 		t.Error("conditional rules start sessions")
 	}
 }
+
+func TestTunnelSelection(t *testing.T) {
+	c := load(t)
+	c.Policies[0].Selection = ""
+	c.Policies[1].Selection = " Balanced "
+	c.Settings.AutoSwitchMargin, c.Settings.SpeedTestURL, c.Settings.SpeedTestInterval = 0, "", 0
+	c.Normalize()
+	c.ApplyDefaults()
+	if c.Policies[0].Selection != SelectPriority || c.Policies[0].AutoSelect() {
+		t.Errorf("default selection %q", c.Policies[0].Selection)
+	}
+	if p := c.Policies[1]; p.Selection != SelectBalanced || !p.AutoSelect() || !p.WantsSpeed() {
+		t.Errorf("balanced: %+v", p.Selection)
+	}
+	d := DefaultSettings()
+	if s := c.Settings; s.AutoSwitchMargin != d.AutoSwitchMargin || s.SpeedTestURL != d.SpeedTestURL || s.SpeedTestInterval != d.SpeedTestInterval {
+		t.Errorf("defaults not applied: %d %q %d", s.AutoSwitchMargin, s.SpeedTestURL, s.SpeedTestInterval)
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c.Policies[0].Selection = "random"
+	c.Settings.AutoSwitchMargin = 95
+	c.Settings.SpeedTestURL = "ftp://example.com/x"
+	err := c.Validate()
+	for _, s := range []string{`selection "random" invalid`, "auto_switch_margin 95", `speed_test_url "ftp://example.com/x"`} {
+		if err == nil || !strings.Contains(err.Error(), s) {
+			t.Errorf("missing %q in %v", s, err)
+		}
+	}
+}

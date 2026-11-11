@@ -128,6 +128,7 @@ type Engine struct {
 	asnCache      *asn.Cache
 	active        map[int]string
 	cands         map[int][]Candidate
+	activeSince   map[int]time.Time // when the active tunnel was chosen
 	events        []Event
 	plan          netfilter.Plan
 	lastApply     time.Time
@@ -146,20 +147,21 @@ type Engine struct {
 // New creates an engine.
 func New(p Paths, r system.Runner) *Engine {
 	e := &Engine{
-		P:         p,
-		R:         r,
-		mon:       health.NewMonitor(r),
-		rtc:       webrtc.NewTracker(netfilter.IPSet{R: r}, 0),
-		dns:       &dnsinspect.Inspector{IPSet: netfilter.IPSet{R: r}},
-		sni:       &sniproxy.Proxy{Sets: netfilter.IPSet{R: r}},
-		wg:        NewWireGuard(r),
-		ovpn:      NewOpenVPN(r),
-		active:    map[int]string{},
-		cands:     map[int][]Candidate{},
-		asnErrors: map[int]string{},
-		netHashes: map[string]string{},
-		started:   time.Now(),
-		kick:      make(chan struct{}, 1),
+		P:           p,
+		R:           r,
+		mon:         health.NewMonitor(r),
+		rtc:         webrtc.NewTracker(netfilter.IPSet{R: r}, 0),
+		dns:         &dnsinspect.Inspector{IPSet: netfilter.IPSet{R: r}},
+		sni:         &sniproxy.Proxy{Sets: netfilter.IPSet{R: r}},
+		wg:          NewWireGuard(r),
+		ovpn:        NewOpenVPN(r),
+		active:      map[int]string{},
+		cands:       map[int][]Candidate{},
+		activeSince: map[int]time.Time{},
+		asnErrors:   map[int]string{},
+		netHashes:   map[string]string{},
+		started:     time.Now(),
+		kick:        make(chan struct{}, 1),
 	}
 	if p.Disabled != "" {
 		if _, err := os.Stat(p.Disabled); err == nil {
@@ -325,6 +327,20 @@ func usedTunnels(c *config.Config) []string {
 	return out
 }
 
+// speedTunnels are the tunnels of enabled policies that select by
+// throughput: only those are speed tested.
+func speedTunnels(c *config.Config) map[string]bool {
+	out := map[string]bool{}
+	for _, p := range c.Policies {
+		if p.Enabled && p.WantsSpeed() {
+			for _, t := range p.Tunnels {
+				out[t] = true
+			}
+		}
+	}
+	return out
+}
+
 // decide runs failover for every policy; returns the ids whose active tunnel changed.
 func (e *Engine) decide() []int {
 	e.mu.Lock()
@@ -333,7 +349,10 @@ func (e *Engine) decide() []int {
 	snap := e.mon.Snapshot()
 	now := time.Now()
 	var changed []int
-	type change struct{ name, from, to string }
+	type change struct {
+		name, from, to string
+		why            string // automatic selection: why it left a working tunnel
+	}
 	var changes []change
 	e.mu.Lock()
 	ids := map[int]bool{}
@@ -343,18 +362,35 @@ func (e *Engine) decide() []int {
 		}
 		ids[p.ID] = true
 		cur := e.active[p.ID]
-		next, cands := Select(p, cur, snap, cfg.Settings, now)
+		next, cands := Select(p, cur, e.activeSince[p.ID], snap, cfg.Settings, now)
 		e.cands[p.ID] = cands
 		if next != cur {
 			e.active[p.ID] = next
+			e.activeSince[p.ID] = now
 			changed = append(changed, p.ID)
-			changes = append(changes, change{p.Name, cur, next})
+			c := change{name: p.Name, from: cur, to: next}
+			if p.AutoSelect() && cur != "" && next != "" {
+				var from, to Candidate
+				for _, cd := range cands {
+					switch cd.Tunnel {
+					case cur:
+						from = cd
+					case next:
+						to = cd
+					}
+				}
+				if from.OK && from.Score > 0 && to.Score > 0 {
+					c.why = fmt.Sprintf("better %s: score %.2f vs %.2f", p.Selection, to.Score, from.Score)
+				}
+			}
+			changes = append(changes, c)
 		}
 	}
 	for id := range e.active {
 		if !ids[id] {
 			delete(e.active, id)
 			delete(e.cands, id)
+			delete(e.activeSince, id)
 		}
 	}
 	e.mu.Unlock()
@@ -364,6 +400,8 @@ func (e *Engine) decide() []int {
 			e.event(c.name, "failover", "no usable tunnel (was %s)", orNone(c.from))
 		case c.from == "":
 			e.event(c.name, "failover", "active tunnel %s", c.to)
+		case c.why != "":
+			e.event(c.name, "failover", "switched %s -> %s (%s)", c.from, c.to, c.why)
 		default:
 			e.event(c.name, "failover", "switched %s -> %s", c.from, c.to)
 		}

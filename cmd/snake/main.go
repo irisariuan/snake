@@ -465,7 +465,7 @@ func status() error {
 		fmt.Println("LAST ERROR:", st.LastError)
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "\nTUNNEL\tIFACE\tHEALTHY\tEXIT\tCOUNTRY\tRTT\tREASON")
+	fmt.Fprintln(tw, "\nTUNNEL\tIFACE\tHEALTHY\tEXIT\tCOUNTRY\tRTT\tAVG\tLOSS\tMBIT/S\tREASON")
 	var names []string
 	for n := range st.Tunnels {
 		names = append(names, n)
@@ -473,7 +473,14 @@ func status() error {
 	sort.Strings(names)
 	for _, n := range names {
 		t := st.Tunnels[n]
-		fmt.Fprintf(tw, "%s\t%s\t%v\t%s\t%s\t%s\t%s\n", n, t.Iface, t.Healthy, t.ExitIP, t.Country, t.ProbeRTT, t.Reason)
+		avg, mbps := "", ""
+		if t.RTTMs > 0 {
+			avg = fmt.Sprintf("%.0fms", t.RTTMs)
+		}
+		if t.ThroughputMbps > 0 {
+			mbps = fmt.Sprintf("%.1f", t.ThroughputMbps)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%v\t%s\t%s\t%s\t%s\t%.0f%%\t%s\t%s\n", n, t.Iface, t.Healthy, t.ExitIP, t.Country, t.ProbeRTT, avg, t.Loss*100, mbps, t.Reason)
 	}
 	fmt.Fprintln(tw, "\nPOLICY\tSCOPE\tROUTE\tIPV6\tWEBRTC\tTRAFFIC\tSETS")
 	for _, p := range st.Policies {

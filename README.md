@@ -19,7 +19,7 @@ Inspired by and able to import from Ranger802004's
 |---|---|---|
 | Domain → IP | `nslookup` polling on cron / AdGuardHome log | **in real time**: every DNS answer is matched before the client receives it |
 | Domain rules | domain list | suffix, exact, subdomains-only, `*`/`**`/`?` wildcards, `~keyword`, `/regex/`, `!exclusions`, `drop:` blocking, CNAME-chain matching |
-| Tunnels per policy | one | **ordered list with failover / fail-back** |
+| Tunnels per policy | one | **ordered list with failover / fail-back, or automatic choice by latency / speed** |
 | Health | – | interface + WireGuard handshake / OpenVPN state, TCP probes *through* the tunnel, **exit-country check** |
 | Tunnel down | traffic goes via WAN | **kill switch** (per policy) or WAN, your choice |
 | Device scoping | – | whole device, or device + destinations, groups of devices |
@@ -832,6 +832,38 @@ seconds (default 15):
 If the active tunnel fails, the policy switches immediately to the
 highest-priority usable one. With auto fail-back on, it returns to a better
 tunnel once that tunnel has been healthy for `failback_hold` seconds.
+
+### Automatic tunnel selection
+
+By default a policy uses its tunnels in list order (*Tunnel selection:
+Priority*). It can instead pick the best usable tunnel by measurement
+(`selection` in the config):
+
+| Selection | Picks the tunnel with |
+|---|---|
+| **Priority** (`priority`, default) | the first usable place in the list |
+| **Lowest latency** (`latency`) | the lowest probe round trip: the TCP connect time to `probe_targets`, smoothed over recent checks, divided by the share of probes that succeed (30 ms with 50% loss counts as 60 ms) |
+| **Fastest download** (`speed`) | the highest measured throughput |
+| **Balanced** (`balanced`) | the lowest latency × throughput cost, each relative to the best tunnel (2× the latency for 4× the throughput wins) |
+
+* **Throughput** is measured for the tunnels of `speed` and `balanced`
+  policies only: snake downloads `speed_test_url` (default 5 MB from
+  speed.cloudflare.com, at most 50 MB read) through the tunnel every
+  `speed_test_interval` seconds (default 3600) and whenever the tunnel
+  becomes healthy, one tunnel at a time. Each test uses that much data,
+  and its result depends on what else uses the line at that moment.
+* Only usable tunnels count (healthy, right exit country). List order
+  breaks ties and is used until the tunnels have been measured; a
+  `speed` policy only picks between speed tested tunnels.
+* When the active tunnel fails, the policy switches to the best usable
+  one at once.
+* A working tunnel is left only for one at least `auto_switch_margin`
+  percent better (default 20), healthy for `failback_hold` seconds, after
+  the current one has been active for `auto_switch_hold` seconds (default
+  900). Switching moves the policy's traffic to another exit IP, which
+  breaks its open connections, so this keeps it from flapping.
+* Status shows each tunnel's average latency, loss and speed, and each
+  candidate's score (1 = best). The event log says why a policy switched.
 
 Route changes use `ip route replace` and add-before-delete rule
 reconciliation, so traffic never falls through to WAN mid-update. Conntrack

@@ -106,12 +106,13 @@ func (e *Engine) checkHealth(geo bool) {
 	}
 	tunnels := usedTunnels(cfg)
 	e.mon.Prune(tunnels)
+	speed := speedTunnels(cfg)
 	var wg sync.WaitGroup
 	for _, t := range tunnels {
 		wg.Add(1)
 		go func(t string) {
 			defer wg.Done()
-			e.mon.Check(cfg.Settings, t, geo)
+			e.mon.Check(cfg.Settings, t, geo, speed[t])
 		}(t)
 	}
 	wg.Wait()

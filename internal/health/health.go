@@ -20,27 +20,36 @@ import (
 
 // Status is the observed health of one tunnel.
 type Status struct {
-	Tunnel        string    `json:"tunnel"`
-	Iface         string    `json:"iface"`
-	Exists        bool      `json:"exists"`
-	Up            bool      `json:"up"`
-	HasIPv6       bool      `json:"has_ipv6"`
-	Handshake     time.Time `json:"handshake,omitempty"` // WireGuard only
-	ClientState   string    `json:"client_state,omitempty"`
-	LinkOK        bool      `json:"link_ok"`
-	ProbeOK       bool      `json:"probe_ok"`
-	ProbeFails    int       `json:"probe_fails"`
-	ProbeRTT      string    `json:"probe_rtt,omitempty"`
-	ExitIP        string    `json:"exit_ip,omitempty"`
-	Country       string    `json:"country,omitempty"`
-	GeoChecked    time.Time `json:"geo_checked,omitempty"`
-	GeoError      string    `json:"geo_error,omitempty"`
-	Healthy       bool      `json:"healthy"`
-	HealthySince  time.Time `json:"healthy_since,omitempty"`
-	Reason        string    `json:"reason,omitempty"`
-	LastChecked   time.Time `json:"last_checked"`
-	everProbed    bool
-	geoWasHealthy bool
+	Tunnel      string    `json:"tunnel"`
+	Iface       string    `json:"iface"`
+	Exists      bool      `json:"exists"`
+	Up          bool      `json:"up"`
+	HasIPv6     bool      `json:"has_ipv6"`
+	Handshake   time.Time `json:"handshake,omitempty"` // WireGuard only
+	ClientState string    `json:"client_state,omitempty"`
+	LinkOK      bool      `json:"link_ok"`
+	ProbeOK     bool      `json:"probe_ok"`
+	ProbeFails  int       `json:"probe_fails"`
+	ProbeRTT    string    `json:"probe_rtt,omitempty"`
+	// RTTMs is the smoothed probe round trip in milliseconds (0 = no
+	// sample yet), Loss the smoothed share of failed probes (0-1).
+	RTTMs float64 `json:"rtt_ms,omitempty"`
+	Loss  float64 `json:"loss"`
+	// ThroughputMbps is the last measured download speed through the
+	// tunnel (0 = not measured), for policies selecting by speed.
+	ThroughputMbps float64   `json:"throughput_mbps,omitempty"`
+	SpeedChecked   time.Time `json:"speed_checked,omitempty"`
+	SpeedError     string    `json:"speed_error,omitempty"`
+	ExitIP         string    `json:"exit_ip,omitempty"`
+	Country        string    `json:"country,omitempty"`
+	GeoChecked     time.Time `json:"geo_checked,omitempty"`
+	GeoError       string    `json:"geo_error,omitempty"`
+	Healthy        bool      `json:"healthy"`
+	HealthySince   time.Time `json:"healthy_since,omitempty"`
+	Reason         string    `json:"reason,omitempty"`
+	LastChecked    time.Time `json:"last_checked"`
+	everProbed     bool
+	geoWasHealthy  bool
 }
 
 // Monitor tracks tunnel health.
@@ -49,11 +58,26 @@ type Monitor struct {
 
 	mu     sync.Mutex
 	status map[string]*Status
+	speed  map[string]*speedState
+
+	// speedTest measures throughput (SpeedTest; replaced in tests).
+	speedTest func(mark uint32, url string) (float64, error)
+	// speedMu runs one speed test at a time, so tunnels do not compete
+	// for the WAN's bandwidth.
+	speedMu sync.Mutex
+}
+
+// speedState is a tunnel's last throughput measurement.
+type speedState struct {
+	mbps    float64
+	checked time.Time
+	err     string
+	running bool
 }
 
 // NewMonitor creates a monitor.
 func NewMonitor(r system.Runner) *Monitor {
-	return &Monitor{R: r, status: map[string]*Status{}}
+	return &Monitor{R: r, status: map[string]*Status{}, speed: map[string]*speedState{}, speedTest: SpeedTest}
 }
 
 // Snapshot returns a copy of all statuses.
@@ -157,6 +181,9 @@ func markedDialer(mark uint32, timeout time.Duration) *net.Dialer {
 	}
 }
 
+// probe is Probe (replaced in tests).
+var probe = Probe
+
 // Probe performs a TCP connect to each target through the tunnel; any
 // success counts as a pass.
 func Probe(mark uint32, targets []string, timeout time.Duration) (time.Duration, error) {
@@ -172,6 +199,139 @@ func Probe(mark uint32, targets []string, timeout time.Duration) (time.Duration,
 		last = err
 	}
 	return 0, last
+}
+
+// Speed test limits.
+var (
+	speedTimeout  = 30 * time.Second
+	speedMaxBytes = int64(50 << 20)
+	speedMinBytes = int64(256 << 10)
+)
+
+// SpeedTest downloads url through the tunnel and returns the throughput
+// in Mbit/s, timed from the first byte of the body (so connection setup
+// does not count). At most speedMaxBytes are read.
+func SpeedTest(mark uint32, url string) (float64, error) {
+	d := markedDialer(mark, 10*time.Second)
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return d.DialContext(ctx, "tcp4", addr)
+		},
+		TLSHandshakeTimeout: 10 * time.Second,
+		DisableKeepAlives:   true,
+		DisableCompression:  true,
+	}
+	cl := &http.Client{Transport: tr, Timeout: speedTimeout}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("User-Agent", "snake-router/1")
+	resp, err := cl.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("speed test HTTP %d", resp.StatusCode)
+	}
+	return measure(resp.Body)
+}
+
+// measure reads r (up to speedMaxBytes) and returns its rate in Mbit/s,
+// timed from the first byte.
+func measure(r io.Reader) (float64, error) {
+	buf := make([]byte, 64<<10)
+	var n int64
+	var start time.Time
+	var rerr error
+	for n < speedMaxBytes {
+		k, err := r.Read(buf)
+		if k > 0 {
+			if start.IsZero() {
+				start = time.Now()
+			} else {
+				n += int64(k)
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				rerr = err
+			}
+			break
+		}
+	}
+	el := time.Since(start)
+	if n < speedMinBytes {
+		if rerr != nil {
+			return 0, rerr
+		}
+		return 0, fmt.Errorf("speed test: only %d bytes", n)
+	}
+	if el <= 0 {
+		el = time.Microsecond
+	}
+	// A timeout after enough data still gives a usable figure.
+	return float64(n) * 8 / el.Seconds() / 1e6, nil
+}
+
+// speedDue starts a background speed test of tunnel when one is due, and
+// returns the last result.
+func (m *Monitor) speedDue(s config.Settings, tunnel string, justHealthy bool) speedState {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sp := m.speed[tunnel]
+	if sp == nil {
+		sp = &speedState{}
+		m.speed[tunnel] = sp
+	}
+	due := sp.checked.IsZero() || justHealthy || time.Since(sp.checked) >= time.Duration(s.SpeedTestInterval)*time.Second
+	if due && !sp.running && s.SpeedTestURL != "" {
+		sp.running = true
+		mark, url, test := s.ProbeMark(tunnel), s.SpeedTestURL, m.speedTest
+		go func() {
+			m.speedMu.Lock()
+			mbps, err := test(mark, url)
+			m.speedMu.Unlock()
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			sp.running, sp.checked = false, time.Now()
+			if err != nil {
+				sp.err = err.Error()
+				return
+			}
+			sp.mbps, sp.err = mbps, ""
+			if st := m.status[tunnel]; st != nil {
+				st.ThroughputMbps, st.SpeedChecked, st.SpeedError = sp.mbps, sp.checked, ""
+			}
+		}()
+	}
+	return *sp
+}
+
+// Smoothing of the probe metrics (exponentially weighted).
+const (
+	rttAlpha  = 0.3
+	lossAlpha = 0.1
+)
+
+// observe records one probe result: failure count, and the smoothed
+// round trip and loss.
+func (st *Status) observe(rtt time.Duration, err error) {
+	if err != nil {
+		st.ProbeFails++
+		st.Loss += lossAlpha * (1 - st.Loss)
+		return
+	}
+	st.ProbeFails = 0
+	st.ProbeRTT = rtt.Round(time.Millisecond).String()
+	ms := float64(rtt) / float64(time.Millisecond)
+	if st.RTTMs == 0 {
+		st.RTTMs = ms
+	} else {
+		st.RTTMs += rttAlpha * (ms - st.RTTMs)
+	}
+	st.Loss -= lossAlpha * st.Loss
 }
 
 // Geo looks up the tunnel's exit IP and country through the tunnel.
@@ -225,8 +385,9 @@ func field(doc map[string]any, path string) string {
 }
 
 // Check runs a full health check for a tunnel and updates the stored status.
-// geoDue forces an exit-country lookup.
-func (m *Monitor) Check(s config.Settings, tunnel string, geoDue bool) Status {
+// geoDue forces an exit-country lookup. speed measures the tunnel's
+// throughput in the background when due (Settings.SpeedTestInterval).
+func (m *Monitor) Check(s config.Settings, tunnel string, geoDue, speed bool) Status {
 	st := m.Link(s, tunnel)
 	m.mu.Lock()
 	prev := m.status[tunnel]
@@ -237,16 +398,12 @@ func (m *Monitor) Check(s config.Settings, tunnel string, geoDue bool) Status {
 		st.HealthySince = prev.HealthySince
 		st.everProbed = prev.everProbed
 		st.geoWasHealthy = prev.geoWasHealthy
+		st.RTTMs, st.Loss = prev.RTTMs, prev.Loss
 	}
 	if st.LinkOK {
-		rtt, err := Probe(s.ProbeMark(tunnel), s.ProbeTargets, 5*time.Second)
+		rtt, err := probe(s.ProbeMark(tunnel), s.ProbeTargets, 5*time.Second)
 		st.everProbed = true
-		if err != nil {
-			st.ProbeFails++
-		} else {
-			st.ProbeFails = 0
-			st.ProbeRTT = rtt.Round(time.Millisecond).String()
-		}
+		st.observe(rtt, err)
 		st.ProbeOK = st.ProbeFails < s.ProbeFailures
 		if !st.ProbeOK {
 			st.Reason = fmt.Sprintf("probe failed %d times", st.ProbeFails)
@@ -265,8 +422,18 @@ func (m *Monitor) Check(s config.Settings, tunnel string, geoDue bool) Status {
 	} else {
 		st.ProbeOK = false
 		st.ProbeFails = 0
+		// A tunnel that went down may come back on another server.
+		st.RTTMs, st.Loss = 0, 0
 	}
 	st.Healthy = st.LinkOK && st.ProbeOK
+	if speed && st.Healthy {
+		sp := m.speedDue(s, tunnel, !st.geoWasHealthy)
+		st.ThroughputMbps, st.SpeedChecked, st.SpeedError = sp.mbps, sp.checked, sp.err
+	} else if !st.Healthy {
+		m.mu.Lock()
+		delete(m.speed, tunnel)
+		m.mu.Unlock()
+	}
 	st.geoWasHealthy = st.Healthy
 	if st.Healthy {
 		if st.HealthySince.IsZero() {
@@ -340,6 +507,11 @@ func (m *Monitor) Prune(keep []string) {
 	for t := range m.status {
 		if !k[t] {
 			delete(m.status, t)
+		}
+	}
+	for t, sp := range m.speed {
+		if !k[t] && !sp.running {
+			delete(m.speed, t)
 		}
 	}
 }

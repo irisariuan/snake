@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -141,10 +142,14 @@ type Leak struct {
 
 // Policy routes matched traffic through an ordered list of tunnels.
 type Policy struct {
-	ID              int      `json:"id"`
-	Name            string   `json:"name"`
-	Enabled         bool     `json:"enabled"`
-	Tunnels         []string `json:"tunnels"`          // ordered by priority, failover candidates
+	ID      int      `json:"id"`
+	Name    string   `json:"name"`
+	Enabled bool     `json:"enabled"`
+	Tunnels []string `json:"tunnels"` // ordered by priority, failover candidates
+	// Selection is how the active tunnel is chosen among the usable ones:
+	// SelectPriority (list order, the default), or automatically by
+	// measured performance: SelectLatency, SelectSpeed or SelectBalanced.
+	Selection       string   `json:"selection"`
 	KillSwitch      bool     `json:"kill_switch"`      // drop instead of WAN when no tunnel healthy
 	ExpectedCountry string   `json:"expected_country"` // ISO 3166 alpha-2, optional
 	Domains         []string `json:"domains"`          // domain rules, see package match for the format
@@ -213,12 +218,27 @@ type Settings struct {
 	GeoStrict       bool     `json:"geo_strict"` // unknown country counts as failure
 	AutoFailback    bool     `json:"auto_failback"`
 	FailbackHold    int      `json:"failback_hold"`
-	ASNRefresh      int      `json:"asn_refresh"` // hours
-	SaveInterval    int      `json:"save_interval"`
-	STUNPorts       string   `json:"stun_ports"` // multiport syntax for fallback mode
-	DoHCanary       bool     `json:"doh_canary"` // answer Firefox/iCloud Private Relay canaries with NXDOMAIN
-	PreResolve      bool     `json:"pre_resolve"`
-	FlushConntrack  bool     `json:"flush_conntrack"`
+	// SpeedTestURL is downloaded through a tunnel to measure its
+	// throughput, for policies selecting by speed or balanced. Only the
+	// first SpeedTestMaxBytes are read.
+	SpeedTestURL string `json:"speed_test_url"`
+	// SpeedTestInterval is how often each such tunnel is measured,
+	// seconds (also right after it becomes healthy).
+	SpeedTestInterval int `json:"speed_test_interval"`
+	// AutoSwitchMargin is how much better (percent of the score) another
+	// tunnel must be before an automatic selection leaves a working one
+	// (1-90; 0 = the default).
+	AutoSwitchMargin int `json:"auto_switch_margin"`
+	// AutoSwitchHold is the least time an automatic selection stays on a
+	// working tunnel before switching for performance, seconds. Switching
+	// moves the policy's connections to another exit, which breaks them.
+	AutoSwitchHold int    `json:"auto_switch_hold"`
+	ASNRefresh     int    `json:"asn_refresh"` // hours
+	SaveInterval   int    `json:"save_interval"`
+	STUNPorts      string `json:"stun_ports"` // multiport syntax for fallback mode
+	DoHCanary      bool   `json:"doh_canary"` // answer Firefox/iCloud Private Relay canaries with NXDOMAIN
+	PreResolve     bool   `json:"pre_resolve"`
+	FlushConntrack bool   `json:"flush_conntrack"`
 	// LANInterfaces are the iptables -i patterns of client traffic,
 	// separated by spaces: the LAN bridges plus the router's VPN servers
 	// (WireGuard wgs*, OpenVPN tun21/tun22), whose clients are covered
@@ -353,6 +373,30 @@ const (
 	// drop: rules included, are not applied to them, nor later policies'.
 	ECHPassthrough = "passthrough"
 )
+
+// Tunnel selection modes (Policy.Selection).
+const (
+	// SelectPriority uses the first usable tunnel in list order.
+	SelectPriority = "priority"
+	// SelectLatency uses the usable tunnel with the lowest probe round
+	// trip, weighted by probe loss.
+	SelectLatency = "latency"
+	// SelectSpeed uses the usable tunnel with the highest measured
+	// download throughput (Settings.SpeedTestURL).
+	SelectSpeed = "speed"
+	// SelectBalanced weighs latency, loss and throughput together.
+	SelectBalanced = "balanced"
+)
+
+// AutoSelect reports whether p picks its tunnel by measured performance.
+func (p Policy) AutoSelect() bool {
+	return p.Selection == SelectLatency || p.Selection == SelectSpeed || p.Selection == SelectBalanced
+}
+
+// WantsSpeed reports whether p's tunnels need throughput measurements.
+func (p Policy) WantsSpeed() bool {
+	return p.Selection == SelectSpeed || p.Selection == SelectBalanced
+}
 
 // Upstream DNS protocols for "resolve via tunnel".
 const (
@@ -515,38 +559,42 @@ func dedupKeepComments(in []string) []string {
 // DefaultSettings returns sane defaults.
 func DefaultSettings() Settings {
 	return Settings{
-		MarkMask:         DefaultMarkMask,
-		ConnMarkMask:     DefaultConnMarkMask,
-		APIPort:          8444,
-		QueueBase:        4200,
-		DomainSetTimeout: 0,
-		SessionTimeout:   120,
-		PeerTimeout:      600,
-		SessionTTL:       600,
-		STUNServerTTL:    86400,
-		HealthInterval:   15,
-		HandshakeMaxAge:  180,
-		ProbeTargets:     []string{"1.1.1.1:443", "8.8.8.8:443", "9.9.9.9:443"},
-		ProbeFailures:    3,
-		GeoURL:           "https://ipinfo.io/json",
-		GeoCountryField:  "country",
-		GeoIPField:       "ip",
-		GeoInterval:      600,
-		AutoFailback:     true,
-		FailbackHold:     120,
-		ASNRefresh:       24,
-		SaveInterval:     1800,
-		STUNPorts:        "3478,3479,5349,19302:19309",
-		DoHCanary:        true,
-		PreResolve:       true,
-		FlushConntrack:   true,
-		LANInterfaces:    DefaultLANInterfaces,
-		STUNTestServers:  []string{"stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"},
-		UpdateRepo:       "irisariuan/snake",
-		BlockDoT:         BlockPolicy,
-		BlockDoH:         BlockPolicy,
-		DNSForwardPort:   5350,
-		SNIProxyPort:     5340,
+		MarkMask:          DefaultMarkMask,
+		ConnMarkMask:      DefaultConnMarkMask,
+		APIPort:           8444,
+		QueueBase:         4200,
+		DomainSetTimeout:  0,
+		SessionTimeout:    120,
+		PeerTimeout:       600,
+		SessionTTL:        600,
+		STUNServerTTL:     86400,
+		HealthInterval:    15,
+		HandshakeMaxAge:   180,
+		ProbeTargets:      []string{"1.1.1.1:443", "8.8.8.8:443", "9.9.9.9:443"},
+		ProbeFailures:     3,
+		GeoURL:            "https://ipinfo.io/json",
+		GeoCountryField:   "country",
+		GeoIPField:        "ip",
+		GeoInterval:       600,
+		AutoFailback:      true,
+		FailbackHold:      120,
+		SpeedTestURL:      "https://speed.cloudflare.com/__down?bytes=5000000",
+		SpeedTestInterval: 3600,
+		AutoSwitchMargin:  20,
+		AutoSwitchHold:    900,
+		ASNRefresh:        24,
+		SaveInterval:      1800,
+		STUNPorts:         "3478,3479,5349,19302:19309",
+		DoHCanary:         true,
+		PreResolve:        true,
+		FlushConntrack:    true,
+		LANInterfaces:     DefaultLANInterfaces,
+		STUNTestServers:   []string{"stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"},
+		UpdateRepo:        "irisariuan/snake",
+		BlockDoT:          BlockPolicy,
+		BlockDoH:          BlockPolicy,
+		DNSForwardPort:    5350,
+		SNIProxyPort:      5340,
 	}
 }
 
@@ -596,6 +644,12 @@ func (c *Config) ApplyDefaults() {
 	setInt(&s.ProbeFailures, d.ProbeFailures)
 	setInt(&s.GeoInterval, d.GeoInterval)
 	setInt(&s.FailbackHold, d.FailbackHold)
+	setInt(&s.SpeedTestInterval, d.SpeedTestInterval)
+	setInt(&s.AutoSwitchHold, d.AutoSwitchHold)
+	setInt(&s.AutoSwitchMargin, d.AutoSwitchMargin)
+	if s.SpeedTestURL == "" {
+		s.SpeedTestURL = d.SpeedTestURL
+	}
 	setInt(&s.ASNRefresh, d.ASNRefresh)
 	setInt(&s.SaveInterval, d.SaveInterval)
 	if s.DomainSetTimeout < 0 {
@@ -774,6 +828,10 @@ func (c *Config) Normalize() {
 		p.ExcludeDevices = dedup(mapStr(p.ExcludeDevices, normalizeDevice))
 		p.Tunnels = dedup(mapStr(p.Tunnels, func(s string) string { return strings.ToLower(strings.TrimSpace(s)) }))
 		p.ExpectedCountry = strings.ToUpper(strings.TrimSpace(p.ExpectedCountry))
+		p.Selection = strings.ToLower(strings.TrimSpace(p.Selection))
+		if p.Selection == "" {
+			p.Selection = SelectPriority
+		}
 		sort.Ints(p.ASNs)
 		p.ASNs = dedupInt(p.ASNs)
 		p.Leak.DNSServer = strings.TrimSpace(p.Leak.DNSServer)
@@ -923,6 +981,12 @@ func (c *Config) Validate() error {
 	case p > s.DNSForwardPort && p <= s.DNSForwardPort+s.MaxPolicyID():
 		add("sni_proxy_port %d is inside the DoT/DoH forwarder range %d-%d", p, s.DNSForwardPort+1, s.DNSForwardPort+s.MaxPolicyID())
 	}
+	if s.AutoSwitchMargin > 90 {
+		add("auto_switch_margin %d must be 1-90 (percent)", s.AutoSwitchMargin)
+	}
+	if u, err := url.Parse(s.SpeedTestURL); s.SpeedTestURL != "" && (err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "") {
+		add("speed_test_url %q must be an http(s) URL", s.SpeedTestURL)
+	}
 	for _, t := range s.ProbeTargets {
 		if _, _, err := net.SplitHostPort(t); err != nil {
 			add("probe target %q must be host:port", t)
@@ -995,6 +1059,11 @@ func (c *Config) Validate() error {
 			case SnakeTunnel(t) && !snakeIDs[t]:
 				add(pre+"tunnel %q is not set up (add it under Tunnels)", t)
 			}
+		}
+		switch p.Selection {
+		case "", SelectPriority, SelectLatency, SelectSpeed, SelectBalanced:
+		default:
+			add(pre+"selection %q invalid (priority, latency, speed or balanced)", p.Selection)
 		}
 		if p.ExpectedCountry != "" && !ccRe.MatchString(p.ExpectedCountry) {
 			add(pre+"expected_country %q must be a 2-letter code", p.ExpectedCountry)
