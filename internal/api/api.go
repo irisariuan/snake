@@ -127,6 +127,9 @@ func (s *Server) routes(authed bool) http.Handler {
 		s.E.Kick()
 		writeJSON(w, map[string]string{"result": "scheduled"})
 	})
+	mux.HandleFunc("POST /api/recheck-speed", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"result": "scheduled", "tunnels": s.E.RecheckSpeed()})
+	})
 	mux.HandleFunc("GET /api/test", func(w http.ResponseWriter, r *http.Request) {
 		d := r.URL.Query().Get("domain")
 		if d == "" {

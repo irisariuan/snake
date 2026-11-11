@@ -89,6 +89,38 @@ func TestSpeedDue(t *testing.T) {
 	if n := calls.Load(); n != 2 {
 		t.Fatalf("%d speed tests, want 2", n)
 	}
+	waitIdle := func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			m.mu.Lock()
+			running := m.speed["wgc1"].running
+			m.mu.Unlock()
+			if !running {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("speed test did not finish")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	waitIdle()
+	// ...and when re-checked by hand, once.
+	m.RecheckSpeed([]string{"wgc1", "wgc2"})
+	if st, _ := m.Get("wgc1"); !st.SpeedTesting {
+		t.Fatal("re-checked tunnel not shown as testing")
+	}
+	m.speedDue(s, "wgc1", false)
+	<-done
+	waitIdle()
+	if st, _ := m.Get("wgc1"); st.SpeedTesting {
+		t.Fatal("still shown as testing after the test")
+	}
+	m.speedDue(s, "wgc1", false)
+	time.Sleep(20 * time.Millisecond)
+	if n := calls.Load(); n != 3 {
+		t.Fatalf("%d speed tests, want 3", n)
+	}
 }
 
 func TestSpeedTestHTTP(t *testing.T) {

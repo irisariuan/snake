@@ -320,6 +320,13 @@ function viewStatus(b) {
   (s.warnings || []).forEach(function (w) { b.appendChild(el('div', { class: 'banner' }, w)); });
   b.appendChild(el('div', { class: 'row tw:mb-2.5' },
     btn('Re-check tunnels', function () { api('POST', '/api/recheck').then(function () { toast('Health check scheduled'); setTimeout(refreshStatus, 4000); }); }),
+    btn('Re-check speed', function () {
+      api('POST', '/api/recheck-speed').then(function (r) {
+        if (!r.tunnels) { toast('No tunnels are speed tested: only policies selecting by speed or balanced use speed tests.'); return; }
+        toast('Speed test scheduled for ' + r.tunnels + ' tunnel' + (r.tunnels === 1 ? '' : 's') + ' (one at a time)');
+        refreshStatus(); setTimeout(refreshStatus, 4000); setTimeout(refreshStatus, 35000);
+      }).catch(function (e) { toast(e.message); });
+    }),
     btn('Re-apply rules', function () { api('POST', '/api/apply').then(function () { toast('Applied'); refreshStatus(); }).catch(function (e) { toast(e.message); }); }),
     el('span', { class: 'muted small' }, 'WAN ' + (s.wan_ip || '?') + ' · uptime ' + s.uptime + ' · applied ' + ago(s.last_apply) + ' · IPv6 ' + (s.caps.ipv6 ? 'yes' : 'no') + ' · NFQUEUE ' + (s.caps.nfqueue ? 'yes' : 'no') + ' · ipset netlink ' + (s.caps.ipset_netlink ? 'yes' : 'no') +
       (s.dns_inspector ? ' · DNS inspector: ' + s.dns_inspector.answers + ' answers, ' + s.dns_inspector.matched + ' matched' + (s.dns_inspector.dropped ? ' (' + s.dns_inspector.dropped + ' blocked)' : '') + ', ' + s.dns_inspector.added + ' IPs added' : '') +
@@ -339,7 +346,7 @@ function viewStatus(b) {
         el('span', null, 'Exit'), el('span', null, (t.exit_ip || '?') + ' ' + (t.country || '')),
         el('span', null, 'Probe'), el('span', null, t.probe_ok ? ('ok ' + (t.probe_rtt || '')) : ('failing (' + t.probe_fails + ')')),
         t.rtt_ms ? [el('span', null, 'Latency'), el('span', null, t.rtt_ms.toFixed(0) + ' ms avg' + (t.loss >= 0.005 ? ', ' + (t.loss * 100).toFixed(0) + '% loss' : ''))] : null,
-        t.throughput_mbps || t.speed_error ? [el('span', null, 'Speed'), el('span', null, t.throughput_mbps ? t.throughput_mbps.toFixed(1) + ' Mbit/s (' + ago(t.speed_checked) + ')' : '', t.speed_error ? el('div', { class: 'small tw:text-warn' }, t.speed_error) : null)] : null,
+        t.throughput_mbps || t.speed_error || t.speed_testing ? [el('span', null, 'Speed'), el('span', null, t.throughput_mbps ? t.throughput_mbps.toFixed(1) + ' Mbit/s (' + ago(t.speed_checked) + ')' : '', t.speed_testing ? el('span', { class: 'muted' }, (t.throughput_mbps ? ' · ' : '') + 'testing…') : null, t.speed_error ? el('div', { class: 'small tw:text-warn' }, t.speed_error) : null)] : null,
         isWG(k) ? [el('span', null, 'Handshake'), el('span', null, ago(t.handshake))] : k.indexOf('ovpnc') === 0 ? [el('span', null, 'State'), el('span', null, t.client_state === '2' ? 'connected' : (t.client_state || '?'))] : null,
         el('span', null, 'IPv6'), el('span', null, t.has_ipv6 ? 'yes' : 'no'),
         el('span', null, 'Geo'), el('span', null, t.geo_error ? t.geo_error : ago(t.geo_checked))));

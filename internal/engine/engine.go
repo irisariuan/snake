@@ -1217,6 +1217,20 @@ func (e *Engine) Kick() {
 	}
 }
 
+// RecheckSpeed speed tests again, now, every tunnel of the policies that
+// select by speed or balanced, and returns how many there are.
+func (e *Engine) RecheckSpeed() int {
+	var ts []string
+	for t := range speedTunnels(e.runtime()) {
+		ts = append(ts, t)
+	}
+	if len(ts) > 0 {
+		e.mon.RecheckSpeed(ts)
+		e.Kick()
+	}
+	return len(ts)
+}
+
 // Monitor exposes the health monitor.
 func (e *Engine) Monitor() *health.Monitor { return e.mon }
 

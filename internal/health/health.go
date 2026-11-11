@@ -40,16 +40,19 @@ type Status struct {
 	ThroughputMbps float64   `json:"throughput_mbps,omitempty"`
 	SpeedChecked   time.Time `json:"speed_checked,omitempty"`
 	SpeedError     string    `json:"speed_error,omitempty"`
-	ExitIP         string    `json:"exit_ip,omitempty"`
-	Country        string    `json:"country,omitempty"`
-	GeoChecked     time.Time `json:"geo_checked,omitempty"`
-	GeoError       string    `json:"geo_error,omitempty"`
-	Healthy        bool      `json:"healthy"`
-	HealthySince   time.Time `json:"healthy_since,omitempty"`
-	Reason         string    `json:"reason,omitempty"`
-	LastChecked    time.Time `json:"last_checked"`
-	everProbed     bool
-	geoWasHealthy  bool
+	// SpeedTesting is set while a speed test of the tunnel runs or is
+	// queued behind another tunnel's.
+	SpeedTesting  bool      `json:"speed_testing,omitempty"`
+	ExitIP        string    `json:"exit_ip,omitempty"`
+	Country       string    `json:"country,omitempty"`
+	GeoChecked    time.Time `json:"geo_checked,omitempty"`
+	GeoError      string    `json:"geo_error,omitempty"`
+	Healthy       bool      `json:"healthy"`
+	HealthySince  time.Time `json:"healthy_since,omitempty"`
+	Reason        string    `json:"reason,omitempty"`
+	LastChecked   time.Time `json:"last_checked"`
+	everProbed    bool
+	geoWasHealthy bool
 }
 
 // Monitor tracks tunnel health.
@@ -73,6 +76,9 @@ type speedState struct {
 	checked time.Time
 	err     string
 	running bool
+	// force makes the next check test the tunnel whatever its age
+	// (RecheckSpeed).
+	force bool
 }
 
 // NewMonitor creates a monitor.
@@ -285,9 +291,9 @@ func (m *Monitor) speedDue(s config.Settings, tunnel string, justHealthy bool) s
 		sp = &speedState{}
 		m.speed[tunnel] = sp
 	}
-	due := sp.checked.IsZero() || justHealthy || time.Since(sp.checked) >= time.Duration(s.SpeedTestInterval)*time.Second
+	due := sp.checked.IsZero() || justHealthy || sp.force || time.Since(sp.checked) >= time.Duration(s.SpeedTestInterval)*time.Second
 	if due && !sp.running && s.SpeedTestURL != "" {
-		sp.running = true
+		sp.running, sp.force = true, false
 		mark, url, test := s.ProbeMark(tunnel), s.SpeedTestURL, m.speedTest
 		go func() {
 			m.speedMu.Lock()
@@ -298,15 +304,31 @@ func (m *Monitor) speedDue(s config.Settings, tunnel string, justHealthy bool) s
 			sp.running, sp.checked = false, time.Now()
 			if err != nil {
 				sp.err = err.Error()
-				return
+			} else {
+				sp.mbps, sp.err = mbps, ""
 			}
-			sp.mbps, sp.err = mbps, ""
 			if st := m.status[tunnel]; st != nil {
-				st.ThroughputMbps, st.SpeedChecked, st.SpeedError = sp.mbps, sp.checked, ""
+				st.ThroughputMbps, st.SpeedChecked, st.SpeedError, st.SpeedTesting = sp.mbps, sp.checked, sp.err, false
 			}
 		}()
 	}
 	return *sp
+}
+
+// RecheckSpeed makes the next health check speed test each of tunnels
+// that is speed tested, however recent its last measurement. Tunnels
+// not measured yet are due anyway; one being tested is left alone.
+func (m *Monitor) RecheckSpeed(tunnels []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, t := range tunnels {
+		if sp := m.speed[t]; sp != nil && !sp.running {
+			sp.force = true
+			if st := m.status[t]; st != nil {
+				st.SpeedTesting = true
+			}
+		}
+	}
 }
 
 // Smoothing of the probe metrics (exponentially weighted).
@@ -428,7 +450,7 @@ func (m *Monitor) Check(s config.Settings, tunnel string, geoDue, speed bool) St
 	st.Healthy = st.LinkOK && st.ProbeOK
 	if speed && st.Healthy {
 		sp := m.speedDue(s, tunnel, !st.geoWasHealthy)
-		st.ThroughputMbps, st.SpeedChecked, st.SpeedError = sp.mbps, sp.checked, sp.err
+		st.ThroughputMbps, st.SpeedChecked, st.SpeedError, st.SpeedTesting = sp.mbps, sp.checked, sp.err, sp.running
 	} else if !st.Healthy {
 		m.mu.Lock()
 		delete(m.speed, tunnel)
