@@ -522,6 +522,74 @@ func TestProxyPassthroughECH(t *testing.T) {
 	}
 }
 
+// ech: route sends every ECH connection through the policy's tunnel,
+// whatever the public name, without learning the shared CDN address. Its
+// rules for the public name, and a policy before it, still come first;
+// drop wins over it.
+func TestProxyRouteECH(t *testing.T) {
+	route := netflix()
+	route.ECH = ECHRoute
+	route.Set = match.MustCompile([]string{"netflix.com", "drop:blocked-ech.example"})
+	h := newHarness(t, []Policy{route})
+	ext := []byte{0xfe, 0x0d, 0, 1, 0}
+	for _, outer := range []string{"cloudflare-ech.com", "public.example.org"} {
+		hello := buildHello(sniExt(outer), ext)
+		if got, err := h.send(t, hello); err != nil || !bytes.Equal(got, hello) {
+			t.Fatalf("%s: not relayed: %v", outer, err)
+		}
+		if m := h.mark(t); m != 0x10000 {
+			t.Fatalf("%s: not routed by the route policy (mark %#x)", outer, m)
+		}
+	}
+	if s := h.sets.get("SNK_1_d4"); len(s) != 0 {
+		t.Fatalf("shared ECH destination learned: %v", s)
+	}
+	if s := h.sets.get("SNK_1_s4"); len(s) != 0 {
+		t.Fatalf("ECH connection opened a session window: %v", s)
+	}
+	// A drop: rule for the public name still applies.
+	if got, _ := h.send(t, buildHello(sniExt("blocked-ech.example"), ext)); len(got) != 0 {
+		t.Fatalf("dropped public name relayed %d bytes", len(got))
+	}
+	// Plain TLS is matched by the rules as usual: unmatched goes via WAN.
+	if _, err := h.send(t, buildHello(sniExt("example.org"))); err != nil {
+		t.Fatal(err)
+	}
+	if m := h.mark(t); m != 0 {
+		t.Fatalf("plain hello routed (mark %#x)", m)
+	}
+	if st := h.p.Stats(); st.ECH != 3 || st.ECHRouted != 2 || st.Dropped != 1 || st.ECHPassed != 0 {
+		t.Fatalf("stats %+v", st)
+	}
+
+	// An earlier relay policy whose rules match the public name takes it;
+	// other ECH connections fall to the route policy, before passthrough.
+	relay := Policy{ID: 2, Name: "relay", ECH: ECHRelay, Mark: 0x20000, Set: match.MustCompile([]string{"cloudflare-ech.com"})}
+	pass := Policy{ID: 3, Name: "pass", ECH: ECHPassthrough, Mark: 0x30000, Set: match.MustCompile([]string{"example.org"})}
+	h2 := newHarness(t, []Policy{pass, relay, route})
+	for outer, want := range map[string]uint32{"cloudflare-ech.com": 0x20000, "public.example.org": 0x10000} {
+		if _, err := h2.send(t, buildHello(sniExt(outer), ext)); err != nil {
+			t.Fatal(err)
+		}
+		if m := h2.mark(t); m != want {
+			t.Fatalf("%s: mark %#x, want %#x", outer, m, want)
+		}
+	}
+	if st := h2.p.Stats(); st.ECHRouted != 1 || st.ECHPassed != 0 {
+		t.Fatalf("stats %+v", st)
+	}
+
+	// Drop wins over route.
+	drop := Policy{ID: 4, Name: "drop", ECH: ECHDrop, Mark: 0x40000, Set: match.MustCompile([]string{"x.example"})}
+	h3 := newHarness(t, []Policy{route, drop})
+	if got, _ := h3.send(t, buildHello(sniExt("cloudflare-ech.com"), ext)); len(got) != 0 {
+		t.Fatalf("relayed %d bytes despite a drop policy", len(got))
+	}
+	if st := h3.p.Stats(); st.ECHRefused != 1 || st.ECHRouted != 0 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
 // A connection matching a session: rule is routed through the policy and
 // starts a session for its client; its destination is not learned into
 // the policy's set.

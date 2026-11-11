@@ -324,7 +324,7 @@ function viewStatus(b) {
     el('span', { class: 'muted small' }, 'WAN ' + (s.wan_ip || '?') + ' · uptime ' + s.uptime + ' · applied ' + ago(s.last_apply) + ' · IPv6 ' + (s.caps.ipv6 ? 'yes' : 'no') + ' · NFQUEUE ' + (s.caps.nfqueue ? 'yes' : 'no') + ' · ipset netlink ' + (s.caps.ipset_netlink ? 'yes' : 'no') +
       (s.dns_inspector ? ' · DNS inspector: ' + s.dns_inspector.answers + ' answers, ' + s.dns_inspector.matched + ' matched' + (s.dns_inspector.dropped ? ' (' + s.dns_inspector.dropped + ' blocked)' : '') + ', ' + s.dns_inspector.added + ' IPs added' : '') +
       (s.sni_proxy ? ' · SNI proxy ' + (s.sni_proxy.listen ? s.sni_proxy.listen : 'not running') + ': ' + s.sni_proxy.conns + ' conns, ' + s.sni_proxy.matched + ' matched, ' + s.sni_proxy.active + ' open' +
-        (s.sni_proxy.ech ? ', ' + s.sni_proxy.ech + ' ECH' + ([s.sni_proxy.ech_refused ? s.sni_proxy.ech_refused + ' dropped' : '', s.sni_proxy.ech_passed ? s.sni_proxy.ech_passed + ' passed through' : ''].filter(Boolean).map(function (x) { return ' (' + x + ')'; }).join('')) : '') + (s.sni_proxy.dropped ? ', ' + s.sni_proxy.dropped + ' blocked' : '') + (s.sni_proxy.errors ? ', ' + s.sni_proxy.errors + ' failed' : '') : ''))));
+        (s.sni_proxy.ech ? ', ' + s.sni_proxy.ech + ' ECH' + ([s.sni_proxy.ech_refused ? s.sni_proxy.ech_refused + ' dropped' : '', s.sni_proxy.ech_routed ? s.sni_proxy.ech_routed + ' routed' : '', s.sni_proxy.ech_passed ? s.sni_proxy.ech_passed + ' passed through' : ''].filter(Boolean).map(function (x) { return ' (' + x + ')'; }).join('')) : '') + (s.sni_proxy.dropped ? ', ' + s.sni_proxy.dropped + ' blocked' : '') + (s.sni_proxy.errors ? ', ' + s.sni_proxy.errors + ' failed' : '') : ''))));
   if (s.sni_proxy && s.sni_proxy.last_error && (!s.sni_proxy.listen || (Date.now() - new Date(s.sni_proxy.last_error_at).getTime()) < 600000))
     b.appendChild(el('div', { class: 'small tw:text-warn tw:mb-2' }, 'SNI proxy: ' + s.sni_proxy.last_error));
 
@@ -719,7 +719,7 @@ function viewPolicies(b) {
       if (gs.block_doh === 'always' || (gs.block_doh !== 'never' && p.leak.block_doh)) prot.push('doh');
       if (gs.block_dot === 'always' || (gs.block_dot !== 'never' && p.leak.block_dot)) prot.push('dot');
       if (p.leak.block_quic) prot.push('quic');
-      if (p.leak.sniff_sni) prot.push({ drop: 'sni (ech: drop)', passthrough: 'sni (ech: pass)' }[p.leak.ech] || 'sni');
+      if (p.leak.sniff_sni) prot.push({ drop: 'sni (ech: drop)', route: 'sni (ech: route)', passthrough: 'sni (ech: pass)' }[p.leak.ech] || 'sni');
       prot.push('v6:' + p.leak.ipv6);
       prot.push('rtc:' + p.leak.webrtc);
       return el('tr', null,
@@ -853,7 +853,8 @@ function tunnelOptions() {
 var ECH_MODES = [
   ['relay', 'Relay: route by the public name (default)', 'ECH hides the real server name behind a public one (e.g. cloudflare-ech.com). The connection is routed by that public name like any other: add it to this policy\'s rules to send ECH traffic through the tunnel, otherwise it goes via WAN. drop: rules for the public name apply.'],
   ['drop', 'Drop: reset ECH connections', 'Resets them, so a hidden name cannot get past this policy\'s drop: rules. Sites behind ECH-enabled CDNs (much of Cloudflare) then fail to load in browsers using DoH; browsers do not retry without ECH.'],
-  ['passthrough', 'Passthrough: leave them alone', 'Relays them via WAN untouched: this policy does not route them and its drop: rules do not apply to them. A later policy set to Relay can still route them by the public name.'],
+  ['route', 'Route: send all of them through the tunnel', 'Sends every ECH connection from this policy\'s devices through its tunnel, whatever the public name, so ECH sites cannot get around the policy. This includes ECH sites you did not add, so more traffic uses the tunnel. Rules for the public name, drop: rules included, still apply first. The shared CDN address is not learned, so connections to it without ECH are still matched by name.'],
+  ['passthrough', 'Passthrough: leave them alone', 'Relays them via WAN untouched: this policy does not route them and its drop: rules do not apply to them. A later policy set to Relay or Route can still route them.'],
 ];
 function echMode(L) {
   if (!L.ech) L.ech = L.refuse_ech ? 'drop' : 'relay';

@@ -60,7 +60,7 @@ func TestSNIProxyLifecycle(t *testing.T) {
 	if !strings.Contains(strings.Join(lc[0].OK, "\n"), "routed by their public name") {
 		t.Fatalf("leak checks: %+v", lc[0])
 	}
-	for mode, want := range map[string]string{config.ECHDrop: "Client Hello connections are refused", config.ECHPassthrough: "passed through via WAN"} {
+	for mode, want := range map[string]string{config.ECHDrop: "Client Hello connections are refused", config.ECHPassthrough: "passed through via WAN", config.ECHRoute: "all go through the tunnel"} {
 		if _, err := e.UpdateConfig(func(c *config.Config) error { c.Policies[0].Leak.ECH = mode; return nil }); err != nil {
 			t.Fatal(err)
 		}

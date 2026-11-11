@@ -665,6 +665,8 @@ func (e *Engine) LeakChecks() []LeakCheck {
 					switch p.Leak.ECH {
 					case config.ECHDrop:
 						ech = "Encrypted Client Hello connections are refused"
+					case config.ECHRoute:
+						ech = "Encrypted Client Hello connections all go through the tunnel, whatever their public name"
 					case config.ECHPassthrough:
 						ech = "Encrypted Client Hello connections are passed through via WAN, untouched by this policy (its drop: rules do not apply to them)"
 					}

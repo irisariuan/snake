@@ -129,7 +129,8 @@ type Leak struct {
 	SniffSNI bool `json:"sniff_sni"`
 	// ECH (with SniffSNI) is what the SNI proxy does with Encrypted Client
 	// Hello connections of the policy's devices, whose real server name
-	// is hidden behind a public one: ECHDrop, ECHRelay or ECHPassthrough.
+	// is hidden behind a public one: ECHDrop, ECHRelay, ECHRoute or
+	// ECHPassthrough.
 	ECH string `json:"ech"`
 	// RefuseECH is the older form of ECH == ECHDrop. It is read when ECH
 	// is empty and kept in sync, so older versions keep the behaviour.
@@ -342,6 +343,10 @@ const (
 	// ECHRelay routes them by the public name, like any other connection:
 	// a rule for it sends them through the policy's tunnel (the default).
 	ECHRelay = "relay"
+	// ECHRoute sends all of them through the policy's tunnel, whatever
+	// the public name. Its rules for the public name (drop: rules
+	// included) still apply first; the shared CDN address is not learned.
+	ECHRoute = "route"
 	// ECHPassthrough relays them via WAN untouched: the policy's rules,
 	// drop: rules included, are not applied to them.
 	ECHPassthrough = "passthrough"
@@ -1058,9 +1063,9 @@ func (c *Config) Validate() error {
 			add(pre+"webrtc mode %q invalid", p.Leak.WebRTC)
 		}
 		switch p.Leak.ECH {
-		case "", ECHDrop, ECHRelay, ECHPassthrough:
+		case "", ECHDrop, ECHRelay, ECHRoute, ECHPassthrough:
 		default:
-			add(pre+"ech mode %q invalid (drop, relay or passthrough)", p.Leak.ECH)
+			add(pre+"ech mode %q invalid (drop, relay, route or passthrough)", p.Leak.ECH)
 		}
 		if p.Leak.DNSViaTunnel {
 			if ip := net.ParseIP(p.Leak.DNSServer); ip == nil || ip.To4() == nil {

@@ -22,8 +22,10 @@
 //     (one such policy for the client is enough);
 //   - relay: routed by the public name like any other connection: a rule
 //     for it sends them through the policy's tunnel;
-//   - passthrough: the policy ignores them; with no relay policy matching,
-//     they go via WAN untouched.
+//   - route: all of them go through the policy's tunnel, whatever the
+//     public name (its rules for the public name still apply first);
+//   - passthrough: the policy ignores them; with no relay or route policy
+//     matching, they go via WAN untouched.
 package sniproxy
 
 import (
@@ -80,7 +82,8 @@ type Policy struct {
 	// Cond receives destinations of connections matching if: atoms.
 	Cond func(dst netip.Addr, hits []match.CondHit)
 	// ECH is what happens to the policy's clients' Encrypted Client Hello
-	// connections: ECHDrop, ECHRelay ("" = relay) or ECHPassthrough.
+	// connections: ECHDrop, ECHRelay ("" = relay), ECHRoute or
+	// ECHPassthrough.
 	ECH string
 }
 
@@ -88,6 +91,7 @@ type Policy struct {
 const (
 	ECHDrop        = "drop"
 	ECHRelay       = "relay"
+	ECHRoute       = "route"
 	ECHPassthrough = "passthrough"
 )
 
@@ -114,6 +118,7 @@ type Stats struct {
 	ECH        uint64         `json:"ech"`         // Encrypted Client Hello connections seen
 	ECHRefused uint64         `json:"ech_refused"` // ECH connections reset (a policy has ech: drop)
 	ECHPassed  uint64         `json:"ech_passed"`  // ECH connections relayed untouched (ech: passthrough)
+	ECHRouted  uint64         `json:"ech_routed"`  // ECH connections sent through a tunnel by ech: route
 	Errors     uint64         `json:"errors"`      // upstream dial failures
 	Refused    uint64         `json:"refused"`     // over the connection limit, or not redirected
 	ByPolicy   map[int]uint64 `json:"by_policy,omitempty"`
@@ -159,6 +164,7 @@ type Proxy struct {
 	ech     atomic.Uint64
 	echRef  atomic.Uint64
 	echPass atomic.Uint64
+	echRout atomic.Uint64
 	errs    atomic.Uint64
 	refused atomic.Uint64
 	statMu  sync.Mutex
@@ -246,7 +252,7 @@ func (p *Proxy) Stats() Stats {
 	p.mu.Unlock()
 	s := Stats{
 		Listen: listen, Active: p.active.Load(), Conns: p.conns.Load(), Matched: p.matched.Load(),
-		Dropped: p.dropped.Load(), NoSNI: p.noSNI.Load(), ECH: p.ech.Load(), ECHRefused: p.echRef.Load(), ECHPassed: p.echPass.Load(), Errors: p.errs.Load(), Refused: p.refused.Load(),
+		Dropped: p.dropped.Load(), NoSNI: p.noSNI.Load(), ECH: p.ech.Load(), ECHRefused: p.echRef.Load(), ECHPassed: p.echPass.Load(), ECHRouted: p.echRout.Load(), Errors: p.errs.Load(), Refused: p.refused.Load(),
 	}
 	p.statMu.Lock()
 	if len(p.byPol) > 0 {
@@ -380,9 +386,9 @@ func inNets(nets []netip.Prefix, a netip.Addr) bool {
 }
 
 // echPolicies splits the policies applying to the client by ECH mode: a
-// policy that drops ECH (first one), the policies that route ECH by the
-// public name, and whether any passes it through.
-func (p *Proxy) echPolicies(client netip.Addr) (drop *Policy, relay []Policy, passthrough bool) {
+// policy that drops ECH (first one), the policies that relay or route ECH
+// (in policy order), and whether any passes it through.
+func (p *Proxy) echPolicies(client netip.Addr) (drop *Policy, routing []Policy, passthrough bool) {
 	for _, pol := range p.applicable(client) {
 		switch pol.ECH {
 		case ECHDrop:
@@ -393,10 +399,27 @@ func (p *Proxy) echPolicies(client netip.Addr) (drop *Policy, relay []Policy, pa
 		case ECHPassthrough:
 			passthrough = true
 		default:
-			relay = append(relay, pol)
+			routing = append(routing, pol)
 		}
 	}
-	return drop, relay, passthrough
+	return drop, routing, passthrough
+}
+
+// matchECH finds, in policy order, the first of pols that takes an ECH
+// connection with the public name name: a policy whose rules match it, or
+// a route policy, which takes every ECH connection. all reports the
+// latter: the destination is then not learned, since it is a CDN address
+// that many unrelated sites share.
+func matchECH(name string, pols []Policy) (pol Policy, res match.Result, ok, all bool) {
+	for _, pol := range pols {
+		if pol, res, ok := matchIn(name, []Policy{pol}); ok {
+			return pol, res, true, false
+		}
+		if pol.ECH == ECHRoute {
+			return pol, match.Result{Matched: true}, true, true
+		}
+	}
+	return Policy{}, match.Result{}, false, false
 }
 
 func (p *Proxy) handle(c *net.TCPConn) {
@@ -451,19 +474,24 @@ func (p *Proxy) handle(c *net.TCPConn) {
 	var mark uint32
 	var pol Policy
 	var res match.Result
-	var ok bool
+	var ok, echAll bool
 	if hello.ECH {
 		p.ech.Add(1)
-		drop, relay, passthrough := p.echPolicies(client)
+		drop, routing, passthrough := p.echPolicies(client)
 		if drop != nil {
 			p.echRef.Add(1)
 			logx.Debugf("sni proxy: %s -> %s (%s) refused: Encrypted Client Hello (policy %s)", client, dst, hello.ServerName, drop.Name)
 			reset(c)
 			return
 		}
-		// Routed by the outer (public) name, by the policies that relay
-		// ECH; passthrough policies leave it alone.
-		pol, res, ok = matchIn(hello.ServerName, relay)
+		// Routed by the outer (public) name by the policies that relay
+		// ECH, or whatever the name by a route policy; passthrough
+		// policies leave it alone.
+		pol, res, ok, echAll = matchECH(hello.ServerName, routing)
+		if echAll {
+			p.echRout.Add(1)
+			logx.Debugf("sni proxy: %s -> %s (%s) routed: Encrypted Client Hello (policy %s)", client, dst, hello.ServerName, pol.Name)
+		}
 		if !ok && passthrough {
 			p.echPass.Add(1)
 			logx.Debugf("sni proxy: %s -> %s (%s) passed through: Encrypted Client Hello", client, dst, hello.ServerName)
@@ -499,7 +527,7 @@ func (p *Proxy) handle(c *net.TCPConn) {
 		}
 	}
 	switch {
-	case hello.ServerName == "":
+	case hello.ServerName == "" && !echAll:
 		p.noSNI.Add(1)
 	case ok && res.Drop:
 		p.dropped.Add(1)
@@ -518,8 +546,9 @@ func (p *Proxy) handle(c *net.TCPConn) {
 		}
 		p.byPol[pol.ID]++
 		p.statMu.Unlock()
-		if res.Route {
-			// Session started by Route above.
+		if res.Route || echAll {
+			// Session started by Route above, or a route policy's ECH
+			// connection: its CDN address is not learned.
 		} else if res.Session && pol.Session != nil {
 			if err := pol.Session(client, dst.Addr(), res.Rule, hello.ServerName, res.Opts); err != nil {
 				logx.Warnf("sni proxy: session for %s -> %s (%s): %v", client, dst, hello.ServerName, err)
@@ -527,7 +556,7 @@ func (p *Proxy) handle(c *net.TCPConn) {
 		} else {
 			p.learn(dst.Addr(), pol.Set4, pol.Set6)
 		}
-		if client.IsValid() {
+		if client.IsValid() && !echAll {
 			p.learn(client, pol.Session4, pol.Session6)
 		}
 		logx.Debugf("sni proxy: %s -> %s (%s) via policy %s", client, dst, hello.ServerName, pol.Name)
