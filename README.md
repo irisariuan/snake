@@ -977,6 +977,13 @@ does it by hand).
 Diagnostics tab:
 * **Test a domain**: which policy matches, resolved addresses, and whether each
   one is in a set.
+* **DNS lookup**: any record type (A, AAAA, MX, TXT, PTR for an IP, ...)
+  from the router's dnsmasq, straight out the WAN, or through a tunnel to a
+  resolver of your choice, with the route the query took: the policy that
+  resolves the name through its tunnel, the interface, gateway and routing
+  table, and the tunnel's exit address. **Compare all paths** runs the
+  lookup over every path at once. CLI: `snake lookup <name> [type]
+  [router|wan|<tunnel>] [resolver]`.
 * **Router-side leak audit**: per-policy checklist of what is and isn't
   protected.
 * **Browser leak test**: HTTP exit IP and WebRTC (STUN) public IPs of the

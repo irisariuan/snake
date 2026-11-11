@@ -981,6 +981,8 @@ function viewDiag(b) {
   inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') run(); });
   b.appendChild(el('div', { class: 'card' }, el('b', null, 'Test a domain'), el('div', { class: 'row tw:my-1.5' }, inp, btn('Test', run, 'pri')), out));
 
+  b.appendChild(dnsLookupCard(function (name) { inp.value = name; run(); inp.scrollIntoView({ block: 'center' }); }));
+
   // browser leak test
   var lt = el('div', { class: 'small' }, 'Checks what this browser exposes: HTTP exit IP and WebRTC (STUN) public IPs, compared with the WAN and tunnel exits.');
   b.appendChild(el('div', { class: 'card' }, el('b', null, 'Leak test for this device'), lt, el('div', { class: 'tw:mt-1.5' }, btn('Run browser leak test', function () { browserLeakTest(lt); }, 'pri'))));
@@ -1008,6 +1010,81 @@ function viewDiag(b) {
   }), planOut));
   function loadLogs() { api('GET', '/api/logs').then(function (l) { logOut.textContent = l.slice(-200).map(function (e) { return new Date(e.time).toLocaleTimeString() + ' ' + e.level + ' ' + e.msg; }).join('\n'); }); }
   loadLogs();
+}
+
+// DNS lookup: records from a resolver over a chosen path (the router's
+// dnsmasq, WAN or a tunnel), with the route the query took.
+var DNS_TYPES = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS', 'SOA', 'PTR', 'SRV', 'HTTPS', 'CAA'];
+function dnsLookupCard(testRouting) {
+  var name = el('input', { type: 'text', placeholder: 'example.com or an IP address', size: 26, 'aria-label': 'Name to look up' });
+  var type = el('select', { 'aria-label': 'Record type' }, DNS_TYPES.map(function (t) { return el('option', { value: t }, t); }));
+  var via = el('select', { 'aria-label': 'Path' }, el('option', { value: 'router' }, "Router's dnsmasq (as LAN devices)"), el('option', { value: 'wan' }, 'WAN, direct'));
+  var server = el('input', { type: 'text', placeholder: '1.1.1.1', size: 16, 'aria-label': 'Resolver' });
+  var serverWrap = el('span', { class: 'row' }, el('span', { class: 'small muted' }, 'Resolver'), server);
+  var out = el('div');
+  api('GET', '/api/dnslookup/vias').then(function (vs) {
+    vs.filter(function (v) { return v !== 'router' && v !== 'wan'; }).forEach(function (t) {
+      var st = state.status && state.status.tunnels && state.status.tunnels[t];
+      via.appendChild(el('option', { value: t }, 'Tunnel ' + tunLabel(t) + (st && st.country ? ' (' + st.country + ')' : '') + (st && !st.healthy ? ' - unhealthy' : '')));
+    });
+  }).catch(function () {});
+  function sync() { serverWrap.style.display = via.value === 'router' ? 'none' : ''; }
+  via.addEventListener('change', sync); sync();
+
+  function query(v) {
+    var q = 'name=' + encodeURIComponent(name.value.trim()) + '&type=' + encodeURIComponent(type.value) + '&via=' + encodeURIComponent(v);
+    if (v !== 'router' && server.value.trim()) q += '&server=' + encodeURIComponent(server.value.trim());
+    return api('GET', '/api/dnslookup?' + q);
+  }
+  function viaLabel(v) { return v === 'router' ? "Router's dnsmasq" : v === 'wan' ? 'WAN, direct' : 'Tunnel ' + tunLabel(v); }
+  function render(r, title) {
+    var box = el('div', { class: 'tw:mt-2' });
+    if (title) box.appendChild(el('b', null, title));
+    box.appendChild(el('div', { class: 'row small muted' },
+      r.rcode ? badge(r.rcode, r.rcode === 'NOERROR' ? (r.records.some(function (x) { return x.section === 'answer'; }) ? 'ok' : 'warn') : 'bad') : null,
+      el('span', { class: 'mono' }, r.name + ' ' + r.type), r.server ? el('span', null, '@ ' + r.server) : null,
+      r.rtt_ms ? el('span', null, r.rtt_ms.toFixed(1) + ' ms') : null, r.tcp ? el('span', null, 'truncated over UDP, retried over TCP') : null));
+    if (r.error) box.appendChild(el('div', { class: 'err' }, r.error));
+    if (r.records && r.records.length) box.appendChild(el('div', { class: 'scroll' }, el('table', null,
+      el('tr', null, ['Name', 'TTL', 'Type', 'Data'].map(function (h) { return el('th', null, h); })),
+      r.records.map(function (x) {
+        return el('tr', { class: x.section === 'answer' ? '' : 'muted' }, el('td', { class: 'mono' }, x.name), el('td', null, x.ttl + 's'),
+          el('td', null, x.type + (x.section === 'answer' ? '' : ' (' + x.section + ')')), el('td', { class: 'mono' }, x.data));
+      }))));
+    else if (!r.error) box.appendChild(el('div', { class: 'small muted' }, 'No records.'));
+    if (r.route && r.route.length) {
+      box.appendChild(el('div', { class: 'small muted tw:mt-1.5' }, 'Route the query took'));
+      box.appendChild(el('ol', { class: 'route' }, r.route.map(function (h) {
+        return el('li', null, h.what, h.detail ? el('span', { class: 'small muted' }, ' - ' + h.detail) : null);
+      })));
+    }
+    return box;
+  }
+  function run() {
+    if (!name.value.trim()) { name.focus(); return; }
+    out.textContent = 'Looking up...';
+    query(via.value).then(function (r) {
+      out.innerHTML = '';
+      out.appendChild(render(r));
+      if (r.type === 'A' || r.type === 'AAAA' || r.type === 'CNAME') out.appendChild(el('div', { class: 'tw:mt-1.5' }, btn('How is this name routed?', function () { testRouting(r.name); })));
+    }).catch(function (e) { out.textContent = e.message; });
+  }
+  function compare() {
+    if (!name.value.trim()) { name.focus(); return; }
+    var vs = Array.prototype.map.call(via.options, function (o) { return o.value; });
+    out.innerHTML = '';
+    vs.forEach(function (v) {
+      var slot = el('div', { class: 'tw:mt-2 small muted' }, viaLabel(v) + ': looking up...');
+      out.appendChild(slot);
+      query(v).then(function (r) { slot.replaceWith(render(r, viaLabel(v))); }).catch(function (e) { slot.textContent = viaLabel(v) + ': ' + e.message; });
+    });
+  }
+  name.addEventListener('keydown', function (e) { if (e.key === 'Enter') run(); });
+  server.addEventListener('keydown', function (e) { if (e.key === 'Enter') run(); });
+  return el('div', { class: 'card' }, el('b', null, 'DNS lookup'),
+    el('div', { class: 'small muted' }, "Ask a resolver directly and see the route the query took. Compare paths to spot answers that differ by country, or DNS that leaves by the WAN."),
+    el('div', { class: 'row tw:my-1.5' }, name, type, via, serverWrap, btn('Look up', run, 'pri'), btn('Compare all paths', compare)),
+    out);
 }
 
 function browserLeakTest(box) {

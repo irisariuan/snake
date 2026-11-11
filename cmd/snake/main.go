@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -62,6 +63,8 @@ Usage: snake <command> [args]
   reload                  reload config.json from disk and apply
   policy list             list policies
   test <domain>           show how a domain is routed
+  lookup <name> [type] [router|wan|<tunnel>] [resolver]
+                          DNS lookup over a chosen path, with the route it took
   rules list|check|import|export
                           manage rule lists / .rules files (snake rules for help)
   learn list|show|new|set|add|rm|move|merge|delete|addrs|forget
@@ -120,6 +123,8 @@ func main() {
 			break
 		}
 		err = printCall("GET", "/api/test?domain="+args[0])
+	case "lookup":
+		err = lookupCmd(args)
 	case "rules":
 		err = rulesCmd(args)
 	case "learn", "learnings":
@@ -402,6 +407,20 @@ func printCall(method, path string) error {
 	out, _ := json.MarshalIndent(v, "", "  ")
 	fmt.Println(string(out))
 	return nil
+}
+
+// lookupCmd: snake lookup <name> [type] [router|wan|<tunnel>] [resolver]
+func lookupCmd(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: snake lookup <name> [type] [router|wan|<tunnel>] [resolver]")
+	}
+	q := url.Values{"name": {args[0]}}
+	for i, k := range []string{"type", "via", "server"} {
+		if len(args) > i+1 {
+			q.Set(k, args[i+1])
+		}
+	}
+	return printCall("GET", "/api/dnslookup?"+q.Encode())
 }
 
 // callOrLocal asks the daemon; when it is not running, applies directly.

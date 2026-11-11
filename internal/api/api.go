@@ -138,6 +138,13 @@ func (s *Server) routes(authed bool) http.Handler {
 		}
 		writeJSON(w, s.E.TestDomain(d))
 	})
+	mux.HandleFunc("GET /api/dnslookup", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		writeJSON(w, s.E.DNSLookup(q.Get("name"), q.Get("type"), q.Get("via"), q.Get("server")))
+	})
+	mux.HandleFunc("GET /api/dnslookup/vias", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, s.E.LookupVias())
+	})
 	mux.HandleFunc("GET /api/set", func(w http.ResponseWriter, r *http.Request) {
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 		if limit <= 0 || limit > 5000 {

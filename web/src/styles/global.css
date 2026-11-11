@@ -60,6 +60,8 @@
 #snake .scroll { @apply tw:overflow-x-auto; }
 #snake .kv { @apply tw:grid tw:gap-x-2.5 tw:gap-y-0.5; grid-template-columns: max-content 1fr; font-size: 12px; }
 #snake .kv span:nth-child(odd) { @apply tw:text-muted; }
+#snake ol.route { @apply tw:pl-5 tw:my-1; font-size: 12px; }
+#snake ol.route li { @apply tw:my-0.5; }
 #snake ul { @apply tw:pl-4.5 tw:my-1; }
 #snake .tun-list li { @apply tw:flex tw:gap-1.5 tw:items-center tw:my-0.75; }
 
