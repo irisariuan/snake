@@ -36,12 +36,14 @@ type Record struct {
 
 // Result is the outcome of a lookup.
 type Result struct {
-	Name    string   `json:"name"`
-	Type    string   `json:"type"`
-	Server  string   `json:"server"`
-	Via     string   `json:"via,omitempty"`
-	Rcode   string   `json:"rcode,omitempty"`
-	RTTMs   float64  `json:"rtt_ms,omitempty"`
+	Name   string `json:"name"`
+	Type   string `json:"type"`
+	Server string `json:"server"`
+	Via    string `json:"via,omitempty"`
+	Rcode  string `json:"rcode,omitempty"`
+	// TookMs is how long the lookup took, including a TCP retry, or
+	// until it failed.
+	TookMs  float64  `json:"took_ms"`
 	TCP     bool     `json:"tcp,omitempty"` // the UDP answer was truncated
 	Records []Record `json:"records"`
 	Error   string   `json:"error,omitempty"`
@@ -139,11 +141,11 @@ func Lookup(dial Dialer, server, name, typ string, timeout time.Duration) Result
 		res.TCP = true
 		resp, err = exchange(ctx, dial, "tcp", server, buf, q.ID)
 	}
+	res.TookMs = float64(time.Since(start).Microseconds()) / 1000
 	if err != nil {
 		res.Error = err.Error()
 		return res
 	}
-	res.RTTMs = float64(time.Since(start).Microseconds()) / 1000
 	res.Rcode = rcode(resp.RCode)
 	add := func(sec string, rs []dnsmessage.Resource) {
 		for _, r := range rs {

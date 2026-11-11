@@ -978,8 +978,10 @@ Diagnostics tab:
 * **Test a domain**: which policy matches, resolved addresses, and whether each
   one is in a set.
 * **DNS lookup**: any record type (A, AAAA, MX, TXT, PTR for an IP, ...)
-  from the router's dnsmasq, straight out the WAN, or through a tunnel to a
-  resolver of your choice, with the route the query took: the policy that
+  from the router's dnsmasq, straight out the WAN (to the router's own WAN
+  DNS setting, DNS-over-TLS included, unless you name a resolver), or
+  through a tunnel to a resolver of your choice, with the time it took and
+  the route the query took: the policy that
   resolves the name through its tunnel, the interface, gateway and routing
   table, and the tunnel's exit address. **Compare all paths** runs the
   lookup over every path at once. CLI: `snake lookup <name> [type]

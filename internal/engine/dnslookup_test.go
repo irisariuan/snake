@@ -58,13 +58,52 @@ func TestRouterRoute(t *testing.T) {
 		t.Errorf("route without a tunnel:\n%s", got)
 	}
 	got = hops(e.routerRoute(e.runtime(), "example.org"))
-	for _, want := range []string{"upstream resolvers | 1.1.1.1, 8.8.8.8", "Out interface eth0 (WAN, the ISP sees this query)", "gateway 198.51.100.1"} {
+	for _, want := range []string{"The router's WAN DNS: 1.1.1.1, 8.8.8.8", "Out interface eth0 (WAN, the ISP sees this query)", "gateway 198.51.100.1"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("WAN route lacks %q:\n%s", want, got)
 		}
 	}
 	if strings.Contains(got, "192.168.1.1") {
 		t.Errorf("domain-specific server listed as upstream:\n%s", got)
+	}
+	if w := e.wanDNS(); len(w.Servers) != 2 || w.Servers[0] != "1.1.1.1" || w.DoT {
+		t.Errorf("WAN DNS: %+v", w)
+	}
+}
+
+func TestWANDNSSetting(t *testing.T) {
+	e, rec := lookupEngine(t)
+	old := resolvDnsmasq
+	resolvDnsmasq = filepath.Join(t.TempDir(), "missing")
+	defer func() { resolvDnsmasq = old }()
+	rec.Responses["nvram get wan0_dns"] = "203.0.113.53 203.0.113.54\n"
+	if w := e.wanDNS(); len(w.Servers) != 2 || w.Servers[0] != "203.0.113.53" || w.Source != "nvram wan0_dns" {
+		t.Fatalf("ISP DNS: %+v", w)
+	}
+	// Merlin's DNS-over-TLS: dnsmasq asks Stubby, which asks over TLS.
+	rec.Responses["nvram get dnspriv_enable"] = "1"
+	rec.Responses["nvram get dnspriv_rulelist"] = "<1.1.1.1>>cloudflare-dns.com><9.9.9.9>853>dns.quad9.net>"
+	w := e.wanDNS()
+	if !w.DoT || w.Servers[0] != "127.0.1.1" || len(w.DoTServers) != 2 || w.DoTServers[0] != "1.1.1.1 (cloudflare-dns.com)" || w.DoTServers[1] != "9.9.9.9:853 (dns.quad9.net)" {
+		t.Fatalf("DoT: %+v", w)
+	}
+	got := hops(e.routerRoute(e.runtime(), "example.org"))
+	for _, want := range []string{"Stubby on 127.0.1.1", "Sent over TLS to 1.1.1.1 (cloudflare-dns.com)", "Out interface eth0"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("DoT route lacks %q:\n%s", want, got)
+		}
+	}
+	// The WAN path with no resolver given follows the same setting.
+	r := e.DNSLookup("example.org", "A", "wan", "")
+	if r.Server != "127.0.1.1:53" || !strings.Contains(hops(r.Route), "Stubby") {
+		t.Fatalf("WAN path ignores the router's DNS setting: %s\n%s", r.Server, hops(r.Route))
+	}
+	if r.Error != "" && r.TookMs <= 0 {
+		t.Fatalf("failed lookup has no time: %+v", r.Result)
+	}
+	// A resolver typed in is asked as given.
+	if r := e.DNSLookup("example.org", "A", "wan", "127.0.0.9:5353"); r.Server != "127.0.0.9:5353" {
+		t.Fatalf("typed resolver: %s", r.Server)
 	}
 }
 

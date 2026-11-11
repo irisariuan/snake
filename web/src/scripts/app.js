@@ -1014,6 +1014,7 @@ function viewDiag(b) {
 
 // DNS lookup: records from a resolver over a chosen path (the router's
 // dnsmasq, WAN or a tunnel), with the route the query took.
+function fmtMs(ms) { return ms >= 1000 ? (ms / 1000).toFixed(2) + ' s' : ms >= 10 ? ms.toFixed(0) + ' ms' : ms.toFixed(1) + ' ms'; }
 var DNS_TYPES = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS', 'SOA', 'PTR', 'SRV', 'HTTPS', 'CAA'];
 function dnsLookupCard(testRouting) {
   var name = el('input', { type: 'text', placeholder: 'example.com or an IP address', size: 26, 'aria-label': 'Name to look up' });
@@ -1022,13 +1023,23 @@ function dnsLookupCard(testRouting) {
   var server = el('input', { type: 'text', placeholder: '1.1.1.1', size: 16, 'aria-label': 'Resolver' });
   var serverWrap = el('span', { class: 'row' }, el('span', { class: 'small muted' }, 'Resolver'), server);
   var out = el('div');
-  api('GET', '/api/dnslookup/vias').then(function (vs) {
-    vs.filter(function (v) { return v !== 'router' && v !== 'wan'; }).forEach(function (t) {
+  var wanDNS = null;
+  api('GET', '/api/dnslookup/vias').then(function (p) {
+    wanDNS = p.wan_dns; sync();
+    p.vias.filter(function (v) { return v !== 'router' && v !== 'wan'; }).forEach(function (t) {
       var st = state.status && state.status.tunnels && state.status.tunnels[t];
       via.appendChild(el('option', { value: t }, 'Tunnel ' + tunLabel(t) + (st && st.country ? ' (' + st.country + ')' : '') + (st && !st.healthy ? ' - unhealthy' : '')));
     });
   }).catch(function () {});
-  function sync() { serverWrap.style.display = via.value === 'router' ? 'none' : ''; }
+  // WAN uses the router's own WAN DNS setting unless a resolver is typed.
+  function wanHint() {
+    if (!wanDNS || !wanDNS.servers || !wanDNS.servers.length) return '1.1.1.1';
+    return wanDNS.dot ? 'router DNS (DoT)' : 'router DNS (' + wanDNS.servers[0] + ')';
+  }
+  function sync() {
+    serverWrap.style.display = via.value === 'router' ? 'none' : '';
+    server.placeholder = via.value === 'wan' ? wanHint() : '1.1.1.1';
+  }
   via.addEventListener('change', sync); sync();
 
   function query(v) {
@@ -1039,11 +1050,11 @@ function dnsLookupCard(testRouting) {
   function viaLabel(v) { return v === 'router' ? "Router's dnsmasq" : v === 'wan' ? 'WAN, direct' : 'Tunnel ' + tunLabel(v); }
   function render(r, title) {
     var box = el('div', { class: 'tw:mt-2' });
-    if (title) box.appendChild(el('b', null, title));
+    if (title) box.appendChild(el('div', { class: 'row' }, el('b', null, title), r.took_ms != null ? el('span', { class: 'small muted' }, fmtMs(r.took_ms)) : null));
     box.appendChild(el('div', { class: 'row small muted' },
       r.rcode ? badge(r.rcode, r.rcode === 'NOERROR' ? (r.records.some(function (x) { return x.section === 'answer'; }) ? 'ok' : 'warn') : 'bad') : null,
       el('span', { class: 'mono' }, r.name + ' ' + r.type), r.server ? el('span', null, '@ ' + r.server) : null,
-      r.rtt_ms ? el('span', null, r.rtt_ms.toFixed(1) + ' ms') : null, r.tcp ? el('span', null, 'truncated over UDP, retried over TCP') : null));
+      r.took_ms != null ? el('span', null, (r.error ? 'failed after ' : 'took ') + fmtMs(r.took_ms)) : null, r.tcp ? el('span', null, 'truncated over UDP, retried over TCP') : null));
     if (r.error) box.appendChild(el('div', { class: 'err' }, r.error));
     if (r.records && r.records.length) box.appendChild(el('div', { class: 'scroll' }, el('table', null,
       el('tr', null, ['Name', 'TTL', 'Type', 'Data'].map(function (h) { return el('th', null, h); })),
@@ -1082,7 +1093,7 @@ function dnsLookupCard(testRouting) {
   name.addEventListener('keydown', function (e) { if (e.key === 'Enter') run(); });
   server.addEventListener('keydown', function (e) { if (e.key === 'Enter') run(); });
   return el('div', { class: 'card' }, el('b', null, 'DNS lookup'),
-    el('div', { class: 'small muted' }, "Ask a resolver directly and see the route the query took. Compare paths to spot answers that differ by country, or DNS that leaves by the WAN."),
+    el('div', { class: 'small muted' }, "Ask a resolver directly and see the route the query took and how long it took. WAN uses the router's own WAN DNS setting (including DNS-over-TLS) unless you type a resolver. Compare paths to spot answers that differ by country, or DNS that leaves by the WAN."),
     el('div', { class: 'row tw:my-1.5' }, name, type, via, serverWrap, btn('Look up', run, 'pri'), btn('Compare all paths', compare)),
     out);
 }
