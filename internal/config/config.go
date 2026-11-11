@@ -336,7 +336,9 @@ const (
 
 // ECH modes: what the SNI proxy does with Encrypted Client Hello
 // connections, whose real server name is hidden behind a public one
-// (e.g. cloudflare-ech.com).
+// (e.g. cloudflare-ech.com). The policies covering a device are tried in
+// policy order; the first that takes the connection decides. Relay takes
+// it only when its rules match the public name; the others take all.
 const (
 	// ECHDrop resets them, so a hidden name cannot get past drop: rules.
 	ECHDrop = "drop"
@@ -348,7 +350,7 @@ const (
 	// included) still apply first; the shared CDN address is not learned.
 	ECHRoute = "route"
 	// ECHPassthrough relays them via WAN untouched: the policy's rules,
-	// drop: rules included, are not applied to them.
+	// drop: rules included, are not applied to them, nor later policies'.
 	ECHPassthrough = "passthrough"
 )
 

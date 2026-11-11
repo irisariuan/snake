@@ -509,16 +509,18 @@ What it costs and where it stops:
 
   | Mode | What happens |
   |---|---|
-  | **Relay** (`relay`, default) | Routed by the **public name** like any other connection: add it to the policy (`cloudflare-ech.com`) to send them through its tunnel, which then carries all ECH traffic to that CDN, or leave it out and they go via WAN. `drop:` rules for the public name apply. Once the destination is learned, other connections to that CDN address follow it too. |
-  | **Drop** (`drop`) | **Reset**, so a hidden name cannot get past the policy's `drop:` rules. Browsers using DoH do not retry without ECH, so sites behind ECH-enabled CDNs (much of Cloudflare) stop loading on those devices. ECH adds no risk to the router or the network: only choose this if you rely on `drop:` rules for blocking. |
-  | **Route** (`route`) | **All through the tunnel**, whatever the public name, so sites hidden behind ECH cannot get around the policy. Also catches ECH sites you did not add. Rules for the public name (`drop:` rules included) still apply first. The shared CDN address is not learned, so connections to it without ECH are still matched by their own name. |
-  | **Passthrough** (`passthrough`) | **Left alone**: relayed via WAN untouched. The policy does not route them by the public name and its `drop:` rules do not apply to them. |
+  | **Relay** (`relay`, default) | Routed by the **public name** like any other connection: add it to the policy (`cloudflare-ech.com`) to send them through its tunnel, which then carries all ECH traffic to that CDN, or leave it out and they go on to the next policy (via WAN if none takes them). `drop:` rules for the public name apply. Once the destination is learned, other connections to that CDN address follow it too. |
+  | **Drop** (`drop`) | **Reset**, so a hidden name cannot get past the policy's `drop:` rules. Browsers using DoH do not retry without ECH, so sites behind ECH-enabled CDNs (much of Cloudflare) stop loading on those devices. ECH adds no risk to the router or the network: only choose this if you rely on `drop:` rules for blocking. Later policies do not get the connection. |
+  | **Route** (`route`) | **All through the tunnel**, whatever the public name, so sites hidden behind ECH cannot get around the policy. Also catches ECH sites you did not add. Rules for the public name (`drop:` rules included) still apply first, and later policies do not get the connection. The shared CDN address is not learned, so connections to it without ECH are still matched by their own name. |
+  | **Passthrough** (`passthrough`) | **Left alone**: relayed via WAN untouched. The policy does not route them by the public name and its `drop:` rules do not apply to them. Later policies do not get the connection either. |
 
-  When several policies cover a device, one set to Drop is enough to reset
-  its ECH connections. Otherwise its Relay and Route policies take them in
-  policy order: a Relay policy when its rules match the public name, a
-  Route policy always (after checking its own rules). Passthrough policies
-  are skipped; with no taker, the connection goes via WAN. The Status tab
+  When several policies cover a device, they are tried **in policy order**
+  and the first that takes the connection decides. Drop, Route and
+  Passthrough take every ECH connection (Route after checking its own
+  rules); Relay takes it only when its rules match the public name, and
+  otherwise passes it on to the next policy. With no taker, it goes via
+  WAN. So a Drop policy only resets ECH connections that no earlier policy
+  took: put it first if its `drop:` rules must not be bypassed. The Status tab
   counts ECH connections, and how many were dropped, routed or passed
   through.
   Older configs convert by themselves: `refuse_ech: true` becomes Drop,

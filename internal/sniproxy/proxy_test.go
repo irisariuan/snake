@@ -506,26 +506,43 @@ func TestProxyPassthroughECH(t *testing.T) {
 		t.Fatalf("stats %+v", st)
 	}
 
-	// A later relay policy routes the public name; passthrough does not
-	// stop it.
+	// Policy order decides: passthrough first stops a later relay policy;
+	// a relay policy first whose rules match takes it.
 	relay := Policy{ID: 2, Name: "relay", ECH: ECHRelay, Mark: 0x20000, Set: match.MustCompile([]string{"cloudflare-ech.com"})}
-	h2 := newHarness(t, []Policy{pass, relay})
 	hello := buildHello(sniExt("cloudflare-ech.com"), ext)
-	if _, err := h2.send(t, hello); err != nil {
+	for _, c := range []struct {
+		pols   []Policy
+		mark   uint32
+		passed uint64
+	}{{[]Policy{pass, relay}, 0, 1}, {[]Policy{relay, pass}, 0x20000, 0}} {
+		h2 := newHarness(t, c.pols)
+		if _, err := h2.send(t, hello); err != nil {
+			t.Fatal(err)
+		}
+		if m := h2.mark(t); m != c.mark {
+			t.Fatalf("%s first: mark %#x, want %#x", c.pols[0].Name, m, c.mark)
+		}
+		if st := h2.p.Stats(); st.ECHPassed != c.passed {
+			t.Fatalf("%s first: stats %+v", c.pols[0].Name, st)
+		}
+	}
+	// A relay policy whose rules do not match passes it on to the next.
+	other := Policy{ID: 3, Name: "other", ECH: ECHRelay, Mark: 0x30000, Set: match.MustCompile([]string{"example.org"})}
+	h3 := newHarness(t, []Policy{other, pass})
+	if _, err := h3.send(t, hello); err != nil {
 		t.Fatal(err)
 	}
-	if m := h2.mark(t); m != 0x20000 {
-		t.Fatalf("relay policy after passthrough: mark %#x", m)
+	if m := h3.mark(t); m != 0 {
+		t.Fatalf("unmatched relay then passthrough: mark %#x", m)
 	}
-	if st := h2.p.Stats(); st.ECHPassed != 0 {
-		t.Fatalf("counted as passed through although routed: %+v", st)
+	if st := h3.p.Stats(); st.ECHPassed != 1 {
+		t.Fatalf("stats %+v", st)
 	}
 }
 
 // ech: route sends every ECH connection through the policy's tunnel,
 // whatever the public name, without learning the shared CDN address. Its
-// rules for the public name, and a policy before it, still come first;
-// drop wins over it.
+// rules for the public name, and policies before it, still come first.
 func TestProxyRouteECH(t *testing.T) {
 	route := netflix()
 	route.ECH = ECHRoute
@@ -563,10 +580,11 @@ func TestProxyRouteECH(t *testing.T) {
 	}
 
 	// An earlier relay policy whose rules match the public name takes it;
-	// other ECH connections fall to the route policy, before passthrough.
+	// other ECH connections fall to the route policy, which a later
+	// passthrough policy does not affect.
 	relay := Policy{ID: 2, Name: "relay", ECH: ECHRelay, Mark: 0x20000, Set: match.MustCompile([]string{"cloudflare-ech.com"})}
 	pass := Policy{ID: 3, Name: "pass", ECH: ECHPassthrough, Mark: 0x30000, Set: match.MustCompile([]string{"example.org"})}
-	h2 := newHarness(t, []Policy{pass, relay, route})
+	h2 := newHarness(t, []Policy{relay, route, pass})
 	for outer, want := range map[string]uint32{"cloudflare-ech.com": 0x20000, "public.example.org": 0x10000} {
 		if _, err := h2.send(t, buildHello(sniExt(outer), ext)); err != nil {
 			t.Fatal(err)
@@ -579,14 +597,35 @@ func TestProxyRouteECH(t *testing.T) {
 		t.Fatalf("stats %+v", st)
 	}
 
-	// Drop wins over route.
+	// Between route, drop and passthrough, the first policy decides.
 	drop := Policy{ID: 4, Name: "drop", ECH: ECHDrop, Mark: 0x40000, Set: match.MustCompile([]string{"x.example"})}
+	hello := buildHello(sniExt("cloudflare-ech.com"), ext)
 	h3 := newHarness(t, []Policy{route, drop})
-	if got, _ := h3.send(t, buildHello(sniExt("cloudflare-ech.com"), ext)); len(got) != 0 {
-		t.Fatalf("relayed %d bytes despite a drop policy", len(got))
+	if _, err := h3.send(t, hello); err != nil {
+		t.Fatal(err)
 	}
-	if st := h3.p.Stats(); st.ECHRefused != 1 || st.ECHRouted != 0 {
-		t.Fatalf("stats %+v", st)
+	if m := h3.mark(t); m != 0x10000 {
+		t.Fatalf("route before drop: mark %#x", m)
+	}
+	if st := h3.p.Stats(); st.ECHRefused != 0 || st.ECHRouted != 1 {
+		t.Fatalf("route before drop: stats %+v", st)
+	}
+	h4 := newHarness(t, []Policy{drop, route})
+	if got, _ := h4.send(t, hello); len(got) != 0 {
+		t.Fatalf("drop before route: relayed %d bytes", len(got))
+	}
+	if st := h4.p.Stats(); st.ECHRefused != 1 || st.ECHRouted != 0 {
+		t.Fatalf("drop before route: stats %+v", st)
+	}
+	h5 := newHarness(t, []Policy{pass, route})
+	if _, err := h5.send(t, hello); err != nil {
+		t.Fatal(err)
+	}
+	if m := h5.mark(t); m != 0 {
+		t.Fatalf("passthrough before route: mark %#x", m)
+	}
+	if st := h5.p.Stats(); st.ECHPassed != 1 || st.ECHRouted != 0 {
+		t.Fatalf("passthrough before route: stats %+v", st)
 	}
 }
 

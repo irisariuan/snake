@@ -851,10 +851,10 @@ function tunnelOptions() {
 }
 // What the SNI proxy does with a policy's Encrypted Client Hello connections.
 var ECH_MODES = [
-  ['relay', 'Relay: route by the public name (default)', 'ECH hides the real server name behind a public one (e.g. cloudflare-ech.com). The connection is routed by that public name like any other: add it to this policy\'s rules to send ECH traffic through the tunnel, otherwise it goes via WAN. drop: rules for the public name apply.'],
-  ['drop', 'Drop: reset ECH connections', 'Resets them, so a hidden name cannot get past this policy\'s drop: rules. Sites behind ECH-enabled CDNs (much of Cloudflare) then fail to load in browsers using DoH; browsers do not retry without ECH.'],
-  ['route', 'Route: send all of them through the tunnel', 'Sends every ECH connection from this policy\'s devices through its tunnel, whatever the public name, so ECH sites cannot get around the policy. This includes ECH sites you did not add, so more traffic uses the tunnel. Rules for the public name, drop: rules included, still apply first. The shared CDN address is not learned, so connections to it without ECH are still matched by name.'],
-  ['passthrough', 'Passthrough: leave them alone', 'Relays them via WAN untouched: this policy does not route them and its drop: rules do not apply to them. A later policy set to Relay or Route can still route them.'],
+  ['relay', 'Relay: route by the public name (default)', 'ECH hides the real server name behind a public one (e.g. cloudflare-ech.com). The connection is routed by that public name like any other: add it to this policy\'s rules to send ECH traffic through the tunnel, otherwise it goes on to the next policy (via WAN if none takes it). drop: rules for the public name apply.'],
+  ['drop', 'Drop: reset ECH connections', 'Resets them, so a hidden name cannot get past this policy\'s drop: rules. Sites behind ECH-enabled CDNs (much of Cloudflare) then fail to load in browsers using DoH; browsers do not retry without ECH. Policies are tried in order: an earlier policy set to Route or Passthrough, or a Relay policy whose rules match, takes the connection first.'],
+  ['route', 'Route: send all of them through the tunnel', 'Sends every ECH connection from this policy\'s devices through its tunnel, whatever the public name, so ECH sites cannot get around the policy. This includes ECH sites you did not add, so more traffic uses the tunnel. Rules for the public name, drop: rules included, still apply first. Later policies do not get them. The shared CDN address is not learned, so connections to it without ECH are still matched by name.'],
+  ['passthrough', 'Passthrough: leave them alone', 'Relays them via WAN untouched: this policy does not route them and its drop: rules do not apply to them. Later policies do not get them; an earlier policy can still take them first.'],
 ];
 function echMode(L) {
   if (!L.ech) L.ech = L.refuse_ech ? 'drop' : 'relay';

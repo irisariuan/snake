@@ -17,15 +17,18 @@
 //
 // With Encrypted Client Hello (ECH) the real server name is encrypted; only
 // the outer, public name (e.g. cloudflare-ech.com) is visible. Each policy
-// chooses what happens to its clients' ECH connections (Policy.ECH):
-//   - drop: reset, so its drop: rules cannot be bypassed by hiding the name
-//     (one such policy for the client is enough);
-//   - relay: routed by the public name like any other connection: a rule
-//     for it sends them through the policy's tunnel;
-//   - route: all of them go through the policy's tunnel, whatever the
+// chooses what happens to its clients' ECH connections (Policy.ECH). The
+// policies applying to the client are tried in policy order, and the first
+// that takes the connection decides:
+//   - drop: takes all of them and resets them, so its drop: rules cannot be
+//     bypassed by hiding the name;
+//   - relay: takes those whose public name its rules match, routed like
+//     any other connection; the others go on to the next policy;
+//   - route: takes all of them through the policy's tunnel, whatever the
 //     public name (its rules for the public name still apply first);
-//   - passthrough: the policy ignores them; with no relay or route policy
-//     matching, they go via WAN untouched.
+//   - passthrough: takes all of them and sends them via WAN untouched.
+//
+// With no policy taking it, the connection goes via WAN.
 package sniproxy
 
 import (
@@ -385,41 +388,37 @@ func inNets(nets []netip.Prefix, a netip.Addr) bool {
 	return false
 }
 
-// echPolicies splits the policies applying to the client by ECH mode: a
-// policy that drops ECH (first one), the policies that relay or route ECH
-// (in policy order), and whether any passes it through.
-func (p *Proxy) echPolicies(client netip.Addr) (drop *Policy, routing []Policy, passthrough bool) {
-	for _, pol := range p.applicable(client) {
-		switch pol.ECH {
-		case ECHDrop:
-			if drop == nil {
-				pol := pol
-				drop = &pol
-			}
-		case ECHPassthrough:
-			passthrough = true
-		default:
-			routing = append(routing, pol)
-		}
-	}
-	return drop, routing, passthrough
-}
+// ECH outcomes of matchECH.
+const (
+	echNoTaker  = iota // no policy took it: via WAN
+	echByRule          // a policy's rules matched the public name: res applies
+	echRouteAll        // a route policy took it: through its tunnel, not learned
+	echReset           // a drop policy took it: reset
+	echPassed          // a passthrough policy took it: via WAN untouched
+)
 
 // matchECH finds, in policy order, the first of pols that takes an ECH
-// connection with the public name name: a policy whose rules match it, or
-// a route policy, which takes every ECH connection. all reports the
-// latter: the destination is then not learned, since it is a CDN address
-// that many unrelated sites share.
-func matchECH(name string, pols []Policy) (pol Policy, res match.Result, ok, all bool) {
+// connection with the public name name, and what it does with it. A relay
+// policy takes it only when its rules match; drop, route and passthrough
+// policies take every ECH connection (route after its own rules). A route
+// policy's destination is not learned, since it is a CDN address that
+// many unrelated sites share.
+func matchECH(name string, pols []Policy) (pol Policy, res match.Result, outcome int) {
 	for _, pol := range pols {
+		switch pol.ECH {
+		case ECHDrop:
+			return pol, match.Result{}, echReset
+		case ECHPassthrough:
+			return pol, match.Result{}, echPassed
+		}
 		if pol, res, ok := matchIn(name, []Policy{pol}); ok {
-			return pol, res, true, false
+			return pol, res, echByRule
 		}
 		if pol.ECH == ECHRoute {
-			return pol, match.Result{Matched: true}, true, true
+			return pol, match.Result{Matched: true}, echRouteAll
 		}
 	}
-	return Policy{}, match.Result{}, false, false
+	return Policy{}, match.Result{}, echNoTaker
 }
 
 func (p *Proxy) handle(c *net.TCPConn) {
@@ -477,24 +476,24 @@ func (p *Proxy) handle(c *net.TCPConn) {
 	var ok, echAll bool
 	if hello.ECH {
 		p.ech.Add(1)
-		drop, routing, passthrough := p.echPolicies(client)
-		if drop != nil {
+		var outcome int
+		pol, res, outcome = matchECH(hello.ServerName, p.applicable(client))
+		switch outcome {
+		case echReset:
 			p.echRef.Add(1)
-			logx.Debugf("sni proxy: %s -> %s (%s) refused: Encrypted Client Hello (policy %s)", client, dst, hello.ServerName, drop.Name)
+			logx.Debugf("sni proxy: %s -> %s (%s) refused: Encrypted Client Hello (policy %s)", client, dst, hello.ServerName, pol.Name)
 			reset(c)
 			return
-		}
-		// Routed by the outer (public) name by the policies that relay
-		// ECH, or whatever the name by a route policy; passthrough
-		// policies leave it alone.
-		pol, res, ok, echAll = matchECH(hello.ServerName, routing)
-		if echAll {
+		case echPassed:
+			p.echPass.Add(1)
+			logx.Debugf("sni proxy: %s -> %s (%s) passed through: Encrypted Client Hello (policy %s)", client, dst, hello.ServerName, pol.Name)
+			pol = Policy{}
+		case echRouteAll:
+			echAll, ok = true, true
 			p.echRout.Add(1)
 			logx.Debugf("sni proxy: %s -> %s (%s) routed: Encrypted Client Hello (policy %s)", client, dst, hello.ServerName, pol.Name)
-		}
-		if !ok && passthrough {
-			p.echPass.Add(1)
-			logx.Debugf("sni proxy: %s -> %s (%s) passed through: Encrypted Client Hello", client, dst, hello.ServerName)
+		case echByRule:
+			ok = true
 		}
 	} else {
 		pol, res, ok = p.match(hello.ServerName, client)
