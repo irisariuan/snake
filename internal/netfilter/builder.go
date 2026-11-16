@@ -169,6 +169,7 @@ func Build(s config.Settings, states []PolicyState, opt Options) Plan {
 		plan.Hooks = append(plan.Hooks,
 			Hook{V6: v6, Table: "mangle", Chain: "FORWARD", Args: []string{"-j", ChainMSS}},
 			Hook{V6: v6, Table: "mangle", Chain: "OUTPUT", Args: []string{"-p", "udp", "--sport", "53", "-j", ChainDNSOut}},
+			Hook{V6: v6, Table: "mangle", Chain: "OUTPUT", Args: []string{"-p", "tcp", "--sport", "53", "-j", ChainDNSOut}},
 			Hook{V6: v6, Table: "filter", Chain: "FORWARD", Args: []string{"-j", ChainFwd}},
 		)
 		if !v6 || opt.IPv6NAT {

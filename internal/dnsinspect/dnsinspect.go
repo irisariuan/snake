@@ -4,8 +4,9 @@
 //
 // Answers are taken from an NFQUEUE on the router's OUTPUT path and released
 // only after the addresses are in the set, so the client's first connection
-// already follows the policy. The queue is fail-open: when the daemon is not
-// running, answers pass straight through.
+// already follows the policy. Answers over TCP are reassembled from their
+// connection's segments (tcp.go). The queue is fail-open: when the daemon is
+// not running, answers pass straight through.
 package dnsinspect
 
 import (
@@ -137,6 +138,7 @@ type Stats struct {
 	Sessions uint64 `json:"sessions"` // matched a session: rule (routed for the asking device)
 	Added    uint64 `json:"added"`
 	Errors   uint64 `json:"errors"`
+	TCP      uint64 `json:"tcp"` // answers that came over TCP (included in Answers)
 }
 
 // inspectorWorkers bounds concurrent set updates for held answers.
@@ -158,12 +160,13 @@ type Inspector struct {
 	pending map[string]chan struct{} // set+addr being added right now
 	stats   Stats
 	queue   uint16
+	tcp     tcpTracker
 }
 
 // Stats returns a copy of the counters.
 func (i *Inspector) Stats() Stats {
 	return Stats{Answers: atomic.LoadUint64(&i.stats.Answers), Matched: atomic.LoadUint64(&i.stats.Matched), Dropped: atomic.LoadUint64(&i.stats.Dropped), Sessions: atomic.LoadUint64(&i.stats.Sessions),
-		Added: atomic.LoadUint64(&i.stats.Added), Errors: atomic.LoadUint64(&i.stats.Errors)}
+		Added: atomic.LoadUint64(&i.stats.Added), Errors: atomic.LoadUint64(&i.stats.Errors), TCP: atomic.LoadUint64(&i.stats.TCP)}
 }
 
 // Record describes how an address got into a policy's domain set.
@@ -385,14 +388,27 @@ func (i *Inspector) Start(queue uint16) error {
 // in the sets); otherwise it returns the work that must finish first.
 func (i *Inspector) handle(raw []byte) func() {
 	pk, ok := packet.Parse(raw)
-	if !ok || !pk.UDP {
+	switch {
+	case !ok:
 		return nil
+	case pk.UDP:
+		return i.handleMsg(pk.Dst, pk.Payload, false)
+	case pk.TCP:
+		return i.handleTCP(pk)
 	}
-	ans, ok := ParseAnswer(pk.Payload)
+	return nil
+}
+
+// handleMsg inspects one DNS message sent to dst.
+func (i *Inspector) handleMsg(dst net.IP, msg []byte, tcp bool) func() {
+	ans, ok := ParseAnswer(msg)
 	if !ok || len(ans.IPs) == 0 {
 		return nil
 	}
 	atomic.AddUint64(&i.stats.Answers, 1)
+	if tcp {
+		atomic.AddUint64(&i.stats.TCP, 1)
+	}
 	i.mu.Lock()
 	rules := i.rules
 	i.mu.Unlock()
@@ -406,10 +422,10 @@ func (i *Inspector) handle(raw []byte) func() {
 	if res.Route {
 		// Route or drop sessions for the asking device, by its condition;
 		// never the sets.
-		if r.Route == nil || pk.Dst.IsLoopback() {
+		if r.Route == nil || dst.IsLoopback() {
 			return nil
 		}
-		client := pk.Dst.String()
+		client := dst.String()
 		addrs := make([]string, 0, len(ans.IPs))
 		for _, ip := range ans.IPs {
 			addrs = append(addrs, ip.String())
@@ -433,12 +449,12 @@ func (i *Inspector) handle(raw []byte) func() {
 	if res.Session && r.Session != nil {
 		// Routed for the asking device only: no sets, no records. The
 		// router's own lookups (pre-resolving) start no session.
-		if pk.Dst.IsLoopback() {
+		if dst.IsLoopback() {
 			return nil
 		}
 		atomic.AddUint64(&i.stats.Matched, 1)
 		atomic.AddUint64(&i.stats.Sessions, 1)
-		client := pk.Dst.String()
+		client := dst.String()
 		addrs := make([]string, 0, len(ans.IPs))
 		for _, ip := range ans.IPs {
 			addrs = append(addrs, ip.String())
@@ -462,8 +478,8 @@ func (i *Inspector) handle(raw []byte) func() {
 	var keys []string
 	var waits []chan struct{}
 	now := time.Now()
-	client := pk.Dst.String()
-	if pk.Dst.IsLoopback() {
+	client := dst.String()
+	if dst.IsLoopback() {
 		client = "router"
 	}
 	i.mu.Lock()
@@ -563,6 +579,15 @@ func (i *Inspector) Stop() {
 // Query asks a resolver for A and AAAA records of name and returns the
 // combined answer, including the CNAME chain (used by the domain tester).
 func Query(server, name string, timeout time.Duration) (Answer, error) {
+	return query(server, name, timeout, false)
+}
+
+// QueryTCP is Query over TCP.
+func QueryTCP(server, name string, timeout time.Duration) (Answer, error) {
+	return query(server, name, timeout, true)
+}
+
+func query(server, name string, timeout time.Duration, tcp bool) (Answer, error) {
 	out := Answer{Question: clean(name)}
 	fqdn, err := dnsmessage.NewName(strings.TrimSuffix(name, ".") + ".")
 	if err != nil {
@@ -578,6 +603,20 @@ func Query(server, name string, timeout time.Duration) (Answer, error) {
 		buf, err := m.Pack()
 		if err != nil {
 			return out, err
+		}
+		if tcp {
+			resp, err := queryTCP(server, buf, timeout)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			a, ok := ParseAnswer(resp)
+			if !ok {
+				continue
+			}
+			got = true
+			out.merge(a)
+			continue
 		}
 		c, err := net.DialTimeout("udp", server, timeout)
 		if err != nil {
@@ -601,16 +640,7 @@ func Query(server, name string, timeout time.Duration) (Answer, error) {
 			continue
 		}
 		got = true
-		for _, cn := range a.Chain {
-			dup := false
-			for _, x := range out.Chain {
-				dup = dup || x == cn
-			}
-			if !dup {
-				out.Chain = append(out.Chain, cn)
-			}
-		}
-		out.IPs = append(out.IPs, a.IPs...)
+		out.merge(a)
 	}
 	if !got && lastErr != nil {
 		return out, lastErr
@@ -619,6 +649,20 @@ func Query(server, name string, timeout time.Duration) (Answer, error) {
 		return out, fmt.Errorf("no answer for %s", name)
 	}
 	return out, nil
+}
+
+// merge adds a's CNAME chain (without duplicates) and addresses to out.
+func (out *Answer) merge(a Answer) {
+	for _, cn := range a.Chain {
+		dup := false
+		for _, x := range out.Chain {
+			dup = dup || x == cn
+		}
+		if !dup {
+			out.Chain = append(out.Chain, cn)
+		}
+	}
+	out.IPs = append(out.IPs, a.IPs...)
 }
 
 // recordConds hands the answer's addresses to every policy whose route:

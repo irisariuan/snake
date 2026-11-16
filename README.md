@@ -346,10 +346,10 @@ snake rules export --policy "Netflix US" --expand
 * **Plain domain rules** (`example.com`) are also written as dnsmasq
   `ipset=` lines. They keep working even if the daemon is down.
 * **The DNS inspector** handles everything else (and CNAME chains). It reads
-  dnsmasq's UDP answers to LAN clients from an NFQUEUE on the router's OUTPUT
-  path, matches every name in the answer, and adds the A/AAAA addresses to the
-  first matching policy's set. Only then does it release the answer, so the
-  client's first connection is already routed.
+  dnsmasq's answers to LAN clients (UDP and TCP) from an NFQUEUE on the
+  router's OUTPUT path, matches every name in the answer, and adds the A/AAAA
+  addresses to the first matching policy's set. Only then does it release the
+  answer, so the client's first connection is already routed.
 * **Latency.** Every DNS answer to the LAN passes through the inspector, so
   it is built to stay out of the way of names no policy routes:
   * Plain domain rules (`example.com`, `.example.com`, `=example.com`) are
@@ -367,8 +367,11 @@ snake rules export --policy "Netflix US" --expand
   cannot honour them.
 * **Without NFQUEUE** in the kernel, only plain domain rules work (exclusions
   are ignored). Status and the leak audit say so.
-* **TCP DNS answers** are not inspected. Clients use UDP unless an answer is
-  truncated.
+* **TCP DNS answers** (used when a UDP answer is truncated, or by clients set
+  to always use TCP) are reassembled from the connection's segments: the
+  segment that completes an answer is held until its addresses are in the
+  set. A connection that was already open when the daemon started, or that
+  loses a segment, is passed through uninspected.
 
 ## Leak protection
 

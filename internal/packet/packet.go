@@ -1,4 +1,4 @@
-// Package packet parses the IPv4/IPv6 + UDP headers of queued packets.
+// Package packet parses the IPv4/IPv6 + UDP/TCP headers of queued packets.
 package packet
 
 import (
@@ -8,13 +8,25 @@ import (
 
 // Packet is the subset of a queued packet we care about.
 type Packet struct {
-	Src, Dst net.IP
-	DstPort  uint16
-	UDP      bool
-	Payload  []byte
+	Src, Dst         net.IP
+	SrcPort, DstPort uint16
+	UDP              bool
+	TCP              bool
+	Seq              uint32 // TCP sequence number
+	Flags            uint8  // TCP flags (FlagFIN, ...)
+	Payload          []byte // UDP or TCP payload
 }
 
-// Parse extracts IP addresses and the UDP payload from a raw IPv4/IPv6 packet.
+// TCP flags.
+const (
+	FlagFIN = 0x01
+	FlagSYN = 0x02
+	FlagRST = 0x04
+	FlagACK = 0x10
+)
+
+// Parse extracts IP addresses and the UDP or TCP payload from a raw
+// IPv4/IPv6 packet.
 func Parse(b []byte) (Packet, bool) {
 	var pk Packet
 	if len(b) < 1 {
@@ -37,6 +49,11 @@ func Parse(b []byte) (Packet, bool) {
 		pk.Src = net.IP(append([]byte(nil), b[12:16]...))
 		pk.Dst = net.IP(append([]byte(nil), b[16:20]...))
 		pk.UDP = b[9] == 17
+		pk.TCP = b[9] == 6
+		// Trailing bytes past the total length (padding) are not payload.
+		if tot := int(binary.BigEndian.Uint16(b[2:4])); tot >= ihl && tot < len(b) {
+			b = b[:tot]
+		}
 		l4 = b[ihl:]
 	case 6:
 		if len(b) < 40 {
@@ -58,6 +75,10 @@ func Parse(b []byte) (Packet, bool) {
 			return pk, false
 		}
 		pk.UDP = next == 17
+		pk.TCP = next == 6
+		if pl := int(binary.BigEndian.Uint16(b[4:6])); pl > 0 && 40+pl >= off && 40+pl < len(b) {
+			b = b[:40+pl]
+		}
 		l4 = b[off:]
 	default:
 		return pk, false
@@ -66,8 +87,23 @@ func Parse(b []byte) (Packet, bool) {
 		if len(l4) < 8 {
 			return pk, false
 		}
+		pk.SrcPort = binary.BigEndian.Uint16(l4[0:2])
 		pk.DstPort = binary.BigEndian.Uint16(l4[2:4])
 		pk.Payload = l4[8:]
+	}
+	if pk.TCP {
+		if len(l4) < 20 {
+			return pk, false
+		}
+		hl := int(l4[12]>>4) * 4
+		if hl < 20 || len(l4) < hl {
+			return pk, false
+		}
+		pk.SrcPort = binary.BigEndian.Uint16(l4[0:2])
+		pk.DstPort = binary.BigEndian.Uint16(l4[2:4])
+		pk.Seq = binary.BigEndian.Uint32(l4[4:8])
+		pk.Flags = l4[13]
+		pk.Payload = l4[hl:]
 	}
 	return pk, true
 }

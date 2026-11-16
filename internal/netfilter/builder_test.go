@@ -105,8 +105,8 @@ func TestBuild(t *testing.T) {
 	if strings.Contains(m4, "NFQUEUE --queue-num 4200") {
 		t.Error("DNS queue rule without DNSQueue option")
 	}
-	// 4 shared hooks + 2 per client interface (br+, wgs+, tun2+), per family.
-	if len(plan.Hooks) != 20 {
+	// 5 shared hooks + 2 per client interface (br+, wgs+, tun2+), per family.
+	if len(plan.Hooks) != 22 {
 		t.Errorf("hooks = %d", len(plan.Hooks))
 	}
 }
@@ -136,14 +136,16 @@ func TestBuildDNSInspector(t *testing.T) {
 	mustContain(t, plan.Restore["4/mangle"],
 		"-A SNAKE_DNSO -o br+ -j NFQUEUE --queue-num 4200 --queue-bypass",
 		"-A SNAKE_DNSO -o lo -j NFQUEUE --queue-num 4200 --queue-bypass")
-	found := false
-	for _, h := range plan.Hooks {
-		if h.Table == "mangle" && h.Chain == "OUTPUT" && strings.Join(h.Args, " ") == "-p udp --sport 53 -j SNAKE_DNSO" {
-			found = true
+	for _, proto := range []string{"udp", "tcp"} {
+		found := false
+		for _, h := range plan.Hooks {
+			if h.Table == "mangle" && h.Chain == "OUTPUT" && strings.Join(h.Args, " ") == "-p "+proto+" --sport 53 -j SNAKE_DNSO" {
+				found = true
+			}
 		}
-	}
-	if !found {
-		t.Error("OUTPUT hook missing")
+		if !found {
+			t.Errorf("%s OUTPUT hook missing", proto)
+		}
 	}
 }
 

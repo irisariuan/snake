@@ -9,6 +9,7 @@ package engine
 import (
 	"encoding/binary"
 	"encoding/json"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -270,9 +271,36 @@ func fakeDNS(t *testing.T, table map[string][]string) func() {
 	return fakeDNSFunc(t, func(name string) []string { return table[name] })
 }
 
-// fakeDNSFunc answers A queries on 127.0.0.1:53 with lookup(name): IPs or
-// CNAME targets, in order.
+// fakeDNSFunc answers A queries on 127.0.0.1:53 (UDP and TCP) with
+// lookup(name): IPs or CNAME targets, in order.
 func fakeDNSFunc(t *testing.T, lookup func(name string) []string) func() {
+	respond := func(q []byte) []byte {
+		var m dnsmessage.Message
+		if m.Unpack(q) != nil || len(m.Questions) == 0 {
+			return nil
+		}
+		qq := m.Questions[0]
+		b := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: m.Header.ID, Response: true})
+		_ = b.StartQuestions()
+		_ = b.Question(qq)
+		_ = b.StartAnswers()
+		owner := qq.Name
+		if qq.Type == dnsmessage.TypeA {
+			for _, v := range lookup(strings.TrimSuffix(qq.Name.String(), ".")) {
+				if ip := net.ParseIP(v); ip != nil {
+					var a [4]byte
+					copy(a[:], ip.To4())
+					_ = b.AResource(dnsmessage.ResourceHeader{Name: owner, Class: dnsmessage.ClassINET, TTL: 30}, dnsmessage.AResource{A: a})
+				} else {
+					cn := dnsmessage.MustNewName(v + ".")
+					_ = b.CNAMEResource(dnsmessage.ResourceHeader{Name: owner, Class: dnsmessage.ClassINET, TTL: 30}, dnsmessage.CNAMEResource{CNAME: cn})
+					owner = cn
+				}
+			}
+		}
+		out, _ := b.Finish()
+		return out
+	}
 	pc, err := net.ListenPacket("udp", "127.0.0.1:53")
 	if err != nil {
 		t.Fatal(err)
@@ -284,34 +312,48 @@ func fakeDNSFunc(t *testing.T, lookup func(name string) []string) func() {
 			if err != nil {
 				return
 			}
-			var m dnsmessage.Message
-			if m.Unpack(buf[:n]) != nil || len(m.Questions) == 0 {
-				continue
+			if out := respond(buf[:n]); out != nil {
+				_, _ = pc.WriteTo(out, addr)
 			}
-			q := m.Questions[0]
-			b := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: m.Header.ID, Response: true})
-			_ = b.StartQuestions()
-			_ = b.Question(q)
-			_ = b.StartAnswers()
-			owner := q.Name
-			if q.Type == dnsmessage.TypeA {
-				for _, v := range lookup(strings.TrimSuffix(q.Name.String(), ".")) {
-					if ip := net.ParseIP(v); ip != nil {
-						var a [4]byte
-						copy(a[:], ip.To4())
-						_ = b.AResource(dnsmessage.ResourceHeader{Name: owner, Class: dnsmessage.ClassINET, TTL: 30}, dnsmessage.AResource{A: a})
-					} else {
-						cn := dnsmessage.MustNewName(v + ".")
-						_ = b.CNAMEResource(dnsmessage.ResourceHeader{Name: owner, Class: dnsmessage.ClassINET, TTL: 30}, dnsmessage.CNAMEResource{CNAME: cn})
-						owner = cn
-					}
-				}
-			}
-			out, _ := b.Finish()
-			_, _ = pc.WriteTo(out, addr)
 		}
 	}()
-	return func() { pc.Close() }
+	ln, err := net.Listen("tcp", "127.0.0.1:53")
+	if err != nil {
+		pc.Close()
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+				for {
+					var l [2]byte
+					if _, err := io.ReadFull(c, l[:]); err != nil {
+						return
+					}
+					q := make([]byte, binary.BigEndian.Uint16(l[:]))
+					if _, err := io.ReadFull(c, q); err != nil {
+						return
+					}
+					out := respond(q)
+					if out == nil {
+						return
+					}
+					// Length prefix and message in separate segments, as
+					// some resolvers send them.
+					_, _ = c.Write(binary.BigEndian.AppendUint16(nil, uint16(len(out))))
+					time.Sleep(time.Millisecond)
+					_, _ = c.Write(out)
+				}
+			}()
+		}
+	}()
+	return func() { pc.Close(); ln.Close() }
 }
 
 func TestIntegrationDNSInspector(t *testing.T) {
@@ -327,6 +369,7 @@ func TestIntegrationDNSInspector(t *testing.T) {
 		"customerevents.netflix.com":         {"203.0.113.52"},                         // excluded
 		"api.nflxso.net":                     {"203.0.113.53"},                         // keyword ~nflxso
 		"www.example.org":                    {"203.0.113.54"},                         // no match
+		"tcp.netflix.com":                    {"203.0.113.55"},                         // asked over TCP
 	})
 	defer stop()
 
@@ -367,8 +410,11 @@ func TestIntegrationDNSInspector(t *testing.T) {
 		}
 		t.Logf("%s -> chain %v ips %v", q, a.Chain, a.IPs)
 	}
+	if a, err := dnsinspect.QueryTCP("127.0.0.1:53", "tcp.netflix.com", 3*time.Second); err != nil || len(a.IPs) != 1 {
+		t.Fatalf("tcp query: %+v %v", a, err)
+	}
 	set := sh(t, "ipset list SNK_1_d4")
-	for _, ip := range []string{"203.0.113.50", "203.0.113.51", "203.0.113.53"} {
+	for _, ip := range []string{"203.0.113.50", "203.0.113.51", "203.0.113.53", "203.0.113.55"} {
 		if !strings.Contains(set, ip) {
 			t.Errorf("%s should have been added:\n%s", ip, set)
 		}
@@ -380,12 +426,12 @@ func TestIntegrationDNSInspector(t *testing.T) {
 	}
 	st := e.dns.Stats()
 	t.Logf("inspector stats: %+v", st)
-	if st.Matched != 3 {
-		t.Errorf("matched = %d, want 3", st.Matched)
+	if st.Matched != 4 || st.TCP != 1 {
+		t.Errorf("matched = %d (want 4), tcp = %d (want 1)", st.Matched, st.TCP)
 	}
 	// Policy addresses view: kernel set joined with the inspector's records.
 	lv, err := e.LearnedAddrs("nf", LearnedDNS, "partner", 0)
-	if err != nil || lv.Total != 3 || len(lv.Addrs) != 1 || lv.Addrs[0].Matched != "x1.cdn.nflxvideo.net" || lv.Addrs[0].Rule != "**.nflxvideo.net" || lv.Addrs[0].Source != "policy" {
+	if err != nil || lv.Total != 4 || len(lv.Addrs) != 1 || lv.Addrs[0].Matched != "x1.cdn.nflxvideo.net" || lv.Addrs[0].Rule != "**.nflxvideo.net" || lv.Addrs[0].Source != "policy" {
 		t.Errorf("LearnedAddrs = %+v %v", lv, err)
 	}
 	if n, err := e.ForgetLearned("nf", ForgetRequest{Kind: LearnedDNS, Addrs: []string{"203.0.113.51"}}); err != nil || n != 1 || strings.Contains(sh(t, "ipset list SNK_1_d4"), "203.0.113.51") {
