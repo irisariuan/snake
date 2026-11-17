@@ -111,6 +111,18 @@ func (r *reader) u16() int {
 }
 
 func parseHelloBody(m []byte) (Hello, error) {
+	return walkHello(m, false)
+}
+
+// parsePartialHello reads what it can from the start of a ClientHello body
+// that was cut short: the server name if its extension is complete. ECH is
+// reported only if its extension came before the cut.
+func parsePartialHello(m []byte) Hello {
+	h, _ := walkHello(m, true)
+	return h
+}
+
+func walkHello(m []byte, partial bool) (Hello, error) {
 	var h Hello
 	r := &reader{b: m}
 	r.bytes(2)       // legacy_version
@@ -124,13 +136,20 @@ func parseHelloBody(m []byte) (Hello, error) {
 	if len(r.b) == 0 {
 		return h, nil // no extensions
 	}
-	ext := &reader{b: r.bytes(r.u16())}
+	n := r.u16()
+	if partial && n > len(r.b) {
+		n = len(r.b)
+	}
+	ext := &reader{b: r.bytes(n)}
 	if r.bad {
 		return h, errNotTLS
 	}
 	for len(ext.b) > 0 && !ext.bad {
 		typ := ext.u16()
 		data := ext.bytes(ext.u16())
+		if ext.bad {
+			break
+		}
 		switch typ {
 		case extECH:
 			h.ECH = true
@@ -146,11 +165,11 @@ func parseHelloBody(m []byte) (Hello, error) {
 			}
 		}
 	}
-	if ext.bad {
-		return h, errNotTLS
-	}
 	if !validHost(h.ServerName) {
 		h.ServerName = ""
+	}
+	if ext.bad && !partial {
+		return h, errNotTLS
 	}
 	return h, nil
 }

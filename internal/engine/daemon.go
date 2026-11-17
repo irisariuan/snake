@@ -671,9 +671,13 @@ func (e *Engine) LeakChecks() []LeakCheck {
 					case config.ECHPassthrough:
 						ech = "Encrypted Client Hello connections are passed through via WAN untouched, unless an earlier policy takes them (no drop: rules apply to them)"
 					}
-					ok("HTTPS the domain sets miss is routed by TLS server name (SNI proxy %s); unclaimed QUIC is rejected so it falls back to TCP; %s", st.SNI.Listen, ech)
+					quic := "unclaimed QUIC is rejected so it falls back to TCP"
+					if st.SNI.QUICQueue > 0 {
+						quic = "so is QUIC (HTTP/3), from its Initial packets"
+					}
+					ok("HTTPS the domain sets miss is routed by TLS server name (SNI proxy %s); %s; %s", st.SNI.Listen, quic, ech)
 					if st.Caps.IPv6 && !st.Caps.IPv6NAT {
-						warn("IPv6 HTTPS is not sniffed (no ip6tables NAT): devices using encrypted DNS over IPv6 bypass the domain rules")
+						warn("IPv6 HTTPS over TCP is not sniffed (no ip6tables NAT): devices using encrypted DNS over IPv6 bypass the domain rules")
 					}
 				case st.SNI != nil && st.SNI.LastError != "":
 					warn("SNI sniffing on but the proxy is not running: %s", st.SNI.LastError)

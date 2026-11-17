@@ -29,7 +29,7 @@ func (a Applier) ExistingChains(v6 bool) map[string][]string {
 	if v6 {
 		fam = "6"
 	}
-	for _, t := range []string{"mangle", "nat", "filter"} {
+	for _, t := range []string{"raw", "mangle", "nat", "filter"} {
 		s, err := a.R.Run(bin(v6, "tables"), "-t", t, "-S")
 		if err != nil {
 			continue
@@ -173,6 +173,7 @@ func (a Applier) Teardown(ipv6 bool, lan string) {
 			{V6: v6, Table: "mangle", Chain: "OUTPUT", Args: []string{"-p", "tcp", "--sport", "53", "-j", ChainDNSOut}},
 			{V6: v6, Table: "filter", Chain: "FORWARD", Args: []string{"-j", ChainFwd}},
 			{V6: v6, Table: "nat", Chain: "POSTROUTING", Args: []string{"-j", ChainNAT}},
+			{V6: v6, Table: "raw", Chain: "PREROUTING", Args: []string{"-j", ChainRaw}},
 		}
 		for _, l := range (config.Settings{LANInterfaces: lan}).ClientInterfaces() {
 			hooks = append(hooks,
@@ -193,7 +194,7 @@ func (a Applier) Teardown(ipv6 bool, lan string) {
 		if v6 {
 			fam = "6"
 		}
-		for _, t := range []string{"mangle", "nat", "filter"} {
+		for _, t := range []string{"raw", "mangle", "nat", "filter"} {
 			chains := ex[fam+"/"+t]
 			if len(chains) == 0 {
 				continue

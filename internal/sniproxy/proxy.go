@@ -103,6 +103,11 @@ type Config struct {
 	Port     int      // listening port (all addresses; only REDIRECTed connections are served)
 	IPv6     bool     // also listen on IPv6
 	Policies []Policy // in policy order: the first match wins
+	// QUICQueue > 0 is the NFQUEUE number on which QUIC packets of the
+	// sniffing policies' clients arrive (quicqueue.go); 0 reads no QUIC.
+	QUICQueue uint16
+	// MarkMask is the fwmark mask policy marks live in (Settings.MarkMask).
+	MarkMask uint32
 }
 
 // SetAdder adds addresses to ipsets (netfilter.IPSet).
@@ -116,14 +121,17 @@ type Stats struct {
 	Active     int64          `json:"active"`
 	Conns      uint64         `json:"conns"`
 	Matched    uint64         `json:"matched"`
-	Dropped    uint64         `json:"dropped"`     // matched a drop: rule
-	NoSNI      uint64         `json:"no_sni"`      // not TLS or no server name: sent via WAN
-	ECH        uint64         `json:"ech"`         // Encrypted Client Hello connections seen
-	ECHRefused uint64         `json:"ech_refused"` // ECH connections reset (a policy has ech: drop)
-	ECHPassed  uint64         `json:"ech_passed"`  // ECH connections relayed untouched (ech: passthrough)
-	ECHRouted  uint64         `json:"ech_routed"`  // ECH connections sent through a tunnel by ech: route
-	Errors     uint64         `json:"errors"`      // upstream dial failures
-	Refused    uint64         `json:"refused"`     // over the connection limit, or not redirected
+	Dropped    uint64         `json:"dropped"`              // matched a drop: rule
+	NoSNI      uint64         `json:"no_sni"`               // not TLS or no server name: sent via WAN
+	ECH        uint64         `json:"ech"`                  // Encrypted Client Hello connections seen
+	ECHRefused uint64         `json:"ech_refused"`          // ECH connections reset (a policy has ech: drop)
+	ECHPassed  uint64         `json:"ech_passed"`           // ECH connections relayed untouched (ech: passthrough)
+	ECHRouted  uint64         `json:"ech_routed"`           // ECH connections sent through a tunnel by ech: route
+	Errors     uint64         `json:"errors"`               // upstream dial failures
+	Refused    uint64         `json:"refused"`              // over the connection limit, or not redirected
+	QUICQueue  int            `json:"quic_queue,omitempty"` // NFQUEUE QUIC packets arrive on (0: QUIC not read)
+	QUIC       uint64         `json:"quic"`                 // QUIC connections whose ClientHello was read
+	QUICOther  uint64         `json:"quic_other"`           // long header UDP 443 packets that were not a readable Initial (sent on unchanged)
 	ByPolicy   map[int]uint64 `json:"by_policy,omitempty"`
 	LastError  string         `json:"last_error,omitempty"`
 	LastErrAt  time.Time      `json:"last_error_at,omitempty"`
@@ -170,10 +178,14 @@ type Proxy struct {
 	echRout atomic.Uint64
 	errs    atomic.Uint64
 	refused atomic.Uint64
-	statMu  sync.Mutex
-	byPol   map[int]uint64
-	lastErr string
-	lastAt  time.Time
+
+	quic          *quicState // QUIC queue (nil: not reading QUIC)
+	quicConns     atomic.Uint64
+	quicUndecoded atomic.Uint64
+	statMu        sync.Mutex
+	byPol         map[int]uint64
+	lastErr       string
+	lastAt        time.Time
 }
 
 // Running reports whether the proxy is listening.
@@ -183,14 +195,24 @@ func (p *Proxy) Running() bool {
 	return len(p.lns) > 0
 }
 
-// Configure starts, reconfigures or (with no policies) stops the proxy.
-// Policy changes take effect for new connections without restarting the
-// listeners.
+// Configure starts, reconfigures or (with no policies) stops the proxy and
+// its QUIC queue. Policy changes take effect for new connections without
+// restarting the listeners. Running and QUICRunning tell which parts run
+// after an error.
 func (p *Proxy) Configure(c Config) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	pols := append([]Policy(nil), c.Policies...)
 	p.pol.Store(&pols)
+	queue := c.QUICQueue
+	if len(pols) == 0 {
+		queue = 0
+	}
+	qerr := p.configureQUICLocked(queue, c.MarkMask)
+	return errors.Join(p.configureTCPLocked(c, pols), qerr)
+}
+
+func (p *Proxy) configureTCPLocked(c Config, pols []Policy) error {
 	if len(pols) == 0 {
 		p.closeLocked()
 		p.cfg = c
@@ -252,8 +274,13 @@ func (p *Proxy) Stats() Stats {
 	if len(p.lns) > 0 {
 		listen = ":" + strconv.Itoa(p.cfg.Port)
 	}
+	quicQueue := 0
+	if p.quic != nil {
+		quicQueue = int(p.quic.queue)
+	}
 	p.mu.Unlock()
 	s := Stats{
+		QUICQueue: quicQueue, QUIC: p.quicConns.Load(), QUICOther: p.quicUndecoded.Load(),
 		Listen: listen, Active: p.active.Load(), Conns: p.conns.Load(), Matched: p.matched.Load(),
 		Dropped: p.dropped.Load(), NoSNI: p.noSNI.Load(), ECH: p.ech.Load(), ECHRefused: p.echRef.Load(), ECHPassed: p.echPass.Load(), ECHRouted: p.echRout.Load(), Errors: p.errs.Load(), Refused: p.refused.Load(),
 	}
@@ -421,6 +448,132 @@ func matchECH(name string, pols []Policy) (pol Policy, res match.Result, outcome
 	return Policy{}, match.Result{}, echNoTaker
 }
 
+// decision is what the policies do with one connection.
+type decision struct {
+	pol    Policy
+	res    match.Result
+	routed bool // through pol's tunnel (or its kill switch)
+	reset  bool // refused: a drop: rule or an ech: drop policy
+	// echAll: an ech: route policy took an ECH connection; its CDN address
+	// is not learned, so only this connection is routed.
+	echAll bool
+	// dropKernel: a refused connection's destination is in the policy's
+	// drop set (or a drop session started), so the router rejects it.
+	dropKernel bool
+}
+
+// decide applies the policies applicable to client to a connection's
+// ClientHello, counts the outcome and runs what must happen before the
+// connection is routed: conditions of if: atoms, conditional rules and
+// learning the destinations of drop: rules. who prefixes log lines.
+func (p *Proxy) decide(client netip.Addr, dst netip.AddrPort, hello Hello, who string) decision {
+	var d decision
+	ok := false
+	if hello.ECH {
+		p.ech.Add(1)
+		var outcome int
+		d.pol, d.res, outcome = matchECH(hello.ServerName, p.applicable(client))
+		switch outcome {
+		case echReset:
+			p.echRef.Add(1)
+			logx.Debugf("%s: %s -> %s (%s) refused: Encrypted Client Hello (policy %s)", who, client, dst, hello.ServerName, d.pol.Name)
+			d.reset = true
+			return d
+		case echPassed:
+			p.echPass.Add(1)
+			logx.Debugf("%s: %s -> %s (%s) passed through: Encrypted Client Hello (policy %s)", who, client, dst, hello.ServerName, d.pol.Name)
+			d.pol = Policy{}
+		case echRouteAll:
+			d.echAll, ok = true, true
+			p.echRout.Add(1)
+			logx.Debugf("%s: %s -> %s (%s) routed: Encrypted Client Hello (policy %s)", who, client, dst, hello.ServerName, d.pol.Name)
+		case echByRule:
+			ok = true
+		}
+	} else {
+		d.pol, d.res, ok = p.match(hello.ServerName, client)
+	}
+	// Destinations of route: rules' if: atoms count for their conditions.
+	if hello.ServerName != "" {
+		for _, ap := range p.applicable(client) {
+			if ap.Cond != nil && ap.Set.HasConds() {
+				if hits := ap.Set.CondHits(hello.ServerName); len(hits) > 0 {
+					ap.Cond(dst.Addr(), hits)
+				}
+			}
+		}
+	}
+	routeDrop := false
+	if ok && d.res.Route {
+		act := ""
+		if d.pol.Route != nil {
+			var err error
+			if act, err = d.pol.Route(client, dst.Addr(), d.res.Rule, hello.ServerName); err != nil {
+				logx.Warnf("%s: conditional rule for %s -> %s (%s): %v", who, client, dst, hello.ServerName, err)
+			}
+		}
+		switch act {
+		case match.ActDrop:
+			d.res.Drop, routeDrop = true, true // drop session started by Route
+		case match.ActRoute:
+		default:
+			ok = false // no branch for this client: not routed by this policy
+		}
+	}
+	switch {
+	case hello.ServerName == "" && !d.echAll:
+		p.noSNI.Add(1)
+	case ok && d.res.Drop:
+		p.dropped.Add(1)
+		// A drop session was started by Route above; otherwise learn
+		// the destination into the drop set.
+		d.dropKernel = routeDrop || p.learnNow(dst.Addr(), d.pol.DropSet4, d.pol.DropSet6)
+		logx.Debugf("%s: %s -> %s (%s) blocked by %s rule %s", who, client, dst, hello.ServerName, d.pol.Name, d.res.Rule)
+		d.reset = true
+	case ok:
+		d.routed = true
+		p.matched.Add(1)
+		p.statMu.Lock()
+		if p.byPol == nil {
+			p.byPol = map[int]uint64{}
+		}
+		p.byPol[d.pol.ID]++
+		p.statMu.Unlock()
+		logx.Debugf("%s: %s -> %s (%s) via policy %s", who, client, dst, hello.ServerName, d.pol.Name)
+	}
+	return d
+}
+
+// commit records a routed connection: its destination is learned (or a
+// session started) so later connections to it take the kernel path, and
+// the client's WebRTC session window opens. now skips the re-add cache, for
+// callers that rely on the set entry for this very connection. It reports
+// whether the kernel's rules now route the destination for the client
+// (false: the connection must carry the policy's mark itself).
+func (p *Proxy) commit(client, dst netip.Addr, hello Hello, d decision, now bool) bool {
+	kernel := false
+	switch {
+	case d.res.Route:
+		kernel = true // session started by Route in decide
+	case d.echAll:
+		// A route policy's ECH connection: its CDN address is not learned.
+	case d.res.Session && d.pol.Session != nil:
+		if err := d.pol.Session(client, dst, d.res.Rule, hello.ServerName, d.res.Opts); err != nil {
+			logx.Warnf("sni proxy: session for %s -> %s (%s): %v", client, dst, hello.ServerName, err)
+		} else {
+			kernel = true
+		}
+	case now:
+		kernel = p.learnNow(dst, d.pol.Set4, d.pol.Set6)
+	default:
+		p.learn(dst, d.pol.Set4, d.pol.Set6)
+	}
+	if client.IsValid() && !d.echAll {
+		p.learn(client, d.pol.Session4, d.pol.Session6)
+	}
+	return kernel
+}
+
 func (p *Proxy) handle(c *net.TCPConn) {
 	p.conns.Add(1)
 	od := p.origDst
@@ -470,96 +623,17 @@ func (p *Proxy) handle(c *net.TCPConn) {
 	}
 	_ = c.SetReadDeadline(time.Time{})
 
+	d := p.decide(client, dst, hello, "sni proxy")
 	var mark uint32
-	var pol Policy
-	var res match.Result
-	var ok, echAll bool
-	if hello.ECH {
-		p.ech.Add(1)
-		var outcome int
-		pol, res, outcome = matchECH(hello.ServerName, p.applicable(client))
-		switch outcome {
-		case echReset:
-			p.echRef.Add(1)
-			logx.Debugf("sni proxy: %s -> %s (%s) refused: Encrypted Client Hello (policy %s)", client, dst, hello.ServerName, pol.Name)
-			reset(c)
-			return
-		case echPassed:
-			p.echPass.Add(1)
-			logx.Debugf("sni proxy: %s -> %s (%s) passed through: Encrypted Client Hello (policy %s)", client, dst, hello.ServerName, pol.Name)
-			pol = Policy{}
-		case echRouteAll:
-			echAll, ok = true, true
-			p.echRout.Add(1)
-			logx.Debugf("sni proxy: %s -> %s (%s) routed: Encrypted Client Hello (policy %s)", client, dst, hello.ServerName, pol.Name)
-		case echByRule:
-			ok = true
-		}
-	} else {
-		pol, res, ok = p.match(hello.ServerName, client)
-	}
-	// Destinations of route: rules' if: atoms count for their conditions.
-	if hello.ServerName != "" {
-		for _, ap := range p.applicable(client) {
-			if ap.Cond != nil && ap.Set.HasConds() {
-				if hits := ap.Set.CondHits(hello.ServerName); len(hits) > 0 {
-					ap.Cond(dst.Addr(), hits)
-				}
-			}
-		}
-	}
-	routeDrop := false
-	if ok && res.Route {
-		act := ""
-		if pol.Route != nil {
-			var err error
-			if act, err = pol.Route(client, dst.Addr(), res.Rule, hello.ServerName); err != nil {
-				logx.Warnf("sni proxy: conditional rule for %s -> %s (%s): %v", client, dst, hello.ServerName, err)
-			}
-		}
-		switch act {
-		case match.ActDrop:
-			res.Drop, routeDrop = true, true // drop session started by Route
-		case match.ActRoute:
-		default:
-			ok = false // no branch for this client: not routed by this policy
-		}
-	}
 	switch {
-	case hello.ServerName == "" && !echAll:
-		p.noSNI.Add(1)
-	case ok && res.Drop:
-		p.dropped.Add(1)
-		if !routeDrop { // a drop session was started by Route above
-			p.learn(dst.Addr(), pol.DropSet4, pol.DropSet6)
-		}
-		logx.Debugf("sni proxy: %s -> %s (%s) blocked by %s rule %s", client, dst, hello.ServerName, pol.Name, res.Rule)
+	case d.reset:
 		reset(c)
 		return
-	case ok:
-		mark = pol.Mark
-		p.matched.Add(1)
-		p.statMu.Lock()
-		if p.byPol == nil {
-			p.byPol = map[int]uint64{}
-		}
-		p.byPol[pol.ID]++
-		p.statMu.Unlock()
-		if res.Route || echAll {
-			// Session started by Route above, or a route policy's ECH
-			// connection: its CDN address is not learned.
-		} else if res.Session && pol.Session != nil {
-			if err := pol.Session(client, dst.Addr(), res.Rule, hello.ServerName, res.Opts); err != nil {
-				logx.Warnf("sni proxy: session for %s -> %s (%s): %v", client, dst, hello.ServerName, err)
-			}
-		} else {
-			p.learn(dst.Addr(), pol.Set4, pol.Set6)
-		}
-		if client.IsValid() && !echAll {
-			p.learn(client, pol.Session4, pol.Session6)
-		}
-		logx.Debugf("sni proxy: %s -> %s (%s) via policy %s", client, dst, hello.ServerName, pol.Name)
+	case d.routed:
+		mark = d.pol.Mark
+		p.commit(client, dst.Addr(), hello, d, false)
 	}
+	pol, ok := d.pol, d.routed
 	dial := p.dial
 	if dial == nil {
 		dial = func(ctx context.Context, mark uint32, addr string) (net.Conn, error) {
@@ -657,6 +731,33 @@ func (p *Proxy) learn(addr netip.Addr, set4, set6 string) {
 		delete(p.learned, key)
 		p.learnMu.Unlock()
 	}
+}
+
+// learnNow adds addr to the set of its family at once, whatever the re-add
+// cache says, and reports whether it is in the set.
+func (p *Proxy) learnNow(addr netip.Addr, set4, set6 string) bool {
+	if p.Sets == nil || !addr.IsValid() {
+		return false
+	}
+	addr = addr.Unmap()
+	set := set4
+	if addr.Is6() {
+		set = set6
+	}
+	if set == "" {
+		return false
+	}
+	if err := p.Sets.AddMany(set, []string{addr.String()}); err != nil {
+		logx.Debugf("sni proxy: add %s to %s: %v", addr, set, err)
+		return false
+	}
+	p.learnMu.Lock()
+	if p.learned == nil {
+		p.learned = map[string]time.Time{}
+	}
+	p.learned[set+" "+addr.String()] = time.Now()
+	p.learnMu.Unlock()
+	return true
 }
 
 // PolicyIDs lists the configured policy ids (for status).

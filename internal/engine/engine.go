@@ -84,6 +84,10 @@ type Caps struct {
 	// AdaptiveQoS: Adaptive QoS (bwdpi) is on and marks packets with
 	// config.AdaptiveQoSMask.
 	AdaptiveQoS bool `json:"adaptive_qos"`
+	// Raw and Raw6: iptables / ip6tables have the raw table, where QUIC
+	// packets are queued before conntrack.
+	Raw  bool `json:"raw"`
+	Raw6 bool `json:"raw6"`
 }
 
 // Event is a notable state change.
@@ -125,6 +129,7 @@ type Engine struct {
 	// conntrackPath is the kernel's connection table (tests replace it).
 	conntrackPath string
 	sniErr        string // why the SNI proxy is not running
+	quicNote      string // why QUIC is not read (last logged)
 	asnCache      *asn.Cache
 	active        map[int]string
 	cands         map[int][]Candidate
@@ -261,9 +266,17 @@ func (e *Engine) DetectCaps() {
 		c.IPv6NAT = err == nil
 	}
 	c.AdaptiveQoS = nv.Get("qos_enable") == "1" && nv.Get("qos_type") == "1"
+	_, _ = e.R.Run("modprobe", "-q", "iptable_raw")
+	_, err := e.R.Run("iptables", "-t", "raw", "-S", "PREROUTING")
+	c.Raw = err == nil
+	if c.IPv6 {
+		_, _ = e.R.Run("modprobe", "-q", "ip6table_raw")
+		_, err := e.R.Run("ip6tables", "-t", "raw", "-S", "PREROUTING")
+		c.Raw6 = err == nil
+	}
 	c.NFQueue = webrtc.Supported(e.R)
 	c.Conntrack = system.Exists("conntrack")
-	_, err := os.Stat("/proc/net/nf_conntrack")
+	_, err = os.Stat("/proc/net/nf_conntrack")
 	c.Procfs = err == nil
 	if !e.DryRun {
 		e.mu.Lock()
@@ -286,7 +299,7 @@ func (e *Engine) DetectCaps() {
 	e.mu.Lock()
 	e.caps = c
 	e.mu.Unlock()
-	logx.Infof("capabilities: ipv6=%v ipv6nat=%v nfqueue=%v conntrack=%v ipset-netlink=%v adaptive-qos=%v", c.IPv6, c.IPv6NAT, c.NFQueue, c.Conntrack, c.IPSetNetlink, c.AdaptiveQoS)
+	logx.Infof("capabilities: ipv6=%v ipv6nat=%v nfqueue=%v raw=%v/%v conntrack=%v ipset-netlink=%v adaptive-qos=%v", c.IPv6, c.IPv6NAT, c.NFQueue, c.Raw, c.Raw6, c.Conntrack, c.IPSetNetlink, c.AdaptiveQoS)
 }
 
 func (e *Engine) event(policy, kind, format string, a ...any) {
@@ -540,6 +553,19 @@ func (e *Engine) Apply(reason string) error {
 			errs = append(errs, err.Error())
 		}
 	}
+	// QUIC flow sets, if QUIC can be read. A kernel without the
+	// hash:ip,port,ip set type cannot: QUIC is then rejected as before.
+	quicOK := e.quicPossible(cfg, states, caps)
+	if quicOK {
+		for _, sp := range quicSetSpecs(caps) {
+			if err := ips.Ensure(sp); err != nil {
+				e.noteQUIC(fmt.Sprintf("QUIC flow set: %v", err))
+				quicOK = false
+				break
+			}
+			want[sp.Name] = true
+		}
+	}
 	v4, v6 := netfilter.SplitFamilies(netfilter.DefaultDoHIPs)
 	_, v6b := netfilter.SplitFamilies(netfilter.DefaultDoHIPv6)
 	// Replace, not add: the DoH sets hold exactly the dedicated resolver
@@ -618,7 +644,7 @@ func (e *Engine) Apply(reason string) error {
 	}
 	// SNI proxy: started before the rules redirect to it. If it cannot
 	// listen, no redirect is installed (HTTPS would otherwise break).
-	sniPort := e.configureSNI(cfg, states, caps, &errs)
+	sniPort, quicQueue := e.configureSNI(cfg, states, caps, quicOK, &errs)
 	sessActive := map[int]sessionChains{}
 	var sessIDs []int
 	for _, st := range states {
@@ -638,6 +664,7 @@ func (e *Engine) Apply(reason string) error {
 	e.setSessionChains(sessActive)
 	plan := netfilter.Build(s, states, netfilter.Options{IPv6: caps.IPv6, IPv6NAT: caps.IPv6NAT, DNSQueue: dnsQueue, Existing: existing,
 		TunnelAddrs: tunnelAddrs(usedTunnels(cfg)), WANAddrs: e.wanAddrs(), SNIPort: sniPort, LANAddr: e.lanAddr(),
+		Raw: caps.Raw, Raw6: caps.IPv6 && caps.Raw6, QUICQueue: quicQueue,
 		SessionPairs: e.sessionPairs, DropPairs: e.dropPairs})
 	if err := nf.Apply(plan); err != nil {
 		errs = append(errs, err.Error())
@@ -902,23 +929,29 @@ func splitClients(clients []string) (map[string]bool, []netip.Prefix) {
 	return macs, nets
 }
 
-// configureSNI starts, updates or stops the SNI proxy and returns the port
-// the rules may redirect to (0: none).
-func (e *Engine) configureSNI(cfg *config.Config, states []netfilter.PolicyState, caps Caps, errs *[]string) int {
+// configureSNI starts, updates or stops the SNI proxy and its QUIC queue
+// (when quic) and returns the port the rules may redirect to and the queue
+// they may send QUIC to (0: none).
+func (e *Engine) configureSNI(cfg *config.Config, states []netfilter.PolicyState, caps Caps, quic bool, errs *[]string) (port, queue int) {
 	pols := e.sniPolicies(cfg, states, caps)
-	port := cfg.Settings.SNIProxyPort
+	s := cfg.Settings
+	port = s.SNIProxyPort
+	if quic {
+		queue = s.QUICQueue()
+	}
 	if e.DryRun {
 		if len(pols) == 0 {
-			return 0
+			return 0, 0
 		}
-		return port // show the rules in plans
+		return port, queue // show the rules in plans
 	}
 	if !e.isDaemon() {
 		// One-shot applies (firewall hooks) have no proxy to redirect to;
 		// the daemon re-applies within 30 seconds.
-		return 0
+		return 0, 0
 	}
-	err := e.sni.Configure(sniproxy.Config{Port: port, IPv6: caps.IPv6 && caps.IPv6NAT, Policies: pols})
+	err := e.sni.Configure(sniproxy.Config{Port: port, IPv6: caps.IPv6 && caps.IPv6NAT, Policies: pols,
+		QUICQueue: uint16(queue), MarkMask: s.MarkMask})
 	e.mu.Lock()
 	e.sniErr = ""
 	if err != nil {
@@ -927,12 +960,52 @@ func (e *Engine) configureSNI(cfg *config.Config, states []netfilter.PolicyState
 	e.mu.Unlock()
 	if err != nil {
 		*errs = append(*errs, err.Error())
-		return 0
 	}
-	if len(pols) == 0 || !e.sni.Running() {
-		return 0
+	if len(pols) == 0 {
+		return 0, 0
 	}
-	return port
+	if !e.sni.Running() {
+		port = 0
+	}
+	if !e.sni.QUICRunning() {
+		queue = 0
+	}
+	return port, queue
+}
+
+// quicPossible reports whether QUIC can be read for the sniffing policies:
+// the kernel queues packets (NFQUEUE) from the raw table, and this is the
+// daemon (or a dry run showing its rules).
+func (e *Engine) quicPossible(cfg *config.Config, states []netfilter.PolicyState, caps Caps) bool {
+	if !caps.NFQueue || !caps.Raw || (!e.DryRun && !e.isDaemon()) {
+		return false
+	}
+	for _, st := range states {
+		if st.Policy.Sniffs() {
+			return true
+		}
+	}
+	return false
+}
+
+// quicSetSpecs are the QUIC flow sets of the families QUIC is read in.
+func quicSetSpecs(caps Caps) []netfilter.SetSpec {
+	specs := []netfilter.SetSpec{{Name: netfilter.QUICFlowSet4, Type: "hash:ip,port,ip", Timeout: netfilter.QUICFlowTimeout, MaxElem: 65536}}
+	if caps.IPv6 && caps.Raw6 {
+		specs = append(specs, netfilter.SetSpec{Name: netfilter.QUICFlowSet6, Type: "hash:ip,port,ip", V6: true, Timeout: netfilter.QUICFlowTimeout, MaxElem: 65536})
+	}
+	return specs
+}
+
+// noteQUIC logs why QUIC is not read (once per reason).
+func (e *Engine) noteQUIC(msg string) {
+	e.mu.Lock()
+	same := e.quicNote == msg
+	e.quicNote = msg
+	e.mu.Unlock()
+	if !same {
+		logx.Warnf("QUIC server names not read, QUIC is rejected instead: %s", msg)
+	}
 }
 
 // stopSNI removes the redirect to the proxy before it stops, so HTTPS

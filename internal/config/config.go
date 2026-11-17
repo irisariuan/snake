@@ -729,6 +729,11 @@ func (s Settings) probeValue(idx int) uint32 {
 	return s.MaxMarkValue() - uint32(idx)
 }
 
+// QUICQueue is the NFQUEUE number the SNI proxy reads QUIC on: past the
+// DNS inspector's (QueueBase) and the policies' WebRTC queues
+// (QueueBase+id, ids up to 200).
+func (s Settings) QUICQueue() int { return s.QueueBase + 255 }
+
 // MaxPolicyID is the largest policy id allowed.
 func (s Settings) MaxPolicyID() int {
 	max := int(s.MaxMarkValue()) - len(TunnelNames)

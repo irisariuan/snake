@@ -26,6 +26,26 @@ const (
 	DoHSet6 = "SNK_DOH6"
 )
 
+// QUIC flow sets (global, hash:ip,port,ip): client address and port and
+// server address of UDP 443 flows that had a reply recently. Their packets
+// skip the QUIC queue.
+const (
+	QUICFlowSet4 = "SNK_QF4"
+	QUICFlowSet6 = "SNK_QF6"
+	// QUICFlowTimeout is how long a flow stays in the set after it was
+	// added (seconds). Shorter than conntrack's UDP stream timeout, so a
+	// new connection reusing the ports is queued again.
+	QUICFlowTimeout = 120
+)
+
+// QUICFlowSet returns the QUIC flow set of a family.
+func QUICFlowSet(v6 bool) string {
+	if v6 {
+		return QUICFlowSet6
+	}
+	return QUICFlowSet4
+}
+
 // SetName returns the ipset name for a policy set.
 func SetName(id int, kind string, v6 bool) string {
 	fam := "4"
@@ -47,6 +67,7 @@ const (
 	ChainNAT    = "SNAKE_NAT"
 	ChainFwd    = "SNAKE_FWD"
 	ChainDNSOut = "SNAKE_DNSO" // mangle OUTPUT: dnsmasq answers (UDP and TCP) -> DNS inspector
+	ChainRaw    = "SNAKE_RAW"  // raw PREROUTING: new QUIC flows -> SNI proxy's QUIC queue
 	chainPolicy = "SNAKE_P"
 	chainMark   = "SNAKE_M"
 )

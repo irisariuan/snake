@@ -491,8 +491,37 @@ How it works:
   is dialled without a mark and leaves via WAN as before. A `drop:` match
   resets the connection.
 * A matched destination is added to the policy's domain set (as a DNS answer
-  would be), so later connections to it, including QUIC, take the fast
-  kernel path, and a WebRTC session window is opened for the client.
+  would be), so later connections to it take the fast kernel path, and a
+  WebRTC session window is opened for the client.
+* **QUIC (HTTP/3)** is routed by server name too, without a proxy. Its
+  first packets (Initial packets) are encrypted with keys anyone can derive
+  from the packet itself (RFC 9001), so snake decrypts them and reads the
+  ClientHello inside, as for TCP:
+  * The first UDP 443 packets of new flows from the policy's devices are
+    queued to the daemon from the `raw` table (NFQUEUE, before connection
+    tracking). Browsers split a ClientHello with post-quantum key shares
+    over two or three packets; they are held until it is complete, usually
+    microseconds later.
+  * On a match the destination is added to the policy's set (or a session
+    starts) **before** the packets are released, so the policy's own
+    rules route the connection from its first packet and policy order is
+    kept. `drop:` matches are released into the drop set, so the router
+    rejects them and the browser falls back to TCP at once. ECH modes apply
+    as for TCP (*Drop* drops the packets; *Route* marks the connection
+    without learning the CDN address).
+  * Unmatched QUIC, and UDP 443 traffic that is not a readable QUIC Initial
+    (other protocols, unknown QUIC versions), goes on unchanged, via WAN
+    unless a policy claims it, like non-TLS TCP.
+  * Flows that had a reply are remembered in `SNK_QF4/6` (client address
+    and port, server address; 2 minutes), so their packets skip the queue:
+    each connection costs the daemon a few packets, not its whole
+    transfer.
+  * QUIC v1, v2 and draft-29 are read. It works on IPv6 even without
+    `ip6tables` NAT, since nothing is redirected.
+  * Needs NFQUEUE, the `raw` table and the `hash:ip,port,ip` ipset type
+    (Status → capabilities). Without them, unclaimed QUIC is **rejected**
+    for those devices instead, so browsers fall back to TCP, which is
+    sniffed.
 
 What it costs and where it stops:
 
@@ -501,10 +530,6 @@ What it costs and where it stops:
   kernel). Expect lower throughput than the kernel path and no hardware
   acceleration for those connections; for a destination-only policy that is
   most of the LAN's HTTPS. Prefer device-scoped policies.
-* **QUIC.** HTTP/3 hides its server name in an encrypted Initial packet, so
-  UDP 443 that no policy claimed is **rejected** for those devices. Browsers
-  fall back to TCP within a moment, which is then sniffed. QUIC to policy
-  destinations still goes through the tunnel.
 * **Encrypted Client Hello (ECH)** encrypts the real server name behind a
   public one (e.g. `cloudflare-ech.com` for every ECH site on Cloudflare).
   Each policy chooses what happens to its devices' ECH connections
@@ -530,13 +555,14 @@ What it costs and where it stops:
   anything else Relay (`refuse_ech` is kept in step for older versions).
 * **Only TLS on port 443.** Other ports, plain HTTP, and non-TLS protocols
   on 443 (sent via WAN after 5 seconds of silence) are not routed by name.
-* **IPv6** is sniffed only when `ip6tables` has NAT. Without it, IPv6 HTTPS
-  of devices using encrypted DNS bypasses the domain rules (the leak audit
-  says so).
+* **IPv6** HTTPS over TCP is sniffed only when `ip6tables` has NAT.
+  Without it, IPv6 HTTPS of devices using encrypted DNS bypasses the domain
+  rules (the leak audit says so); IPv6 QUIC is still read.
 * **Daemon down.** The redirect is removed when the daemon stops normally.
   If it crashes, HTTPS from those devices fails until the watchdog restarts
   it (within 5 minutes) or a firewall restart re-applies the rules without
-  it.
+  it. The QUIC queue is fail-open: while the daemon is down, QUIC goes on
+  unread (routed only by the sets).
 
 ## Device sessions
 
@@ -885,8 +911,9 @@ LAN client ──► mangle PREROUTING -i br+/wgs+/tun2+ ─► SNAKE
             ─► nat POSTROUTING SNAKE_NAT: MASQUERADE marked traffic out of tunnels
 filter FORWARD SNAKE_FWD: DoT/DoH/QUIC/IPv6 rejects, then accept LAN⇄tunnel
 nat PREROUTING SNAKE_DNS: port-53 REDIRECT; TCP 443 → SNAKE_SNI: unclaimed → REDIRECT to the SNI proxy
+raw PREROUTING SNAKE_RAW: new UDP 443 flows (not in SNK_QF) → NFQUEUE → QUIC server name → policy set
 dnsmasq: ipset=/netflix.com/.../SNK_1_d4,SNK_1_d6   server=/netflix.com/9.9.9.9
-mangle OUTPUT SNAKE_DNSO: dnsmasq's UDP answers → NFQUEUE → DNS inspector → SNK_<id>_d4/d6
+mangle OUTPUT SNAKE_DNSO: dnsmasq's UDP and TCP answers → NFQUEUE → DNS inspector → SNK_<id>_d4/d6
 ```
 
 * fwmark bits `0x00ff0000` (configurable, Settings → Advanced). Policy ids

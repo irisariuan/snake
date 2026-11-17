@@ -67,6 +67,14 @@ type Options struct {
 	// connections of sniffing policies' clients that no policy claimed are
 	// redirected to it. 0 installs no redirect (proxy not running).
 	SNIPort int
+	// Raw and Raw6: iptables / ip6tables have the raw table.
+	Raw, Raw6 bool
+	// QUICQueue > 0 is the queue the SNI proxy reads QUIC ClientHellos
+	// from: UDP 443 packets of sniffing policies' clients whose flow is not
+	// in the QUIC flow set are queued from the raw table (families with
+	// it). Otherwise QUIC that no policy claimed is rejected for those
+	// clients, so browsers fall back to TCP, which the proxy reads.
+	QUICQueue int
 	// SessionPairs returns the policy's current session rules in a family:
 	// [source match ("-s IP", "-m mac --mac-source MAC", "" = any device
 	// of the policy), address].
@@ -96,7 +104,7 @@ type Hook struct {
 }
 
 // Tables is the ordered list of family/table keys.
-var Tables = []string{"4/mangle", "4/nat", "4/filter", "6/mangle", "6/nat", "6/filter"}
+var Tables = []string{"4/raw", "4/mangle", "4/nat", "4/filter", "6/raw", "6/mangle", "6/nat", "6/filter"}
 
 type table struct {
 	chains []string
@@ -157,7 +165,11 @@ func Build(s config.Settings, states []PolicyState, opt Options) Plan {
 		if v6 {
 			fam = "6"
 		}
-		mangle, nat, filter := buildFamily(s, states, v6, opt)
+		raw, mangle, nat, filter := buildFamily(s, states, v6, opt)
+		if opt.raw(v6) {
+			plan.Restore[fam+"/raw"] = raw.render("raw", opt.Existing[fam+"/raw"])
+			plan.Hooks = append(plan.Hooks, Hook{V6: v6, Table: "raw", Chain: "PREROUTING", Args: []string{"-j", ChainRaw}})
+		}
 		plan.Restore[fam+"/mangle"] = mangle.render("mangle", opt.Existing[fam+"/mangle"])
 		plan.Restore[fam+"/filter"] = filter.render("filter", opt.Existing[fam+"/filter"])
 		if !v6 || opt.IPv6NAT {
@@ -182,8 +194,20 @@ func Build(s config.Settings, states []PolicyState, opt Options) Plan {
 	return plan
 }
 
-func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) (mangle, nat, filter *table) {
-	mangle, nat, filter = &table{}, &table{}, &table{}
+// raw reports whether the family has the raw table.
+func (o Options) raw(v6 bool) bool {
+	if v6 {
+		return o.Raw6
+	}
+	return o.Raw
+}
+
+// quic reports whether QUIC is read in the family.
+func (o Options) quic(v6 bool) bool { return o.QUICQueue > 0 && o.raw(v6) }
+
+func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) (raw, mangle, nat, filter *table) {
+	raw, mangle, nat, filter = &table{}, &table{}, &table{}, &table{}
+	raw.chain(ChainRaw)
 	mask := hex(s.MarkMask)
 	rmask := hex(s.RouteMask())
 	cmask := hex(s.ConnMarkMask)
@@ -198,6 +222,14 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 			mangle.add(ChainDNSOut, "-o", lan, "-j NFQUEUE --queue-num", q, "--queue-bypass")
 		}
 		mangle.add(ChainDNSOut, "-o lo -j NFQUEUE --queue-num", q, "--queue-bypass")
+	}
+	// QUIC flows that had a reply are remembered, so their packets skip
+	// the queue in the raw table (which has no conntrack state to tell).
+	// First in SNAKE: later rules jump away.
+	if opt.quic(v6) {
+		qf := QUICFlowSet(v6)
+		mangle.add(ChainMain, "-p udp --dport 443 -m conntrack --ctstate ESTABLISHED -m set ! --match-set", qf,
+			"src,src,dst -j SET --add-set", qf, "src,src,dst")
 	}
 	nat.chain(ChainDNS)
 	nat.chain(ChainNAT)
@@ -611,7 +643,8 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 	// SNI sniffing: HTTPS connections no policy claimed go to the proxy,
 	// which routes them by TLS server name. Only families with NAT can be
 	// redirected.
-	if opt.SNIPort > 0 && (scopes["sni"] != nil || len(guarded["sni"]) > 0) && (!v6 || opt.IPv6NAT) {
+	sniScope := scopes["sni"] != nil || len(guarded["sni"]) > 0
+	if opt.SNIPort > 0 && sniScope && (!v6 || opt.IPv6NAT) {
 		nat.chain(ChainSNI)
 		emit(nat, ChainDNS, "sni", "sni", rules(nat, []string{"-p tcp --dport 443 -j", ChainSNI}))
 		// Claimed by a policy (sets, devices, WebRTC): the kernel routes it.
@@ -628,11 +661,22 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 			}
 		}
 		nat.add(ChainSNI, "-p tcp -j REDIRECT --to-ports", fmt.Sprint(opt.SNIPort))
-		// QUIC carries its server name in an encrypted Initial packet the
-		// proxy does not handle: unclaimed QUIC is rejected so browsers
-		// fall back to TCP, which is sniffed. QUIC to policy destinations
-		// (connmark set) still goes through the tunnel.
-		emit(filter, ChainFwd, "sni", "sniq", rules(filter, []string{"-p udp --dport 443 -m connmark --mark 0/" + cmask, "-j REJECT --reject-with", reject}))
+		if !opt.quic(v6) {
+			// QUIC cannot be read here: unclaimed QUIC is rejected so
+			// browsers fall back to TCP, which is sniffed. QUIC to policy
+			// destinations (connmark set) still goes through the tunnel.
+			emit(filter, ChainFwd, "sni", "sniq", rules(filter, []string{"-p udp --dport 443 -m connmark --mark 0/" + cmask, "-j REJECT --reject-with", reject}))
+		}
+	}
+	// QUIC: the first packets of new UDP 443 flows go to the SNI proxy,
+	// which reads the server name from the Initial packets and releases
+	// them once the destination is in the matching policy's set. Queued
+	// before conntrack, so a ClientHello split over several packets
+	// creates one conntrack entry. Fail-open: with the daemon down, QUIC
+	// goes on as if not read.
+	if opt.quic(v6) && sniScope {
+		emit(raw, ChainRaw, "sni", "sniq", rules(raw, []string{"-p udp --dport 443 -m set ! --match-set", QUICFlowSet(v6),
+			"src,src,dst -j NFQUEUE --queue-num", fmt.Sprint(opt.QUICQueue), "--queue-bypass"}))
 	}
 
 	ifaces := make([]string, 0, len(tunnels))
@@ -658,7 +702,7 @@ func buildFamily(s config.Settings, states []PolicyState, v6 bool, opt Options) 
 			filter.add(ChainFwd, "-i", ifc, "-o", lan, "-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT")
 		}
 	}
-	return mangle, nat, filter
+	return raw, mangle, nat, filter
 }
 
 // clientMatch is the iptables match for one device entry in a family: a

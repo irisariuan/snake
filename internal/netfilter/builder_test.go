@@ -308,6 +308,65 @@ func TestSNIRedirect(t *testing.T) {
 	mustContain(t, plan.Restore["6/nat"], "-A SNAKE_SNI -m set --match-set SNK_DOH6 dst -j RETURN", "-A SNAKE_SNI -p tcp -j REDIRECT --to-ports 5340")
 }
 
+func TestQUICQueue(t *testing.T) {
+	c, st := states(t)
+	st[1].Policy.Leak.SniffSNI = true // Disney: devices + destinations
+	st[0].Excluded = []string{"aa:bb:cc:00:00:99"}
+	st[0].Policy.Leak.SniffSNI = true // Netflix: destinations, one device excluded
+	plan := Build(c.Settings, st, Options{IPv6: true, IPv6NAT: false, SNIPort: 5340, Raw: true, Raw6: true, QUICQueue: 4455})
+	r4, m4, f4 := plan.Restore["4/raw"], plan.Restore["4/mangle"], plan.Restore["4/filter"]
+	mustContain(t, r4,
+		":SNAKE_RAW - [0:0]",
+		"-A SNAKE_RAW -i br+ -m mac --mac-source aa:bb:cc:00:00:01 -p udp --dport 443 -m set ! --match-set SNK_QF4 src,src,dst -j NFQUEUE --queue-num 4455 --queue-bypass",
+		// The policy with an excluded device gets its own guarded chain.
+		"-A SNAKE_X1_SNIQ -m mac --mac-source aa:bb:cc:00:00:99 -j RETURN",
+		"-A SNAKE_X1_SNIQ -i br+ -p udp --dport 443 -m set ! --match-set SNK_QF4 src,src,dst -j NFQUEUE --queue-num 4455 --queue-bypass",
+		"-A SNAKE_RAW -j SNAKE_X1_SNIQ",
+	)
+	// Answered flows are remembered first thing in SNAKE.
+	first := regexp.MustCompile(`(?m)^-A SNAKE .*$`).FindString(m4)
+	if first != "-A SNAKE -p udp --dport 443 -m conntrack --ctstate ESTABLISHED -m set ! --match-set SNK_QF4 src,src,dst -j SET --add-set SNK_QF4 src,src,dst" {
+		t.Errorf("first SNAKE rule: %s", first)
+	}
+	// QUIC is read, not rejected.
+	if strings.Contains(f4, "--dport 443 -m connmark") {
+		t.Error("QUIC still rejected")
+	}
+	// IPv6 QUIC is read without IPv6 NAT too (nothing is redirected).
+	mustContain(t, plan.Restore["6/raw"], "-m set ! --match-set SNK_QF6 src,src,dst -j NFQUEUE --queue-num 4455")
+	hooks := 0
+	for _, h := range plan.Hooks {
+		if h.Table == "raw" && h.Chain == "PREROUTING" && strings.Join(h.Args, " ") == "-j SNAKE_RAW" {
+			hooks++
+		}
+	}
+	if hooks != 2 {
+		t.Errorf("%d raw hooks", hooks)
+	}
+
+	// No raw table in IPv6: IPv6 QUIC is rejected as before (with NAT).
+	plan = Build(c.Settings, st, Options{IPv6: true, IPv6NAT: true, SNIPort: 5340, Raw: true, QUICQueue: 4455})
+	if _, ok := plan.Restore["6/raw"]; ok {
+		t.Error("raw table rules without a raw table")
+	}
+	mustContain(t, plan.Restore["6/filter"], "-p udp --dport 443 -m connmark --mark 0/0x3fc00000 -j REJECT")
+	if strings.Contains(plan.Restore["6/mangle"], "SNK_QF6") {
+		t.Error("IPv6 flow set rule without the IPv6 queue")
+	}
+	// Queue not running: the raw chain stays, empty; QUIC is rejected.
+	plan = Build(c.Settings, st, Options{IPv6: true, IPv6NAT: true, SNIPort: 5340, Raw: true, Raw6: true})
+	if strings.Contains(plan.Restore["4/raw"], "NFQUEUE") || strings.Contains(plan.Restore["4/mangle"], "SNK_QF4") {
+		t.Error("QUIC rules without the queue")
+	}
+	mustContain(t, plan.Restore["4/filter"], "-p udp --dport 443 -m connmark --mark 0/0x3fc00000 -j REJECT")
+	// No sniffing policy: nothing is queued.
+	_, st = states(t)
+	plan = Build(c.Settings, st, Options{Raw: true, QUICQueue: 4455})
+	if strings.Contains(plan.Restore["4/raw"], "NFQUEUE") {
+		t.Error("QUIC queued without a sniffing policy")
+	}
+}
+
 func TestVPNServerClients(t *testing.T) {
 	c, st := states(t)
 	if got := c.Settings.ClientInterfaces(); strings.Join(got, " ") != "br+ wgs+ tun2+" {
