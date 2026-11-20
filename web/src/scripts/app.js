@@ -252,13 +252,51 @@ function tunUsers(id, enabledOnly) {
 function viewTunnels(b) {
   var cfg = state.cfg;
   b.appendChild(el('h3', null, 'Router VPN clients'));
-  b.appendChild(el('p', { class: 'muted small' }, 'wgc1-5 (WireGuard) and ovpnc1-5 (OpenVPN) are the firmware\'s VPN clients: set them up in VPN → VPN Client, with "Redirect Internet traffic through tunnel" set to "VPN Director" and no VPN Director rules. The firmware has no more than these ten, and snake never starts or stops them.'));
+  b.appendChild(el('p', { class: 'muted small' }, 'wgc1-5 (WireGuard) and ovpnc1-5 (OpenVPN) are the firmware\'s VPN clients: set them up in VPN → VPN Client, with "Redirect Internet traffic through tunnel" set to "VPN Director" and no VPN Director rules. The firmware has no more than these ten, and snake never starts them.'));
+  takeoverCard(b);
   b.appendChild(el('h3', null, 'Saved tunnels'));
   b.appendChild(el('p', { class: 'muted small' }, 'More VPNs than the firmware allows, from the files your VPN provider gives you for its WireGuard or OpenVPN apps. ' +
     'A saved tunnel runs only while an enabled policy uses it (as its main tunnel or a failover backup); the others stay stopped. ' +
     'snake routes traffic itself: the file\'s routes and DNS settings are ignored (each policy chooses its resolver) and its scripts are not run. Changes take effect on "Save & apply".'));
   tunnelSection(b, 'wireguard');
   tunnelSection(b, 'openvpn');
+}
+// Firmware VPN clients -> saved tunnels (GET previews, POST does it).
+function takeoverCard(b) {
+  var out = el('div');
+  function show(r) {
+    out.innerHTML = '';
+    (r.warnings || []).forEach(function (w) { out.appendChild(el('div', { class: 'small tw:text-warn' }, w)); });
+    var cl = r.clients || [];
+    if (!cl.length) { out.appendChild(el('p', { class: 'small muted' }, 'The firmware has no VPN client set up.')); return; }
+    var picked = {};
+    cl.forEach(function (c) { picked[c.id] = !c.error; });
+    out.appendChild(el('table', null, el('tr', null, el('th', null, ''), el('th', null, 'Client'), el('th', null, 'Server'), el('th', null, 'Used by'), el('th', null, r.applied ? 'Now' : 'State')),
+      cl.map(function (c) {
+        return el('tr', null,
+          el('td', null, r.applied || c.error ? null : el('input', { type: 'checkbox', checked: true, onchange: function (e) { picked[c.id] = e.target.checked; } })),
+          el('td', null, c.id + (c.name ? ' (' + c.name + ')' : '')), el('td', null, c.server || ''), el('td', null, (c.used_by || []).join(', ') || '—'),
+          el('td', null, c.into ? 'runs as ' + c.into : c.error ? el('span', { class: 'tw:text-warn' }, 'Cannot be taken over: ' + c.error) : (c.enabled ? 'on' : 'off') + ' in the firmware'));
+      })));
+    if (r.applied || !cl.some(function (c) { return !c.error; })) return;
+    out.appendChild(el('div', { class: 'tw:mt-2' }, btn('Take over selected', function () {
+      var ids = cl.filter(function (c) { return picked[c.id]; }).map(function (c) { return c.id; });
+      if (!ids.length) { toast('Select at least one client'); return; }
+      if (state.dirty) { toast('Save or discard your unsaved changes first'); return; }
+      if (!confirm('Take over ' + ids.join(', ') + '?\n\nEach is copied into a saved tunnel, the policies using it switch to the copy, and the firmware client is stopped and switched off. Their connections drop for a few seconds while the copies connect.\n\nThe firmware keeps the clients\' settings: you can turn them back on in VPN → VPN Client.')) return;
+      out.textContent = 'Taking over...';
+      api('POST', '/api/takeover?ids=' + encodeURIComponent(ids.join(','))).then(function (res) {
+        toast('Taken over'); state.dirty = false; state.takeover = res; load();
+      }).catch(function (e) { out.textContent = e.message; });
+    }, 'pri')));
+  }
+  b.appendChild(el('div', { class: 'card' }, el('b', null, 'Take over the firmware\'s VPN clients'),
+    el('p', { class: 'small muted' }, 'Copies the firmware\'s VPN clients into saved tunnels that snake runs itself, points your policies at the copies and stops the firmware\'s clients. After that the firmware\'s VPN options (redirect mode, VPN Director, kill switch, DNS) no longer matter for them: only snake\'s policies decide what the tunnels carry.'),
+    el('div', { class: 'row' }, btn('Show the firmware\'s clients', function () {
+      out.textContent = 'Reading...';
+      api('GET', '/api/takeover').then(function (r) { state.takeover = r; show(r); }).catch(function (e) { out.textContent = e.message; });
+    })), out));
+  if (state.takeover) show(state.takeover);
 }
 function tunnelSection(b, kind) {
   var k = KINDS[kind], list = state.cfg[kind], st = state.status || {};

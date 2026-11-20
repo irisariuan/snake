@@ -175,6 +175,30 @@ func (s *Server) routes(authed bool) http.Handler {
 	s.ruleRoutes(mux)
 	mux.HandleFunc("GET /api/plan", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, s.E.Plan()) })
 	mux.HandleFunc("POST /api/import-dvr", s.importDVR)
+	// Firmware VPN clients: GET previews, POST takes them over (ids: a
+	// comma-separated list; all that can be taken over when empty).
+	mux.HandleFunc("GET /api/takeover", func(w http.ResponseWriter, r *http.Request) {
+		res, err := s.E.TakeOverPreview()
+		if err != nil {
+			writeErr(w, 500, err)
+			return
+		}
+		writeJSON(w, res)
+	})
+	mux.HandleFunc("POST /api/takeover", func(w http.ResponseWriter, r *http.Request) {
+		var ids []string
+		for _, id := range strings.Split(r.URL.Query().Get("ids"), ",") {
+			if id = strings.TrimSpace(id); id != "" {
+				ids = append(ids, id)
+			}
+		}
+		res, err := s.E.TakeOverClients(ids)
+		if err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		writeJSON(w, res)
+	})
 	s.learnRoutes(mux)
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {

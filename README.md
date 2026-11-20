@@ -108,7 +108,8 @@ to 20 WireGuard tunnels (`wgx1`–`wgx20`) and 20 OpenVPN clients
 **A saved tunnel runs only while an enabled policy uses it**, as its main
 tunnel or as a failover backup (backups are kept connected so failover is
 instant and their health is known). Saved tunnels no enabled policy lists
-stay stopped. snake never starts or stops the firmware's own clients.
+stay stopped. snake never starts the firmware's own clients, and stops
+them only when it [takes them over](#taking-over-the-firmwares-vpn-clients).
 
 1. Web UI → **Tunnels** → **+ Add WireGuard tunnel** or **+ Add OpenVPN
    tunnel**.
@@ -180,6 +181,33 @@ PersistentKeepalive = 25
 * Needs the firmware's WireGuard support (kernel module and `wg`) for
   WireGuard and its `openvpn` for OpenVPN; both are on any model that offers
   those VPN clients. Also needs the default 8-bit `mark_mask`.
+
+### Taking over the firmware's VPN clients
+
+Instead of setting each firmware client to "VPN Director" by hand, snake can
+run them itself: **Tunnels → Take over the firmware's VPN clients** (or
+`snake takeover`, which previews; `snake takeover --yes [wgc1 ovpnc2 ...]`
+does it). For each client you pick:
+
+1. its configuration is copied into a saved tunnel (`wgc1` becomes the next
+   free `wgx`, `ovpnc1` the next free `ovx`, named after the client);
+2. every policy that listed the client lists the copy instead;
+3. the firmware client is stopped and switched off (`wgc<n>_enable=0`, or
+   removed from the OpenVPN clients started at boot), so the VPN server
+   sees one connection, not two.
+
+From then on the firmware's options for that client (redirect mode, VPN
+Director rules, kill switch, DNS) have no effect: the tunnel carries only
+what snake's policies send into it. The policies' connections drop for a few
+seconds while the copies connect. The firmware keeps the clients' settings,
+so turning one back on in *VPN → VPN Client* (and removing the copy) undoes
+it.
+
+WireGuard clients are read from NVRAM. OpenVPN clients are read from the
+configuration the firmware wrote when it last started the client
+(`/etc/openvpn/client<n>/`), with its certificate and key files pasted
+inline; a client that was never started since boot must be started once
+first. A client taken over twice is not copied twice.
 
 ## Policies
 
@@ -977,6 +1005,7 @@ snake reload                 re-read config.json
 snake policy list
 snake rules list|check|import|export
 snake import-dvr [--dir /jffs/configs/domain_vpn_routing] [--yes]
+snake takeover [--yes] [client ...]   # firmware VPN clients -> saved tunnels
 snake token [--rotate]       API token for the standalone UI at http://router:8444/
 snake start | stop [--flush] | restart
 snake disable | enable       emergency switch (see below)

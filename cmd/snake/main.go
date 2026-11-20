@@ -71,6 +71,10 @@ Usage: snake <command> [args]
                           learning groups and learned addresses (snake learn for help)
   import-dvr [--dir D] [--yes]
                           import Domain VPN Routing policies
+  takeover [--yes] [client ...]
+                          copy the firmware's VPN clients (wgc1-5, ovpnc1-5) into
+                          saved tunnels, point policies at them and stop the
+                          firmware's clients (needs the daemon)
   token [--rotate]        print the API token for the standalone UI
   webui-mount             (re)install the Addons page
   daemon                  run in the foreground
@@ -131,6 +135,8 @@ func main() {
 		err = learnCmd(args)
 	case "import-dvr":
 		err = importCmd(args)
+	case "takeover":
+		err = takeoverCmd(args)
 	case "token":
 		err = tokenCmd(hasFlag(args, "--rotate"))
 	case "install":
@@ -559,6 +565,56 @@ func dryRun() error {
 	fmt.Println(rec.Joined())
 	fmt.Println("\n# dnsmasq fragment")
 	fmt.Print(dnsmasq.Generate(e.Config().Runtime(), e.Caps().NFQueue))
+	return nil
+}
+
+// takeoverCmd previews or runs a take-over of the firmware's VPN clients
+// through the daemon, which saves the configuration and applies it.
+func takeoverCmd(args []string) error {
+	if !pidAlive() {
+		return fmt.Errorf("the daemon is not running: start it first (snake takes the clients over and starts their copies)")
+	}
+	var ids []string
+	for _, a := range args {
+		if !strings.HasPrefix(a, "--") {
+			ids = append(ids, a)
+		}
+	}
+	method := "GET"
+	if hasFlag(args, "--yes") {
+		method = "POST"
+	}
+	b, err := call(method, "/api/takeover?ids="+strings.Join(ids, ","), nil)
+	if err != nil {
+		return err
+	}
+	var res engine.TakeOver
+	if err := json.Unmarshal(b, &res); err != nil {
+		return err
+	}
+	if len(res.Clients) == 0 {
+		fmt.Println("the firmware has no VPN client set up")
+		return nil
+	}
+	for _, c := range res.Clients {
+		line := fmt.Sprintf("  %-7s %s", c.ID, strings.TrimSpace(c.Name+" "+c.Server))
+		if len(c.UsedBy) > 0 {
+			line += " (used by " + strings.Join(c.UsedBy, ", ") + ")"
+		}
+		switch {
+		case c.Into != "":
+			line += " -> " + c.Into
+		case c.Error != "":
+			line += ": cannot be taken over: " + c.Error
+		}
+		fmt.Println(line)
+	}
+	for _, w := range res.Warnings {
+		fmt.Println("warning:", w)
+	}
+	if !res.Applied {
+		fmt.Println("preview only; re-run with --yes to take them over")
+	}
 	return nil
 }
 
