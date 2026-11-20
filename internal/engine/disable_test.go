@@ -120,3 +120,33 @@ func TestDoHSetHoldsOnlyResolverAddresses(t *testing.T) {
 		t.Fatalf("DoH set not replaced with the resolver list:\n%v", rec.Commands)
 	}
 }
+
+func TestDoHSetFollowsEditedAddresses(t *testing.T) {
+	dir := t.TempDir()
+	c := config.Default()
+	c.Settings.DoHAddresses = []string{"# Google", "# 8.8.8.8", "203.0.113.53"}
+	c.Policies = []config.Policy{{Name: "p", Enabled: true, Tunnels: []string{"wgc1"}, Domains: []string{"example.com"},
+		Leak: config.Leak{BlockDoH: true, IPv6: "off", WebRTC: "off"}}}
+	c.Normalize()
+	if err := config.Save(filepath.Join(dir, "config.json"), c); err != nil {
+		t.Fatal(err)
+	}
+	rec := &system.Recorder{}
+	e := New(DefaultPaths(dir), rec)
+	e.DryRun = true
+	if err := e.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Apply("test"); err != nil {
+		t.Fatal(err)
+	}
+	var restore string
+	for _, cmd := range rec.Commands {
+		if strings.Contains(cmd, "ipset -exist restore") && strings.Contains(cmd, "SNK_DOH4") {
+			restore = cmd
+		}
+	}
+	if !strings.Contains(restore, "add SNK_DOH4_t 203.0.113.53") || strings.Contains(restore, "8.8.8.8") || strings.Contains(restore, "1.1.1.1") {
+		t.Fatalf("DoH set does not follow the edited list:\n%s", restore)
+	}
+}

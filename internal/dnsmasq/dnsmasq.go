@@ -81,15 +81,15 @@ func Generate(c *config.Config, inspector bool, upstreams ...map[int]string) str
 		// block set holds only dedicated resolver addresses. DNS answers
 		// reach every device, so this is only done when DoH is blocked for
 		// the whole LAN; device-scoped policies block the addresses only.
-		if c.DoHBlockedLANWide() {
+		if c.DoHBlockedLANWide() && len(config.Active(c.Settings.DoHDomains)) > 0 {
 			b.WriteString("# DoH resolvers: NXDOMAIN, so clients fall back to normal DNS\n")
-			for _, part := range chunks(netfilter.DefaultDoHDomains) {
+			for _, part := range chunks(config.Active(c.Settings.DoHDomains)) {
 				fmt.Fprintf(&b, "local=/%s/\n", strings.Join(part, "/"))
 			}
 		}
-		if c.Settings.DoHCanary {
+		if c.Settings.DoHCanary && len(config.Active(c.Settings.CanaryDomains)) > 0 {
 			b.WriteString("# canaries: NXDOMAIN tells Firefox / iCloud Private Relay to stand down\n")
-			for _, d := range netfilter.CanaryDomains {
+			for _, d := range config.Active(c.Settings.CanaryDomains) {
 				fmt.Fprintf(&b, "local=/%s/\n", d)
 			}
 		}

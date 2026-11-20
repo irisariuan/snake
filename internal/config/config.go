@@ -236,7 +236,7 @@ type Settings struct {
 	ASNRefresh     int    `json:"asn_refresh"` // hours
 	SaveInterval   int    `json:"save_interval"`
 	STUNPorts      string `json:"stun_ports"` // multiport syntax for fallback mode
-	DoHCanary      bool   `json:"doh_canary"` // answer Firefox/iCloud Private Relay canaries with NXDOMAIN
+	DoHCanary      bool   `json:"doh_canary"` // answer CanaryDomains with NXDOMAIN
 	PreResolve     bool   `json:"pre_resolve"`
 	FlushConntrack bool   `json:"flush_conntrack"`
 	// LANInterfaces are the iptables -i patterns of client traffic,
@@ -251,6 +251,16 @@ type Settings struct {
 	// (whole LAN) or never (overrides every policy).
 	BlockDoT string `json:"block_dot"`
 	BlockDoH string `json:"block_doh"`
+	// DoHDomains are DoH hostnames answered with NXDOMAIN when DoH is
+	// blocked for the whole LAN; DoHAddresses are resolver addresses
+	// (IPs or CIDRs, both families) rejected on port 443 for devices with
+	// DoH blocked; CanaryDomains are answered with NXDOMAIN with
+	// DoHCanary. Each starts as its preset (DefaultDoHDomains, ...); lines
+	// starting with # are comments or switched-off entries. Missing (null)
+	// means the preset, an empty list means none.
+	DoHDomains    []string `json:"doh_domains"`
+	DoHAddresses  []string `json:"doh_addresses"`
+	CanaryDomains []string `json:"canary_domains"`
 	// DNSForwardPort is the preferred encrypted-DNS listener port base.
 	// Occupied/reserved ports are replaced by allocated runtime endpoints.
 	DNSForwardPort int `json:"dns_forward_port"`
@@ -593,6 +603,9 @@ func DefaultSettings() Settings {
 		UpdateRepo:        "irisariuan/snake",
 		BlockDoT:          BlockPolicy,
 		BlockDoH:          BlockPolicy,
+		DoHDomains:        append([]string(nil), DefaultDoHDomains...),
+		DoHAddresses:      append([]string(nil), DefaultDoHAddresses...),
+		CanaryDomains:     append([]string(nil), DefaultCanaryDomains...),
 		DNSForwardPort:    5350,
 		SNIProxyPort:      5340,
 	}
@@ -678,6 +691,16 @@ func (c *Config) ApplyDefaults() {
 	}
 	if s.BlockDoH == "" {
 		s.BlockDoH = d.BlockDoH
+	}
+	// nil, not empty: an emptied list blocks nothing.
+	if s.DoHDomains == nil {
+		s.DoHDomains = d.DoHDomains
+	}
+	if s.DoHAddresses == nil {
+		s.DoHAddresses = d.DoHAddresses
+	}
+	if s.CanaryDomains == nil {
+		s.CanaryDomains = d.CanaryDomains
 	}
 	setInt(&s.DNSForwardPort, d.DNSForwardPort)
 	setInt(&s.SNIProxyPort, d.SNIProxyPort)
@@ -886,6 +909,9 @@ func (c *Config) Normalize() {
 	if c.Groups == nil {
 		c.Groups = []Group{}
 	}
+	c.Settings.DoHDomains = normalizeHostList(c.Settings.DoHDomains)
+	c.Settings.DoHAddresses = normalizeAddrList(c.Settings.DoHAddresses)
+	c.Settings.CanaryDomains = normalizeHostList(c.Settings.CanaryDomains)
 	c.normalizeSnakeTunnels()
 	if c.Devices == nil {
 		c.Devices = []Device{}
@@ -997,6 +1023,9 @@ func (c *Config) Validate() error {
 			add("probe target %q must be host:port", t)
 		}
 	}
+	validateHostList("doh_domains", s.DoHDomains, add)
+	validateAddrList("doh_addresses", s.DoHAddresses, add)
+	validateHostList("canary_domains", s.CanaryDomains, add)
 	groups := map[string]bool{}
 	for _, g := range c.Groups {
 		if !nameRe.MatchString(g.Name) {

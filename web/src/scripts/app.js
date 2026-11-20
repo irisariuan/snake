@@ -1175,7 +1175,7 @@ function viewSettings(b) {
       num('asn_refresh', 'ASN refresh (hours)'),
       list('stun_test_servers', 'STUN servers for the browser leak test')),
     el('div', { class: 'card' }, el('b', null, 'Advanced'),
-      bool('doh_canary', 'Answer DoH canary domains with NXDOMAIN', 'Firefox and iCloud Private Relay turn themselves off network-wide.'),
+      bool('doh_canary', 'Answer DoH canary domains with NXDOMAIN', 'Firefox and iCloud Private Relay turn themselves off network-wide. The list is under DNS → Canary domains.'),
       bool('pre_resolve', 'Pre-resolve policy domains at start'),
       txt('lan_interfaces', 'Client interfaces (iptables -i patterns, space-separated)', 'br+ = LAN and guest networks, wgs+ = WireGuard server clients, tun2+ = OpenVPN server clients (tun mode). Remove a pattern to leave those clients alone.'),
       num('api_port', 'API port (HTTPS uses port + 1)', 'Restart the daemon after changing.'),
@@ -1229,6 +1229,60 @@ function overridden(key, node) {
   node.lastChild.appendChild(el('div', { class: 'small tw:text-warn' }, 'Overridden in Settings: ' + (mode === 'always' ? 'always blocked for the whole LAN' : 'never blocked')));
   return node;
 }
+// ---------- editable block lists (DoH hostnames, addresses, canaries) ----------
+// One entry per line; "# Name" lines head a preset group and "# entry"
+// is an entry switched off. Each group gets a checkbox that switches all
+// of its entries on or off; the text stays editable for anything else.
+function blockLines(t) { return (t || '').split('\n').map(function (x) { return x.trim(); }).filter(Boolean); }
+function offEntry(line) { var m = /^#\s*(\S+)$/.exec(line); return m && /[.:]/.test(m[1]) ? m[1] : null; }
+function blockGroups(list) {
+  var groups = [], g = null;
+  (list || []).forEach(function (line, i) {
+    var off = line.charAt(0) === '#' ? offEntry(line) : null;
+    if (line.charAt(0) === '#' && off === null) { g = { name: line.replace(/^#\s*/, ''), on: 0, off: 0, idx: [] }; groups.push(g); return; }
+    if (!g) { g = { name: 'Custom', on: 0, off: 0, idx: [] }; groups.push(g); }
+    g.idx.push(i);
+    if (off === null) g.on++; else g.off++;
+  });
+  return groups.filter(function (x) { return x.idx.length; });
+}
+function presetList(key, label, help) {
+  var s = state.cfg.settings;
+  var chips = el('div', { class: 'tw:flex tw:flex-wrap tw:gap-x-3' });
+  var count = el('span', { class: 'small muted' });
+  var ta = el('textarea', { class: 'tw:min-h-[120px] tw:font-mono tw:text-xs', spellcheck: 'false', autocapitalize: 'off', autocomplete: 'off',
+    onchange: function (e) { s[key] = blockLines(e.target.value); markDirty(); draw(false); } });
+  function draw(text) {
+    var list = s[key] || [];
+    if (text !== false) ta.value = list.join('\n');
+    chips.innerHTML = '';
+    blockGroups(list).forEach(function (g) {
+      var cb = el('input', { type: 'checkbox', checked: g.on > 0, onchange: function (e) {
+        var on = e.target.checked;
+        g.idx.forEach(function (i) {
+          var line = list[i], off = line.charAt(0) === '#' ? offEntry(line) : null;
+          if (on && off !== null) list[i] = off;
+          if (!on && off === null) list[i] = '# ' + line;
+        });
+        s[key] = list; markDirty(); draw();
+      } });
+      cb.indeterminate = g.on > 0 && g.off > 0;
+      chips.appendChild(el('label', { class: 'chk', title: g.on + ' on, ' + g.off + ' off' }, cb, el('span', null, g.name)));
+    });
+    var active = list.filter(function (l) { return l.charAt(0) !== '#'; }).length;
+    count.textContent = active + ' active' + (active ? '' : ' (nothing blocked)');
+  }
+  draw();
+  return el('div', { class: 'tw:mt-2' }, el('label', { class: 'f' }, label), chips, ta,
+    el('div', { class: 'row' }, count,
+      btn('Restore defaults', function () {
+        api('GET', '/api/presets/doh').then(function (p) {
+          if (!confirm('Replace ' + label + ' with the default list? Your edits to it are lost.')) return;
+          s[key] = p[key]; markDirty(); draw();
+        }).catch(function (e) { toast(e.message); });
+      }, 'btn-sm')),
+    help ? el('div', { class: 'small muted' }, help) : null);
+}
 function viewDNSSettings(num) {
   var s = state.cfg.settings;
   function mode(key, label, what) {
@@ -1243,7 +1297,11 @@ function viewDNSSettings(num) {
     mode('block_doh', 'Block DNS over HTTPS (known resolvers)', 'DoH'),
     el('div', { class: 'small muted' }, '"Per policy" uses each policy\'s leak protection toggle. Blocking makes devices fall back to the router\'s DNS, which snake needs to see which domains they use. "Never" lets them keep encrypted DNS, but domain rules then miss those devices\' lookups.'),
     num('dns_forward_port', 'Preferred local port base for DoT/DoH', 'Policy id is added. Occupied ports and mDNS port 5353 are skipped automatically; Status shows the actual port. Only reachable from the router itself.'),
-    num('sni_proxy_port', 'SNI proxy port', 'Used by policies with "Route HTTPS by TLS server name". Only connections redirected by snake are served.'));
+    num('sni_proxy_port', 'SNI proxy port', 'Used by policies with "Route HTTPS by TLS server name". Only connections redirected by snake are served.'),
+    el('div', { class: 'small muted tw:mt-2' }, 'Block lists: untick a group, or put # in front of a line, to stop blocking it (e.g. if an app or service stops working). Add your own entries on new lines.'),
+    presetList('doh_addresses', 'DoH resolver addresses', 'IPs or CIDRs (IPv4 and IPv6). Port 443 to them is rejected for devices with DoH blocked.'),
+    presetList('doh_domains', 'DoH hostnames', 'Answered with NXDOMAIN when DoH is blocked for the whole LAN, so browsers fall back to normal DNS.'),
+    presetList('canary_domains', 'Canary domains', 'Answered with NXDOMAIN while "Answer DoH canary domains" (Advanced) is on and DoH is blocked anywhere. NXDOMAIN for the iCloud Private Relay names turns Private Relay off on Apple devices.'));
 }
 
 // ---------- updates ----------

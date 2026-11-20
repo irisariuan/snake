@@ -379,7 +379,7 @@ snake rules export --policy "Netflix US" --expand
 |---|---|
 | Resolve via tunnel | `server=/domain/<resolver>` in dnsmasq, and an `ip rule` sends the router's queries to that resolver through the policy's tunnel. CDNs then pick servers near the VPN exit, not near you. The router can talk to the resolver in plain DNS, **DNS over TLS** or **DNS over HTTPS** (see below). |
 | Hijack DNS | Redirects port 53 from scoped clients to the router, so devices with hardcoded DNS (e.g. `8.8.8.8`) are still seen by dnsmasq. |
-| Block DoH | Rejects TCP/UDP 443 to the dedicated addresses of known DoH resolvers (8.8.8.8, 1.1.1.1, Quad9, AdGuard, NextDNS, ...). When DoH is blocked for the whole LAN (a destination-only policy, or Settings → *Always*), DoH hostnames such as `dns.google` also get NXDOMAIN from dnsmasq, so browsers fall back to normal DNS. Addresses are never learned from DNS answers: names like `dns.google.com` share addresses with ordinary Google sites, and blocking those cut Google downloads. Also answers the Firefox and iCloud Private Relay canary domains with NXDOMAIN (network-wide, Settings → *DoH canary*). |
+| Block DoH | Rejects TCP/UDP 443 to the dedicated addresses of known DoH resolvers (8.8.8.8, 1.1.1.1, Quad9, AdGuard, NextDNS, ...). When DoH is blocked for the whole LAN (a destination-only policy, or Settings → *Always*), DoH hostnames such as `dns.google` also get NXDOMAIN from dnsmasq, so browsers fall back to normal DNS. Addresses are never learned from DNS answers: names like `dns.google.com` share addresses with ordinary Google sites, and blocking those cut Google downloads. Also answers the Firefox and iCloud Private Relay canary domains with NXDOMAIN (network-wide, Settings → *DoH canary*). All three lists are editable, below. |
 | Block DoT | Rejects port 853 (DoT/DoQ), so Android "Private DNS" falls back to normal DNS. |
 | Block QUIC | Rejects UDP 443 (optional). |
 | Route HTTPS by server name | HTTPS connections no set matched go through snake's transparent SNI proxy, which routes them by the name in the TLS ClientHello. Lets devices keep DoH/DoT. See below. |
@@ -390,6 +390,18 @@ snake rules export --policy "Netflix US" --expand
 on its own: *Per policy* (the toggles above), *Always* (blocked for every
 device on the LAN, whatever the policies say) or *Never* (allowed everywhere;
 devices that use it bypass snake's domain rules).
+
+The lists behind *Block DoH* and the canaries are editable presets in
+**Settings → DNS**: *DoH resolver addresses* (IPs or CIDRs, IPv4 and IPv6),
+*DoH hostnames* and *Canary domains*. Each starts as snake's built-in list,
+grouped by provider. Untick a group, or put `#` in front of a line, to stop
+blocking it without losing it; add your own entries on new lines; *Restore
+defaults* brings back the built-in list. If an app or service stops working
+with DoH blocking on (for example an Apple service that needs iCloud Private
+Relay), switch off the matching group. In the config file they are
+`settings.doh_addresses`, `settings.doh_domains` and
+`settings.canary_domains`; a missing list means the preset, an empty one
+blocks nothing. `GET /api/presets/doh` returns the presets.
 
 "Scoped clients" means the policy's devices. For destination-only policies it
 means the whole LAN, because any device might reach those destinations.

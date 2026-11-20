@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -470,5 +472,72 @@ func TestTunnelSelection(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), s) {
 			t.Errorf("missing %q in %v", s, err)
 		}
+	}
+}
+
+func TestDoHBlockListsEditable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.json")
+	// An older configuration without the lists gets the presets.
+	if err := os.WriteFile(path, []byte(`{"version":5,"settings":{"api_port":8444}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(c.Settings.CanaryDomains, "mask.icloud.com") || !slices.Contains(c.Settings.DoHAddresses, "2620:fe::fe") || !slices.Contains(c.Settings.DoHDomains, "dns.google") {
+		t.Fatalf("presets not applied: %+v", c.Settings)
+	}
+	// Switched-off entries and comments are kept but not in force; custom
+	// entries are cleaned; an emptied list stays empty.
+	c.Settings.CanaryDomains = []string{"# iCloud", "#mask.icloud.com", " Use-Application-DNS.net. ", "use-application-dns.net"}
+	c.Settings.DoHAddresses = []string{"203.0.113.7", "198.51.100.9/24", "2001:DB8::1"}
+	c.Settings.DoHDomains = []string{}
+	c.Normalize()
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if got := Active(c.Settings.CanaryDomains); !slices.Equal(got, []string{"use-application-dns.net"}) {
+		t.Errorf("active canaries = %v", got)
+	}
+	if got := c.Settings.CanaryDomains; len(got) != 3 || got[1] != "#mask.icloud.com" {
+		t.Errorf("comments not kept: %v", got)
+	}
+	if got := c.Settings.DoHAddresses; !slices.Equal(got, []string{"203.0.113.7", "198.51.100.0/24", "2001:db8::1"}) {
+		t.Errorf("addresses = %v", got)
+	}
+	if err := Save(path, c); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.Settings.DoHDomains == nil || len(c2.Settings.DoHDomains) != 0 {
+		t.Errorf("emptied list came back as %v", c2.Settings.DoHDomains)
+	}
+	if !slices.Equal(c2.Settings.CanaryDomains, c.Settings.CanaryDomains) {
+		t.Errorf("canaries not saved: %v", c2.Settings.CanaryDomains)
+	}
+
+	c2.Settings.DoHAddresses = []string{"1.1.1.1", "not-an-ip", "#comment ok"}
+	c2.Settings.CanaryDomains = []string{"bad/host"}
+	err = c2.Validate()
+	if err == nil || !strings.Contains(err.Error(), `"not-an-ip"`) || !strings.Contains(err.Error(), `"bad/host"`) || strings.Contains(err.Error(), "comment") {
+		t.Errorf("validation: %v", err)
+	}
+}
+
+func TestDoHPresetsValid(t *testing.T) {
+	c := Default()
+	c.Normalize()
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	p := DefaultDoHPresets()
+	p.CanaryDomains[0] = "changed"
+	if DefaultCanaryDomains[0] == "changed" || c.Settings.CanaryDomains[0] == "changed" {
+		t.Error("presets share storage")
 	}
 }

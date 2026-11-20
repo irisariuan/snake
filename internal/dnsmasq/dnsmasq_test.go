@@ -161,3 +161,24 @@ func TestDoHHostnamesNotLearned(t *testing.T) {
 		t.Errorf("block_doh=never still blocks:\n%s", out)
 	}
 }
+
+func TestEditedDoHLists(t *testing.T) {
+	c := config.Default()
+	c.Settings.BlockDoH = config.BlockAlways
+	c.Settings.CanaryDomains = []string{"use-application-dns.net", "# iCloud Private Relay", "# mask.icloud.com"}
+	c.Settings.DoHDomains = []string{"# Google", "# dns.google", "doh.example.net"}
+	out := Generate(c, true)
+	if strings.Contains(out, "mask.icloud.com") || strings.Contains(out, "dns.google") || strings.Contains(out, "local=/#") {
+		t.Errorf("switched-off entries rendered:\n%s", out)
+	}
+	for _, s := range []string{"local=/use-application-dns.net/", "local=/doh.example.net/"} {
+		if !strings.Contains(out, s) {
+			t.Errorf("missing %q:\n%s", s, out)
+		}
+	}
+	c.Settings.CanaryDomains = []string{}
+	c.Settings.DoHDomains = []string{"# all off"}
+	if out := Generate(c, true); strings.Contains(out, "canaries") || strings.Contains(out, "DoH resolvers") {
+		t.Errorf("empty lists still render sections:\n%s", out)
+	}
+}

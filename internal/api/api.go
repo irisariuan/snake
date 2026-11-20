@@ -79,6 +79,7 @@ func (s *Server) routes(authed bool) http.Handler {
 	mux.HandleFunc("GET /api/status", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, s.E.Status()) })
 	mux.HandleFunc("GET /api/config", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, s.E.Config()) })
 	mux.HandleFunc("PUT /api/config", s.putConfig)
+	mux.HandleFunc("GET /api/presets/doh", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, config.DefaultDoHPresets()) })
 	mux.HandleFunc("POST /api/apply", func(w http.ResponseWriter, r *http.Request) {
 		if err := s.E.Apply("manual"); err != nil {
 			writeErr(w, 500, err)
